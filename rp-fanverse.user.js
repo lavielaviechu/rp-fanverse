@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RP Fanverse
 // @namespace    https://crack.wrtn.ai/
-// @version      0.12.5
+// @version      0.12.6
 // @description  Treats a Crack RP episode as canon and grows a persistent virtual Pixiv/Reddit fandom around it.
 // @author       Personal userscript
 // @match        https://crack.wrtn.ai/stories/*/episodes/*
@@ -19,12 +19,13 @@
 // @connect      firebasevertexai.googleapis.com
 // @connect      content-firebaseappcheck.googleapis.com
 // @connect      googleapis.com
+// @connect      *
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const APP_VERSION = '0.12.5';
+  const APP_VERSION = '0.12.6';
   const DB_NAME = 'rp-fanverse';
   const DB_VERSION = 1;
   const SETTINGS_KEY = 'rp-fanverse:settings:v1';
@@ -322,6 +323,14 @@
     fanworkRevision: { label: 'Continuity Rewrite / Fix', group: 'continuity', description: 'Continuity Check 결과로 전문을 수정합니다.', output: 'Text (수정된 전문)', required: ['FANWORK', 'ISSUES'], optional: ['LANGUAGE', 'OUTLINE', 'CANON', 'CONTINUITY_NOTES'] },
   });
 
+  // Shared by every prompt whose output fans see. Internal IDs stay in the JSON fields that ask for
+  // them; episodeLabel/sceneLabel/episodePart/fanReferences/fandomTimeline in the input are display
+  // aliases computed by RP Fanverse (virtual episodes, never Canon event numbers).
+  const FAN_REFERENCE_RULES = `FAN-FACING REFERENCE RULES:
+- canonEventId values, sourceCanonEventIds, sourceTurnIds, sourceMessageIds, pending/event IDs and tokens such as "canon_…" or "fact_…" are internal tracking metadata. Put them only in the JSON ID fields that ask for them. Never write them, or database-style numbering such as "Canon #12", "Canon Event 4", "event ID", "Canon 번호", in any text fans can see (titles, bodies, comments, captions, tags, summaries, continuationTopics, payload text, fanwork prose).
+- Refer to story events the way a real fandom does: by episode (episodeLabel such as "12화"; "이번 화" for fandomTimeline.latestEpisodeLabel, "저번 화" for previousEpisodeLabel), part of the episode (episodePart: 초반부/중반부/후반부/마지막), place, action and dialogue (sceneLabel), e.g. "12화 음악실 씬", "저번 화 마지막에 둘이 옥상에 남았던 장면", "원작에서", "본편에서", "작중에서". In Japanese text use 「12話」「今回」「前回」「本編」「原作」 the same way.
+- Do not keep repeating the system words "Canon", "Canon에서", "Canon상". Say 원작/본편/작중 (原作/本編). The canon-versus-fan-interpretation distinction still applies: confirmed story events are 원작 facts, theories stay interpretations.`;
+
   const DEFAULT_PROMPT_TEMPLATES = Object.freeze({
     canonExtractor: `You are the Canon Extractor for RP Fanverse. The RP log is the only canon. Extract only explicit facts, events, knowledge states, spoken claims (without assuming they are true), and confirmed feelings. Never turn inference into canon. Preserve uncertainty. Return Korean descriptions while retaining proper names in their source language when useful.
 
@@ -341,8 +350,12 @@ CURRENT FANDOM STATE:
 {{FANDOM_STATE}}
 
 CURRENT TURN: {{CURRENT_TURN}}
-Return interpretation updates, ship/tag deltas, reaction points, and pending events with dueTurn and expiryTurn.`,
+Return interpretation updates, ship/tag deltas, reaction points, and pending events with dueTurn and expiryTurn. Keep the IDs in sourceCanonEventIds; in free text (text, reason, summary, payload) refer to events by episodeLabel/sceneLabel, never by ID.
+
+${FAN_REFERENCE_RULES}`,
     redditGenerator: `Create virtual Reddit-like fandom posts reacting to the supplied canon and fan interpretations. Use only the persistent persona IDs provided. Users share canon facts but disagree in interpretation. Include analysis, theories, episode discussion, CP discussion, unpopular opinions, and occasional text memes. The category field is shown as the post flair, so keep it short (e.g. Discussion, Theory, Analysis, Shipping, Meme, Unpopular Opinion, Episode Discussion). Generate only a small initial comment sample per post; the rest will be generated on demand. Comments are a flat list with id and parentId for nested rendering. Supply estimatedCommentCount, hasMoreComments, and continuationTopics so later batches can continue naturally. Do not claim fan theories are canon. Language: Korean, with natural fandom jargon.
+
+${FAN_REFERENCE_RULES}
 
 PERSONAS:
 {{PERSONAS}}
@@ -352,6 +365,8 @@ REACTION INPUT:
 
 ACTIVITY: {{ACTIVITY}}`,
     redditMoreComments: `Continue a persistent virtual Reddit discussion. Generate only the next comment batch, not the post again. Reuse only the supplied persona IDs. Comments may reply to an existing comment ID or another new temporary ID from this batch. Preserve disagreements and persona biases, avoid repeating existing comments, and ground all claims in the supplied canon/fandom context. Return hasMoreComments based on whether the discussion still has worthwhile unexplored threads. Language: Korean.
+
+${FAN_REFERENCE_RULES}
 
 POST:
 {{POST}}
@@ -370,7 +385,9 @@ CANON:
 
 FANDOM STATE:
 {{FANDOM_STATE}}`,
-    pixivMetadataGenerator: `Create metadata only for virtual Japanese Pixiv-like fanworks based on the supplied fandom reaction input. Do NOT write the full work. Use only persistent author persona IDs provided. Mix 原作軸, 幕間, IF, AU, future fabrication, multi-person relationships, and character-centric works as appropriate. Titles/captions/tags should feel natural in Japanese. Source canon IDs must be retained.
+    pixivMetadataGenerator: `Create metadata only for virtual Japanese Pixiv-like fanworks based on the supplied fandom reaction input. Do NOT write the full work. Use only persistent author persona IDs provided. Mix 原作軸, 幕間, IF, AU, future fabrication, multi-person relationships, and character-centric works as appropriate. Titles/captions/tags should feel natural in Japanese. Source canon IDs must be retained in sourceCanonEventIds only.
+
+${FAN_REFERENCE_RULES}
 
 AUTHORS:
 {{PERSONAS}}
@@ -379,7 +396,7 @@ REACTION INPUT:
 {{REACTIONS}}
 
 ACTIVITY: {{ACTIVITY}}`,
-    fanwork: `You are writing a virtual fanwork based on an RP treated as official canon. This is FANWORK, not canon. Respect the metadata, author persona, relevant canon facts, and chosen divergence type. Write naturally in {{LANGUAGE}}. Target approximately {{TARGET_LENGTH}} characters. Do not add meta commentary before or after the work.
+    fanwork: `You are writing a virtual fanwork based on an RP treated as official canon. This is FANWORK, not canon. Respect the metadata, author persona, relevant canon facts, and chosen divergence type. Write naturally in {{LANGUAGE}}. Target approximately {{TARGET_LENGTH}} characters. Do not add meta commentary before or after the work. The prose never contains internal IDs or "Canon" labels; use the episode/scene aliases only to locate the moment in the story.
 
 WORK METADATA:
 {{WORK_METADATA}}
@@ -422,7 +439,7 @@ CANON:
 
 FANWORK:
 {{FANWORK}}`,
-    fanworkRevision: `Revise the complete virtual fanwork to fix every accidental continuity issue listed below. Preserve the work's title, voice, emotional arc, approximate length, deliberate IF/AU divergences, and all passages that do not need changes. Return only the full corrected fanwork with no preface or commentary. Language: {{LANGUAGE}}.
+    fanworkRevision: `Revise the complete virtual fanwork to fix every accidental continuity issue listed below. Preserve the work's title, voice, emotional arc, approximate length, deliberate IF/AU divergences, and all passages that do not need changes. Return only the full corrected fanwork with no preface or commentary, and never include internal IDs or "Canon" labels in the prose. Language: {{LANGUAGE}}.
 
 OUTLINE:
 {{OUTLINE}}
@@ -605,6 +622,608 @@ ORIGINAL FANWORK:
     return null;
   }
 
+  // ---------- RP log cleaning (Books/EPUB + fan-facing scene references) ----------
+  // Deterministic, no AI. The RP text itself is never rewritten: only chat-UI wrappers are removed
+  // (OOC lore context, shortcut directives, HUD/status lines, code fences, role labels) and the
+  // time/place HUD is turned into scene metadata.
+  const HUD_TIME_KEY_RE = /^(?:시간|시각|일시|날짜|일자|time|date|📅|🗓️?|🕐|🕑|🕒|⏰|⌚)$/iu;
+  const HUD_PLACE_KEY_RE = /^(?:장소|위치|place|location|📍|🏠|🗺️?)$/iu;
+  const HUD_MARKER_RE = /^(?:턴|turn|hud|상태|status|날씨|weather|d\+?\d*|day\s*\d*|\d+\s*일차)$/iu;
+  const TIME_LIKE_RE = /(\d{1,4}\s*년|\d{1,2}\s*월\s*\d{1,2}\s*일|\d{1,2}\s*일|요일|\d{1,2}:\d{2}|오전|오후|아침|점심|저녁|새벽|정오|자정|\b(?:AM|PM)\b|day\s*\d+|\d{4}[./-]\d{1,2}[./-]\d{1,2})/i;
+  const CLOCK_RE = /(\d{1,2}:\d{2}(?::\d{2})?|\b(?:AM|PM)\b|오전|오후|\d{1,2}\s*시(?:\s*\d{1,2}\s*분)?)/gi;
+  const EPUB_IMAGE_TYPES = Object.freeze({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/svg+xml': 'svg' });
+
+  function hudField(segment) {
+    const text = String(segment || '').trim();
+    let match = text.match(/^([^:：=]{1,12}?)\s*[:：=]\s*(.+)$/u);
+    // A key never contains digits (so "14:05" or "6월 5일 14:30" is a value), unless it is a HUD marker like "D+3".
+    if (match && (!/\d/.test(match[1]) || HUD_MARKER_RE.test(match[1].trim()))) return { key: match[1].trim(), value: match[2].trim() };
+    match = text.match(/^(\p{Extended_Pictographic}️?)\s*(.+)$/u);
+    if (match) return { key: match[1], value: match[2].trim() };
+    return { key: '', value: text };
+  }
+
+  function hudKind(field) {
+    if (field.key) {
+      if (HUD_TIME_KEY_RE.test(field.key)) return 'time';
+      if (HUD_PLACE_KEY_RE.test(field.key)) return 'place';
+      if (HUD_MARKER_RE.test(field.key)) return 'marker';
+      return 'other';
+    }
+    if (HUD_MARKER_RE.test(field.value)) return 'marker';
+    if (/^#?\d+$/.test(field.value)) return 'number';
+    if (TIME_LIKE_RE.test(field.value)) return 'time';
+    return 'text';
+  }
+
+  // One line → { time, place } when it is a HUD/status line, else null. Only these shapes count:
+  //   [턴|12|2026년 6월 5일 14:05|음악실]   [시간: 오후 3시 | 장소: 음악실]   [장소: 음악실]
+  //   시간: 오후 3시 | 장소: 음악실          📅 6월 5일 | 📍 음악실
+  // and, inside a message's leading header block only (loose), a single "장소: 음악실" line.
+  // Ordinary bracketed text such as [띵동] or [시스템 메시지] is not a HUD.
+  function parseHudLine(line, { loose = false } = {}) {
+    let text = String(line || '').trim();
+    if (!text || text.length > 300) return null;
+    const bracketed = /^\[[^[\]]+\]$/.test(text) || /^【[^【】]+】$/.test(text);
+    if (bracketed) text = text.slice(1, -1).trim();
+    const segments = text.split(/\s*[|｜]\s*/).filter(Boolean);
+    if (!segments.length) return null;
+    const fields = segments.map(hudField);
+    const kinds = fields.map(hudKind);
+    const labeled = fields.some((field, index) => field.key && (kinds[index] === 'time' || kinds[index] === 'place'));
+    const markerFirst = kinds[0] === 'marker';
+    const allKeyed = fields.every((field) => field.key);
+    let hud = false;
+    if (bracketed && segments.length >= 2) hud = markerFirst || labeled;
+    else if (bracketed) hud = labeled || markerFirst;
+    else if (segments.length >= 2) hud = allKeyed && labeled;
+    else hud = labeled && (loose || /\p{Extended_Pictographic}/u.test(fields[0].key));
+    if (!hud) return null;
+    let time = null; let place = null;
+    fields.forEach((field, index) => {
+      if (kinds[index] === 'time' && !time) time = field.value;
+      if (kinds[index] === 'place' && field.key && !place) place = field.value;
+    });
+    if (!place) {
+      // Unlabeled HUD ([턴|12|날짜|장소]): the first plain text field after the time is the place.
+      const timeIndex = kinds.indexOf('time');
+      const candidate = fields.find((field, index) => !field.key && kinds[index] === 'text' && index > timeIndex && field.value.length <= 40);
+      if (candidate && (timeIndex >= 0 || markerFirst)) place = candidate.value;
+    }
+    return { time: time || null, place: place || null };
+  }
+
+  function sceneDayKey(time) {
+    return String(time || '').replace(CLOCK_RE, '').replace(/[\s,·~-]+/g, ' ').trim();
+  }
+
+  function decodeHtmlEntities(text) {
+    return String(text).replace(/&(#\d+|#x[0-9a-f]+|amp|lt|gt|quot|apos|nbsp);/gi, (match, code) => {
+      const lower = code.toLowerCase();
+      if (lower === 'amp') return '&'; if (lower === 'lt') return '<'; if (lower === 'gt') return '>';
+      if (lower === 'quot') return '"'; if (lower === 'apos') return "'"; if (lower === 'nbsp') return ' ';
+      const point = lower.startsWith('#x') ? parseInt(lower.slice(2), 16) : parseInt(lower.slice(1), 10);
+      try { return String.fromCodePoint(point); } catch (_) { return match; }
+    });
+  }
+
+  // Removes "(shortcut: …)" / "(ooc: …)" directives with balanced parentheses (the directive may
+  // itself contain parentheses). Anything else in parentheses is RP text and stays.
+  function removeParenDirectives(text, names = ['shortcut', 'ooc']) {
+    const opener = new RegExp(`[(（]\\s*(?:${names.join('|')})\\s*[:：]`, 'iu');
+    let source = String(text);
+    for (let guard = 0; guard < 200; guard += 1) {
+      const match = opener.exec(source);
+      if (!match) break;
+      let depth = 0; let end = -1;
+      for (let i = match.index; i < source.length; i += 1) {
+        const ch = source[i];
+        if (ch === '(' || ch === '（') depth += 1;
+        else if (ch === ')' || ch === '）') { depth -= 1; if (depth === 0) { end = i; break; } }
+      }
+      source = end < 0 ? source.slice(0, match.index) : source.slice(0, match.index) + source.slice(end + 1);
+    }
+    return source;
+  }
+
+  const IMAGE_URL_LINE_RE = /^\s*<?((?:https?:\/\/|data:image\/)[^\s<>]+?\.(?:png|jpe?g|gif|webp|avif|svg)(?:\?[^\s<>]*)?)>?\s*$/i;
+
+  // Image references inside one message: markdown ![](…), <img src="…">, a bare image URL line, and
+  // image-like URL fields on the message object itself (e.g. an attached illustration).
+  function messageImageFields(message) {
+    const urls = [];
+    const visit = (value, key, depth) => {
+      if (depth > 3 || value == null) return;
+      if (typeof value === 'string') {
+        if (/^(?:https?:\/\/|data:image\/)/i.test(value) && (/image|img|illust|picture|photo|thumbnail|media|asset|file/i.test(key) || /\.(?:png|jpe?g|gif|webp|avif)(?:\?|$)/i.test(value))) urls.push(value);
+        return;
+      }
+      if (Array.isArray(value)) { value.forEach((item) => visit(item, key, depth + 1)); return; }
+      if (typeof value === 'object') for (const [childKey, child] of Object.entries(value)) if (!['content', '_id', 'turnId', 'parentTurnId'].includes(childKey)) visit(child, childKey, depth + 1);
+    };
+    visit(message, '', 0);
+    return urls;
+  }
+
+  // Cleans one RP message into ordered blocks: { type: 'p', text } | { type: 'img', url } | { type: 'break' }.
+  // Returns { blocks, time, place } where time/place come from the message's HUD (first values found).
+  function cleanRpMessage(message, { role = message?.role } = {}) {
+    let text = String(message?.content ?? '').replace(/\r\n?/g, '\n');
+    text = text.replace(/<ooc_[\w-]*>[\s\S]*?<\/ooc_[\w-]*>/gi, '\n');
+    text = text.replace(/<\/?ooc_[\w-]*>/gi, '');
+    text = text.replace(/<!--[\s\S]*?-->/g, '');
+    if (role === 'user') {
+      text = removeParenDirectives(text);
+      text = text.split('\n').filter((line) => !/^\s*\/[\p{L}\p{N}_-]{1,20}\s*$/u.test(line)).join('\n');
+    }
+    const images = [];
+    const placeholder = (url) => { images.push(decodeHtmlEntities(url.trim())); return `\n\u0001IMG${images.length - 1}\u0001\n`; };
+    text = text.replace(/!\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/g, (_, url) => placeholder(url));
+    text = text.replace(/<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi, (_, url) => placeholder(url));
+    text = text.split('\n').map((line) => { const match = line.match(IMAGE_URL_LINE_RE); return match ? placeholder(match[1]) : line; }).join('\n');
+    text = text.replace(/<br\s*\/?>/gi, '\n').replace(/<\/(?:p|div|li|h[1-6])>/gi, '\n').replace(/<\/?[a-z][a-z0-9-]*(?:\s[^<>]*)?\/?>/gi, '');
+    text = decodeHtmlEntities(text);
+    for (const url of messageImageFields(message)) if (!images.includes(url)) { images.push(url); text += `\n\u0001IMG${images.length - 1}\u0001\n`; }
+
+    const blocks = [];
+    let time = null; let place = null; let seenProse = false;
+    const takeScene = (scene) => { if (scene.time && !time) time = scene.time; if (scene.place && !place) place = scene.place; };
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i += 1) {
+      const raw = lines[i];
+      if (/^\s*(```|~~~)/.test(raw)) {
+        // Code fence: a status window made of "key: value" lines is a HUD; anything else is unwrapped.
+        const fence = []; let j = i + 1;
+        while (j < lines.length && !/^\s*(```|~~~)/.test(lines[j])) { fence.push(lines[j]); j += 1; }
+        i = j;
+        const filled = fence.map((line) => line.trim()).filter(Boolean);
+        const fields = filled.map((line) => parseHudLine(line, { loose: true }) || (hudField(line).key && !/\d/.test(hudField(line).key) ? {} : null));
+        if (filled.length && fields.every(Boolean) && fields.some((scene) => scene.time || scene.place)) { fields.forEach(takeScene); continue; }
+        for (const line of fence) if (line.trim()) { blocks.push({ type: 'p', text: line.trim() }); seenProse = true; }
+        continue;
+      }
+      let line = raw.trim();
+      if (!line) continue;
+      const image = line.match(/^\u0001IMG(\d+)\u0001$/);
+      if (image) { blocks.push({ type: 'img', url: images[Number(image[1])] }); continue; }
+      if (/^(?:-{3,}|\*{3,}|_{3,}|={3,}|[*＊]\s*[*＊]\s*[*＊])$/.test(line)) { blocks.push({ type: 'break' }); continue; }
+      const scene = parseHudLine(line, { loose: !seenProse });
+      if (scene) { takeScene(scene); continue; }
+      line = line.replace(/^(?:USER|ASSISTANT|AI|사용자|어시스턴트)\s*[:：]\s*/i, '').replace(/^#{1,6}\s+/, '').replace(/^>\s?/, '');
+      if (!line) continue;
+      blocks.push({ type: 'p', text: line });
+      seenProse = true;
+    }
+    while (blocks.length && blocks[0].type === 'break') blocks.shift();
+    while (blocks.length && blocks[blocks.length - 1].type === 'break') blocks.pop();
+    return { blocks, time, place };
+  }
+
+  // "이름 | "대사"" dialogue format used by the assistant side of the log (null when not used).
+  const PIPE_DIALOGUE_RE = /^([^|"“「『\n]{1,24}?)\s*[|｜]\s*(["“「『].*)$/u;
+  function detectDialogueStyle(assistantBlockLists) {
+    let pipe = 0; let quoted = 0;
+    for (const blocks of assistantBlockLists) {
+      for (const block of blocks) {
+        if (block.type !== 'p') continue;
+        if (PIPE_DIALOGUE_RE.test(block.text)) pipe += 1;
+        else if (/^["“「『]/.test(block.text)) quoted += 1;
+      }
+    }
+    return pipe >= 2 && pipe >= quoted ? 'pipe' : null;
+  }
+
+  // Formats a bare quoted user line like the other characters' lines. Only with a known name.
+  function unifyUserDialogue(blocks, style, name) {
+    const speaker = String(name || '').trim();
+    if (style !== 'pipe' || !speaker) return blocks;
+    return blocks.map((block) => (block.type === 'p' && /^["“「『]/.test(block.text) && !PIPE_DIALOGUE_RE.test(block.text) ? { ...block, text: `${speaker} | ${block.text}` } : block));
+  }
+
+  // Scene of a turn: the assistant's HUD, else the user's.
+  function turnScene(turn) {
+    const assistant = cleanRpMessage({ role: 'assistant', content: turn?.assistant || '' });
+    const user = cleanRpMessage({ role: 'user', content: turn?.user || '' });
+    return { time: assistant.time || user.time || null, place: assistant.place || user.place || null };
+  }
+
+  // Virtual episodes ("N화") for fan-facing references and EPUB chapters. A new episode starts after
+  // `maxTurns` turns, or after `minTurns` when the place or the day changes. Each decision only looks
+  // at earlier turns, so adding turns never renumbers existing episodes. Not related to Canon IDs.
+  const EPISODE_MIN_TURNS = 4;
+  const EPISODE_MAX_TURNS = 10;
+  function segmentEpisodes(scenes, { minTurns = EPISODE_MIN_TURNS, maxTurns = EPISODE_MAX_TURNS } = {}) {
+    const numbers = [];
+    let episode = 1; let start = 0; let lastPlace = null; let lastDay = null;
+    (scenes || []).forEach((scene, index) => {
+      const place = scene?.place || null;
+      const day = scene?.time ? sceneDayKey(scene.time) || null : null;
+      const changed = Boolean((place && lastPlace && place !== lastPlace) || (day && lastDay && day !== lastDay));
+      const length = index - start;
+      if (index > 0 && (length >= maxTurns || (length >= minTurns && changed))) { episode += 1; start = index; }
+      numbers.push(episode);
+      if (place) lastPlace = place;
+      if (day) lastDay = day;
+    });
+    return numbers;
+  }
+
+  function episodeLabel(number) { return Number(number) > 0 ? `${number}화` : null; }
+
+  // eventId → { episodeLabel, sceneLabel, episodePart, scenePlace, sceneTime }: display aliases for
+  // prompts and UI. The Canon event (and its source IDs) is not modified.
+  function buildFanReferenceIndex(turns, events, scenes = null) {
+    const turnScenes = scenes || (turns || []).map(turnScene);
+    const episodes = segmentEpisodes(turnScenes);
+    const turnIndex = new Map((turns || []).map((turn, index) => [turn.id, index]));
+    const lastIndexOf = new Map();
+    episodes.forEach((episode, index) => lastIndexOf.set(episode, index));
+    const firstIndexOf = new Map();
+    episodes.forEach((episode, index) => { if (!firstIndexOf.has(episode)) firstIndexOf.set(episode, index); });
+    const placeAt = (index) => { for (let i = index; i >= 0; i -= 1) if (turnScenes[i]?.place) return turnScenes[i].place; return null; };
+    const timeAt = (index) => { for (let i = index; i >= 0; i -= 1) if (turnScenes[i]?.time) return turnScenes[i].time; return null; };
+    const latest = episodes.length ? episodes[episodes.length - 1] : 0;
+    const byEvent = new Map();
+    for (const event of events || []) {
+      const indices = (event.sourceTurnIds || []).map((id) => turnIndex.get(id)).filter((index) => index != null);
+      let index = indices.length ? Math.min(...indices) : Math.min(episodes.length, Math.max(1, Number(event.turn) || 1)) - 1;
+      if (index < 0 || !episodes.length) continue;
+      index = Math.min(index, episodes.length - 1);
+      const episode = episodes[index];
+      const first = firstIndexOf.get(episode); const last = lastIndexOf.get(episode);
+      const span = Math.max(1, last - first + 1);
+      const ratio = (index - first) / span;
+      const part = episode === latest && index === last ? '마지막' : ratio < 0.34 ? '초반부' : ratio < 0.67 ? '중반부' : index === last ? '마지막' : '후반부';
+      const place = placeAt(index);
+      const title = String(event.title || event.summary || '').trim();
+      const base = [place ? `${place}에서` : '', title].filter(Boolean).join(' ');
+      byEvent.set(event.id, { episodeLabel: episodeLabel(episode), sceneLabel: base && !/(장면|씬)$/.test(base) ? `${base} 장면` : base || null, episodePart: part, scenePlace: place, sceneTime: timeAt(index) });
+    }
+    return {
+      episodes,
+      byEvent,
+      timeline: { latestEpisodeLabel: episodeLabel(latest), previousEpisodeLabel: latest > 1 ? episodeLabel(latest - 1) : null, episodeCount: latest },
+      episodeLabelForTurnCount(count) { const n = Math.max(1, Math.min(episodes.length, Number(count) || 0)); return episodes.length ? episodeLabel(episodes[n - 1]) : null; },
+    };
+  }
+
+  // Deep copy of a prompt payload with fan-facing aliases added next to the internal IDs (which stay).
+  function annotateFanReferences(value, index, depth = 0) {
+    if (depth > 8 || value == null || typeof value !== 'object') return value;
+    if (Array.isArray(value)) return value.map((item) => annotateFanReferences(item, index, depth + 1));
+    const copy = {};
+    for (const [key, child] of Object.entries(value)) copy[key] = annotateFanReferences(child, index, depth + 1);
+    const own = typeof value.id === 'string' ? index?.byEvent?.get(value.id) : null;
+    if (own) Object.assign(copy, { episodeLabel: own.episodeLabel, sceneLabel: own.sceneLabel, episodePart: own.episodePart, scenePlace: own.scenePlace });
+    if (Array.isArray(value.sourceCanonEventIds) && value.sourceCanonEventIds.length) {
+      const refs = [];
+      for (const id of value.sourceCanonEventIds) {
+        const ref = index?.byEvent?.get(id);
+        if (ref && !refs.some((item) => item.sceneLabel === ref.sceneLabel && item.episodeLabel === ref.episodeLabel)) refs.push({ episodeLabel: ref.episodeLabel, episodePart: ref.episodePart, sceneLabel: ref.sceneLabel });
+      }
+      if (refs.length) copy.fanReferences = refs;
+    }
+    return copy;
+  }
+
+  // Removes internal tracking IDs and database-style "Canon #12" references from fan-visible text.
+  // Applied to generated text before saving and again when rendering (older saved posts).
+  function scrubFanText(text, knownIds = null) {
+    if (typeof text !== 'string' || !text) return text;
+    const japanese = /[぀-ヿ]/.test(text);
+    const origin = japanese ? '原作' : '원작';
+    let result = text;
+    if (knownIds) for (const id of knownIds) if (id && id.length >= 6 && result.includes(id)) result = result.split(id).join('');
+    result = result
+      .replace(/\b(?:source_?)?(?:canon_?event|turn|message|pending_?event)_?ids?\b/gi, '')
+      .replace(/\b(?:sourceCanonEventIds|sourceTurnIds|sourceMessageIds|canonEventIds?|pendingEventIds?)\b/g, '')
+      .replace(/\b(?:canon|fact|pending|interpretation|reddit|pixiv|comment)_(?=[0-9a-z]*\d)[0-9a-z]{3,10}\b/gi, '')
+      .replace(/\b(?:internal\s+)?(?:source|event)\s+IDs?\b\s*[:#]?\s*(?:[\w-]*\d[\w-]*)?/gi, '')
+      .replace(/\bcanon\s*(?:event|이벤트|사건|イベント)?\s*(?:#|no\.?|번호)\s*\d+(?:\s*번)?/gi, origin)
+      .replace(/\bcanon\s+(?:event|이벤트|사건|イベント)\s*\d+(?:\s*번)?/gi, origin)
+      .replace(/\bcanon\s*번호/gi, origin)
+      .replace(/\bcanon(?=에서|상(?![가-힣]))/gi, origin);
+    if (result === text) return text;
+    // Tidy only what a removal left behind (empty brackets, doubled spaces); untouched text keeps its spacing.
+    return result.replace(/[(（[]\s*[,、·]?\s*[)）\]]/g, '').replace(/[ \t]{2,}/g, ' ').replace(/ +([,.!?、。])/g, '$1').trim();
+  }
+
+  // ---------- EPUB 3 writer (no dependency) ----------
+  function xmlEscape(value) {
+    return String(value ?? '')
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]/g, '')
+      .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')
+      .replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+  }
+
+  // Escaped text with **strong** and *em* (Crack narration markdown). Tags never nest across each
+  // other because neither pattern may contain markup, so the result is always well-formed XHTML.
+  function epubInline(text) {
+    return xmlEscape(text)
+      .replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*([^*<>\s](?:[^*<>]*?[^*<>\s])?)\*/g, '<em>$1</em>');
+  }
+
+  // Windows-forbidden characters only; the title itself is kept (no slug, no translation).
+  function epubFileName(title, fallback = 'RP Fanverse') {
+    let name = String(title || '').replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_').replace(/[. ]+$/g, '').trim();
+    if (!name) name = fallback;
+    if (/^(?:con|prn|aux|nul|com\d|lpt\d)$/i.test(name)) name = `${name}_`;
+    return `${Array.from(name).slice(0, 120).join('')}.epub`;
+  }
+
+  function stableUuid(text) {
+    const fnv = (input, seed) => { let hash = seed >>> 0; for (let i = 0; i < input.length; i += 1) { hash ^= input.charCodeAt(i); hash = Math.imul(hash, 16777619) >>> 0; } return hash.toString(16).padStart(8, '0'); };
+    const hex = [0x811c9dc5, 0x01000193, 0x9e3779b9, 0x85ebca6b].map((seed) => fnv(String(text), seed)).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-${((parseInt(hex[16], 16) & 3) | 8).toString(16)}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+  }
+
+  function sniffImageType(bytes) {
+    const b = bytes || [];
+    if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+    if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+    if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return 'image/gif';
+    if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
+    if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) return 'image/avif';
+    const head = String.fromCharCode(...Array.from(b.slice ? b.slice(0, 256) : []).filter((c) => c < 128));
+    if (/<svg[\s>]/i.test(head)) return 'image/svg+xml';
+    return null;
+  }
+
+  // Groups cleaned messages into chapters (one per virtual episode) and lays out the scene markers:
+  // a time/place marker appears only where the day or the place changes.
+  // messages: chronological active-branch messages; turns: buildTurns(messages).
+  function buildBookChapters(messages, turns, { userName = '', unifyDialogue = true, sceneMarkers = true, includeImages = true } = {}) {
+    const cleaned = (messages || []).map((message) => ({ message, ...cleanRpMessage(message) }));
+    const style = detectDialogueStyle(cleaned.filter((item) => item.message.role === 'assistant').map((item) => item.blocks));
+    const scenes = (turns || []).map(turnScene);
+    const episodes = segmentEpisodes(scenes);
+    const turnOfMessage = new Map();
+    (turns || []).forEach((turn, index) => { turnOfMessage.set(turn.userMessageId, index); turnOfMessage.set(turn.assistantMessageId, index); });
+    const chapters = [];
+    let current = null; let lastTurn = 0; let lastDay = null; let lastPlace = null; let lastTime = null;
+    for (const item of cleaned) {
+      const turn = turnOfMessage.has(item.message._id) ? turnOfMessage.get(item.message._id) : lastTurn;
+      lastTurn = turn;
+      const number = episodes.length ? episodes[Math.min(turn, episodes.length - 1)] : 1;
+      if (!current || current.number !== number) {
+        current = { number, title: episodeLabel(number), place: null, blocks: [] };
+        chapters.push(current);
+      }
+      let blocks = item.blocks;
+      if (item.message.role === 'user' && unifyDialogue) blocks = unifyUserDialogue(blocks, style, userName);
+      if (!includeImages) blocks = blocks.filter((block) => block.type !== 'img');
+      // A turn's scene is its reply's HUD, so the marker lands before the user's line of that turn.
+      const turnSceneOf = turnOfMessage.has(item.message._id) ? scenes[turn] : null;
+      const time = turnSceneOf?.time || item.time;
+      const place = turnSceneOf?.place || item.place;
+      const day = time ? sceneDayKey(time) || time : null;
+      if (sceneMarkers && (time || place)) {
+        const dayChanged = Boolean(day && day !== lastDay);
+        const placeChanged = Boolean(place && place !== lastPlace);
+        if (dayChanged || placeChanged) current.blocks.push({ type: 'scene', time: time || lastTime, place: place || lastPlace });
+      }
+      if (place && !current.place) current.place = place;
+      if (day) lastDay = day;
+      if (time) lastTime = time;
+      if (place) lastPlace = place;
+      if (blocks.length) current.blocks.push(...blocks);
+    }
+    return { chapters: chapters.filter((chapter) => chapter.blocks.length), dialogueStyle: style };
+  }
+
+  const EPUB_CSS = `body{margin:0 5%;font-family:serif;line-height:1.85;word-break:keep-all;overflow-wrap:break-word}
+h1.ep-title{margin:2.5em 0 2em;font-size:1.35em;font-weight:bold;text-align:center}
+p{margin:0 0 .9em;text-indent:0}
+.scene{margin:2.4em 0 1.6em;text-align:center;color:#555}
+.scene p{margin:0;font-size:.88em;line-height:1.6}
+.scene .scene-place{font-weight:bold}
+hr.scene-mark{width:20%;margin:2em auto;border:0;border-top:1px solid #999}
+figure.illust{margin:1.5em 0;text-align:center}
+figure.illust img{max-width:100%;max-height:95vh}
+.cover{margin:0;padding:0;text-align:center}
+.cover img{max-width:100%;max-height:100vh}
+nav ol{list-style:none;padding-left:0}
+nav li{margin:.4em 0}`;
+
+  function xhtmlDocument(title, body, { css = 'styles/book.css', bodyClass = '' } = {}) {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="ko" lang="ko">
+<head>
+<meta charset="UTF-8"/>
+<title>${xmlEscape(title)}</title>
+<link rel="stylesheet" type="text/css" href="${css}"/>
+</head>
+<body${bodyClass ? ` class="${bodyClass}"` : ''}>
+${body}
+</body>
+</html>
+`;
+  }
+
+  // book: { title, language, identifier, modified (Date), description, source, chapters, cover: { data, mediaType } }
+  // images: Map(url → { data, mediaType }) of downloaded images; references to missing ones are dropped.
+  // Returns [{ name, data }] in EPUB order (mimetype first). Every referenced file is in the manifest.
+  function buildEpubFiles(book, images = new Map()) {
+    const encoder = new TextEncoder();
+    const files = [];
+    const add = (name, data) => files.push({ name, data: typeof data === 'string' ? encoder.encode(data) : data });
+    const modified = new Date(book.modified || Date.now()).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const identifier = book.identifier || `urn:uuid:${stableUuid(book.title || 'book')}`;
+    const imageItems = []; const imageHref = new Map();
+    for (const chapter of book.chapters) {
+      for (const block of chapter.blocks) {
+        if (block.type !== 'img' || imageHref.has(block.url)) continue;
+        const image = images.get(block.url);
+        const ext = image && EPUB_IMAGE_TYPES[image.mediaType];
+        if (!ext) continue;
+        const id = `img${String(imageItems.length + 1).padStart(3, '0')}`;
+        imageHref.set(block.url, `images/${id}.${ext}`);
+        imageItems.push({ id, href: `images/${id}.${ext}`, mediaType: image.mediaType, data: image.data });
+      }
+    }
+    const coverExt = book.cover && EPUB_IMAGE_TYPES[book.cover.mediaType];
+    const coverHref = coverExt ? `images/cover.${coverExt}` : null;
+    const chapterItems = book.chapters.map((chapter, index) => {
+      const id = `ep${String(index + 1).padStart(3, '0')}`;
+      const body = chapter.blocks.map((block) => {
+        if (block.type === 'p') return `<p>${epubInline(block.text)}</p>`;
+        if (block.type === 'break') return '<hr class="scene-mark"/>';
+        if (block.type === 'scene') return `<div class="scene">${block.time ? `<p class="scene-time">${xmlEscape(block.time)}</p>` : ''}${block.place ? `<p class="scene-place">${xmlEscape(block.place)}</p>` : ''}</div>`;
+        if (block.type === 'img' && imageHref.has(block.url)) return `<figure class="illust"><img src="../${imageHref.get(block.url)}" alt=""/></figure>`;
+        return '';
+      }).filter(Boolean).join('\n');
+      const heading = chapter.title || `${index + 1}`;
+      return { id, href: `text/${id}.xhtml`, label: chapter.place ? `${heading} · ${chapter.place}` : heading, xhtml: xhtmlDocument(heading, `<section epub:type="chapter" id="${id}">\n<h1 class="ep-title">${xmlEscape(heading)}</h1>\n${body}\n</section>`, { css: '../styles/book.css' }) };
+    });
+    const title = xmlEscape(book.title);
+    const language = xmlEscape(book.language || 'ko');
+    add('mimetype', 'application/epub+zip');
+    add('META-INF/container.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<rootfiles>
+<rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+</rootfiles>
+</container>
+`);
+    const manifest = [
+      '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
+      '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
+      '<item id="css" href="styles/book.css" media-type="text/css"/>',
+      ...(coverHref ? [`<item id="cover-image" href="${coverHref}" media-type="${book.cover.mediaType}" properties="cover-image"/>`, '<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>'] : []),
+      ...chapterItems.map((item) => `<item id="${item.id}" href="${item.href}" media-type="application/xhtml+xml"/>`),
+      ...imageItems.map((item) => `<item id="${item.id}" href="${item.href}" media-type="${item.mediaType}"/>`),
+    ];
+    const spine = [...(coverHref ? ['<itemref idref="cover" linear="yes"/>'] : []), ...chapterItems.map((item) => `<itemref idref="${item.id}"/>`)];
+    add('OEBPS/content.opf', `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="${language}">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:identifier id="bookid">${xmlEscape(identifier)}</dc:identifier>
+<dc:title>${title}</dc:title>
+<dc:language>${language}</dc:language>
+<meta property="dcterms:modified">${modified}</meta>
+${book.description ? `<dc:description>${xmlEscape(book.description)}</dc:description>\n` : ''}${book.source ? `<dc:source>${xmlEscape(book.source)}</dc:source>\n` : ''}<dc:publisher>RP Fanverse</dc:publisher>
+${coverHref ? '<meta name="cover" content="cover-image"/>\n' : ''}</metadata>
+<manifest>
+${manifest.join('\n')}
+</manifest>
+<spine toc="ncx">
+${spine.join('\n')}
+</spine>
+</package>
+`);
+    const tocList = chapterItems.map((item) => `<li><a href="${item.href}">${xmlEscape(item.label)}</a></li>`).join('\n');
+    add('OEBPS/nav.xhtml', xhtmlDocument(book.title, `<nav epub:type="toc" id="toc">
+<h1>목차</h1>
+<ol>
+${tocList}
+</ol>
+</nav>
+<nav epub:type="landmarks" id="landmarks" hidden="hidden">
+<ol>
+${coverHref ? '<li><a epub:type="cover" href="cover.xhtml">표지</a></li>\n' : ''}${chapterItems.length ? `<li><a epub:type="bodymatter" href="${chapterItems[0].href}">본문</a></li>\n` : ''}</ol>
+</nav>`));
+    add('OEBPS/toc.ncx', `<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1" xml:lang="${language}">
+<head>
+<meta name="dtb:uid" content="${xmlEscape(identifier)}"/>
+<meta name="dtb:depth" content="1"/>
+<meta name="dtb:totalPageCount" content="0"/>
+<meta name="dtb:maxPageNumber" content="0"/>
+</head>
+<docTitle><text>${title}</text></docTitle>
+<navMap>
+${chapterItems.map((item, index) => `<navPoint id="np${index + 1}" playOrder="${index + 1}"><navLabel><text>${xmlEscape(item.label)}</text></navLabel><content src="${item.href}"/></navPoint>`).join('\n')}
+</navMap>
+</ncx>
+`);
+    add('OEBPS/styles/book.css', EPUB_CSS);
+    if (coverHref) {
+      add('OEBPS/cover.xhtml', xhtmlDocument(book.title, `<section epub:type="cover" class="cover"><img src="${coverHref}" alt="${title}"/></section>`, { bodyClass: 'cover' }));
+      add(`OEBPS/${coverHref}`, book.cover.data);
+    }
+    for (const item of chapterItems) add(`OEBPS/${item.href}`, item.xhtml);
+    for (const item of imageItems) add(`OEBPS/${item.href}`, item.data);
+    return files;
+  }
+
+  const CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n += 1) { let c = n; for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; table[n] = c >>> 0; }
+    return table;
+  })();
+  function crc32(bytes) {
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i += 1) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  async function deflateRaw(bytes) {
+    if (typeof CompressionStream !== 'function') return null;
+    try {
+      const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    } catch (_) { return null; }
+  }
+
+  // Minimal ZIP (PKWARE APPNOTE): local headers + central directory, no ZIP64. The first entry
+  // (mimetype) is always stored uncompressed with no extra field, as EPUB requires; text entries are
+  // deflated when CompressionStream exists, images are stored. Returns Uint8Array parts for a Blob.
+  async function createZip(files, { date = new Date(), compress = true, onEntry = null } = {}) {
+    const encoder = new TextEncoder();
+    const d = new Date(date);
+    const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2);
+    const dosDate = (Math.max(0, d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+    const parts = []; const central = []; let offset = 0;
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      const name = encoder.encode(file.name);
+      const data = file.data instanceof Uint8Array ? file.data : new Uint8Array(file.data);
+      const crc = crc32(data);
+      const first = index === 0;
+      let method = 0; let stored = data;
+      if (compress && !first && !/\.(?:png|jpe?g|gif|webp)$/i.test(file.name)) {
+        const deflated = await deflateRaw(data);
+        if (deflated && deflated.length < data.length) { method = 8; stored = deflated; }
+      }
+      const flags = first ? 0 : 0x0800;
+      const local = new DataView(new ArrayBuffer(30));
+      local.setUint32(0, 0x04034b50, true); local.setUint16(4, 20, true); local.setUint16(6, flags, true); local.setUint16(8, method, true);
+      local.setUint16(10, dosTime, true); local.setUint16(12, dosDate, true); local.setUint32(14, crc, true);
+      local.setUint32(18, stored.length, true); local.setUint32(22, data.length, true); local.setUint16(26, name.length, true); local.setUint16(28, 0, true);
+      parts.push(new Uint8Array(local.buffer), name, stored);
+      const entry = new DataView(new ArrayBuffer(46));
+      entry.setUint32(0, 0x02014b50, true); entry.setUint16(4, 20, true); entry.setUint16(6, 20, true); entry.setUint16(8, flags, true); entry.setUint16(10, method, true);
+      entry.setUint16(12, dosTime, true); entry.setUint16(14, dosDate, true); entry.setUint32(16, crc, true); entry.setUint32(20, stored.length, true); entry.setUint32(24, data.length, true);
+      entry.setUint16(28, name.length, true); entry.setUint32(42, offset, true);
+      central.push(new Uint8Array(entry.buffer), name);
+      offset += 30 + name.length + stored.length;
+      await onEntry?.(index + 1, files.length);
+    }
+    const centralSize = central.reduce((sum, part) => sum + part.length, 0);
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+    end.setUint32(12, centralSize, true); end.setUint32(16, offset, true);
+    return [...parts, ...central, new Uint8Array(end.buffer)];
+  }
+
+  // Placeholder cover (SVG): title on a calm gradient. Used when a canvas PNG cannot be drawn.
+  function coverSvg(title, subtitle = 'Crack 캐릭터채팅') {
+    const chars = Array.from(String(title || ''));
+    const lines = []; for (let i = 0; i < chars.length && lines.length < 6; i += 9) lines.push(chars.slice(i, i + 9).join(''));
+    const palette = [['#24364f', '#5b7aa6'], ['#3d2a4f', '#8a6aa8'], ['#2f4a3e', '#6f9a80'], ['#4f2e2a', '#a8705f'], ['#2c3e50', '#7f8c8d']][parseInt(stableUuid(title).slice(0, 2), 16) % 5];
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1800" viewBox="0 0 1200 1800">
+<defs><linearGradient id="g" x1="0" y1="0" x2="0.4" y2="1"><stop offset="0" stop-color="${palette[1]}"/><stop offset="1" stop-color="${palette[0]}"/></linearGradient></defs>
+<rect width="1200" height="1800" fill="url(#g)"/>
+<rect x="90" y="90" width="1020" height="1620" fill="none" stroke="#ffffff" stroke-opacity=".35" stroke-width="4"/>
+${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family="serif" font-size="104" font-weight="700" fill="#fff" text-anchor="middle">${xmlEscape(line)}</text>`).join('\n')}
+<text x="600" y="1560" font-family="sans-serif" font-size="44" fill="#fff" fill-opacity=".8" text-anchor="middle">${xmlEscape(subtitle)}</text>
+</svg>
+`;
+  }
+
   function readingMinutes(characters) {
     return Math.max(1, Math.round((Number(characters) || 0) / 550));
   }
@@ -636,6 +1255,26 @@ ORIGINAL FANWORK:
       readingMinutes,
       isValidChatTitle,
       extractChatRoomTitle,
+      parseHudLine,
+      cleanRpMessage,
+      removeParenDirectives,
+      detectDialogueStyle,
+      unifyUserDialogue,
+      turnScene,
+      segmentEpisodes,
+      buildFanReferenceIndex,
+      annotateFanReferences,
+      scrubFanText,
+      buildBookChapters,
+      buildEpubFiles,
+      createZip,
+      crc32,
+      epubFileName,
+      epubInline,
+      stableUuid,
+      sniffImageType,
+      coverSvg,
+      xmlEscape,
       promptDefinitions: PROMPT_DEFINITIONS,
       defaultPromptTemplates: DEFAULT_PROMPT_TEMPLATES,
     };
@@ -992,6 +1631,13 @@ ORIGINAL FANWORK:
     async fetchChatRoomTitle(info) {
       const json = await this.request(`${API_BASE}/chats/${encodeURIComponent(info.episodeId)}`);
       return extractChatRoomTitle(json?.data, [info.storyId, info.episodeId]);
+    }
+
+    // Same room object, for Books: the user's chat profile (persona) name, when Crack provides one.
+    async fetchChatProfileName(info) {
+      const json = await this.request(`${API_BASE}/chats/${encodeURIComponent(info.episodeId)}`);
+      const name = json?.data?.chatProfile?.name;
+      return typeof name === 'string' && name.trim() && name.trim().length <= 30 ? name.trim() : null;
     }
   }
 
@@ -1671,6 +2317,29 @@ ORIGINAL FANWORK:
       await this.db.put(STORES.worlds, this.world);
     }
 
+    // ---------- fan-facing references ----------
+    // Display aliases (virtual episode "N화", scene label) for Canon events, derived from the active
+    // turns. Canon events and their source IDs are read, never changed. Turn scenes are cached until
+    // the active branch changes.
+    async fanReferenceIndex() {
+      const turns = await this.allActiveTurns();
+      const key = `${this.world.id}:${this.world.canonRevision}:${turns.length}:${turns[turns.length - 1]?.id || ''}`;
+      if (this.fanScenes?.key !== key) this.fanScenes = { key, scenes: turns.map(turnScene) };
+      const events = await this.db.getAllByWorld(STORES.canonEvents, this.world.id);
+      const index = buildFanReferenceIndex(turns, events, this.fanScenes.scenes);
+      index.knownIds = new Set([...events.map((event) => event.id), ...(this.world.canon.facts || []).map((fact) => fact.id)].filter(Boolean));
+      this.fanKnownIds = index.knownIds;
+      return index;
+    }
+
+    // Prompt input with episodeLabel/sceneLabel/fanReferences next to the internal IDs, plus fandomTimeline.
+    withFanReferences(value, index) {
+      if (!index || !value || typeof value !== 'object' || Array.isArray(value)) return value;
+      return { ...annotateFanReferences(value, index), fandomTimeline: index.timeline };
+    }
+
+    fanText(text) { return scrubFanText(text, this.fanKnownIds); }
+
     // silent: automatic/background syncs (polling, page entry). They show no progress/success toast;
     // abnormal states (DOM fallback, branch change) and errors are still reported.
     async sync({ full = false, onProgress = null, allowUpdate = true, silent = false } = {}) {
@@ -1846,8 +2515,9 @@ ${this.world.sync.error}`);
     }
 
     async evolveFandom(canonUpdate, canonEvents, currentTurn) {
+      const fan = await this.fanReferenceIndex().catch(() => null);
       const fandomResult = await this.gemini.generateJson(PromptLibrary.fandomUpdate({
-        canonUpdate: { ...canonUpdate, newCanonEvents: canonEvents }, fandom: this.fandomSnapshot(),
+        canonUpdate: this.withFanReferences({ ...canonUpdate, newCanonEvents: canonEvents }, fan), fandom: this.fandomSnapshot(),
         currentTurn, activity: this.getSettings().activity,
       }), Schemas.fandom, { retries: 1, temperature: 0.65 });
       const interpretations = (fandomResult.interpretations || []).map((item) => ({ ...item, id: Utils.uid('interpretation'), addedTurn: currentTurn }));
@@ -1999,12 +2669,18 @@ ${this.world.sync.error}`);
       (comments || []).forEach((comment, index) => idMap.set(comment.id, `comment_${Utils.hash(`${postId}:${existingComments.length + index}:${comment.personaId}:${comment.body}`)}`));
       return (comments || []).map((comment, index) => {
         const mappedParent = comment.parentId ? (idMap.get(comment.parentId) || (existingIds.has(comment.parentId) ? comment.parentId : null)) : null;
-        return { ...comment, id: idMap.get(comment.id) || `comment_${Utils.hash(`${postId}:${existingComments.length + index}`)}`, parentId: mappedParent, personaId: personaIds.has(comment.personaId) ? comment.personaId : this.world.personas.reddit[0].id, createdAt: new Date(Date.now() - ((comments || []).length - index) * 47000).toISOString() };
+        return { ...comment, body: this.fanText(comment.body), id: idMap.get(comment.id) || `comment_${Utils.hash(`${postId}:${existingComments.length + index}`)}`, parentId: mappedParent, personaId: personaIds.has(comment.personaId) ? comment.personaId : this.world.personas.reddit[0].id, createdAt: new Date(Date.now() - ((comments || []).length - index) * 47000).toISOString() };
       });
     }
 
     async generateReddit(reactions, currentTurn, sourcePendingEventIds = []) {
-      const result = await this.gemini.generateJson(PromptLibrary.redditGenerator({ personas: this.world.personas.reddit, reactions, activity: this.getSettings().activity }), Schemas.reddit, { retries: 1, temperature: 0.85 });
+      const fan = await this.fanReferenceIndex().catch(() => null);
+      const result = await this.gemini.generateJson(PromptLibrary.redditGenerator({ personas: this.world.personas.reddit, reactions: this.withFanReferences(reactions, fan), activity: this.getSettings().activity }), Schemas.reddit, { retries: 1, temperature: 0.85 });
+      // Fan-visible text never carries internal IDs; sourceCanonEventIds keeps them.
+      for (const post of result.posts || []) {
+        post.title = this.fanText(post.title); post.body = this.fanText(post.body);
+        post.continuationTopics = (post.continuationTopics || []).map((topic) => this.fanText(topic));
+      }
       const personaIds = new Set(this.world.personas.reddit.map((persona) => persona.id));
       const eventKey = [...sourcePendingEventIds].sort().join(',');
       const posts = (result.posts || []).slice(0, this.activityLimit('reddit')).map((post, index) => {
@@ -2027,13 +2703,15 @@ ${this.world.sync.error}`);
     async loadMoreRedditComments(post) {
       if (!post?.hasMoreComments) return post;
       const context = await this.buildCanonContext(post.sourceCanonEventIds || [], [post.title, post.body, ...(post.continuationTopics || [])]);
+      const fan = await this.fanReferenceIndex().catch(() => null);
       const result = await this.gemini.generateJson(PromptLibrary.redditMoreComments({
-        post: { id: post.id, title: post.title, body: post.body, category: post.category, sourceCanonEventIds: post.sourceCanonEventIds },
+        post: this.withFanReferences({ id: post.id, title: post.title, body: post.body, category: post.category, sourceCanonEventIds: post.sourceCanonEventIds }, fan),
         existingComments: post.comments,
         continuationTopics: post.continuationTopics || [],
         personas: this.world.personas.reddit,
-        context: { canon: context, fandom: this.fandomSnapshot() },
+        context: { canon: this.withFanReferences(context, fan), fandom: this.fandomSnapshot() },
       }), Schemas.redditComments, { retries: 1, temperature: 0.85 });
+      result.continuationTopics = (result.continuationTopics || []).map((topic) => this.fanText(topic));
       const batch = this.normalizeComments((result.comments || []).slice(0, 12), post.id, post.comments || []);
       if (!batch.length) throw new Error('Gemini returned no additional comments');
       const known = new Set((post.comments || []).map((comment) => comment.id));
@@ -2102,7 +2780,12 @@ ${this.world.sync.error}`);
     }
 
     async generatePixiv(reactions, currentTurn, sourcePendingEventIds = []) {
-      const result = await this.gemini.generateJson(PromptLibrary.pixivMetadataGenerator({ personas: this.world.personas.pixiv, reactions, activity: this.getSettings().activity }), Schemas.pixiv, { retries: 1, temperature: 0.9 });
+      const fan = await this.fanReferenceIndex().catch(() => null);
+      const result = await this.gemini.generateJson(PromptLibrary.pixivMetadataGenerator({ personas: this.world.personas.pixiv, reactions: this.withFanReferences(reactions, fan), activity: this.getSettings().activity }), Schemas.pixiv, { retries: 1, temperature: 0.9 });
+      for (const work of result.works || []) {
+        for (const key of ['title', 'caption', 'summary', 'seriesTitle']) work[key] = this.fanText(work[key]);
+        work.tags = (work.tags || []).map((tag) => this.fanText(tag)).filter(Boolean);
+      }
       const personaIds = new Set(this.world.personas.pixiv.map((persona) => persona.id));
       const eventKey = [...sourcePendingEventIds].sort().join(',');
       const existing = await this.db.getAllByWorld(STORES.pixivWorks, this.world.id);
@@ -2139,7 +2822,8 @@ ${this.world.sync.error}`);
       const author = this.world.personas.pixiv.find((persona) => persona.id === work.authorId);
       const canonContext = await this.buildCanonContext(work.sourceCanonEventIds || [], [work.title, work.ship, work.summary, ...(work.tags || [])]);
       let text; let outline = null; let continuity = null; let initialContinuity = null; let revisionApplied = false;
-      const input = { work, author, canon: canonContext, fandom: this.fandomSnapshot(), language: settings.fanworkLanguage, targetLength: settings.fanworkTargetLength };
+      const fan = await this.fanReferenceIndex().catch(() => null);
+      const input = { work: this.withFanReferences(work, fan), author, canon: this.withFanReferences(canonContext, fan), fandom: this.fandomSnapshot(), language: settings.fanworkLanguage, targetLength: settings.fanworkTargetLength };
       if (settings.fanworkTargetLength > 8000) {
         outline = await this.gemini.generateJson(PromptLibrary.fanworkOutline(input), Schemas.outline, { retries: 1, temperature: 0.65 });
         const sections = [];
@@ -2161,6 +2845,7 @@ ${this.world.sync.error}`);
       } else {
         text = await this.gemini.generateText(PromptLibrary.fanwork(input), { stream: settings.streaming, onChunk });
       }
+      text = this.fanText(text);
       const record = { id: work.id, worldId: this.world.id, text, outline, continuity, initialContinuity, revisionApplied, generatedAt: new Date().toISOString(), language: settings.fanworkLanguage };
       await this.db.put(STORES.fanworks, record);
       work.hasFullText = true;
@@ -2237,6 +2922,161 @@ ${this.world.sync.error}`);
     }
   }
 
+  // ---------- Books: EPUB export ----------
+  // Runs only when "EPUB 다운로드" is pressed (nothing here runs at startup). Pipeline: full active-branch
+  // log from the Crack API (stored log as fallback) → deterministic cleaning into chapters → images
+  // downloaded and embedded (each failure is skipped) → EPUB 3 package → download.
+  const yieldToUi = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  function fetchBinary(url, timeoutMs = 30000) {
+    const data = /^data:([^;,]*)(;base64)?,(.*)$/is.exec(url);
+    if (data) {
+      const text = data[2] ? atob(data[3]) : decodeURIComponent(data[3]);
+      return Promise.resolve({ bytes: Uint8Array.from(text, (ch) => ch.charCodeAt(0) & 0xff), type: data[1] || '' });
+    }
+    if (typeof GM_xmlhttpRequest !== 'function') {
+      return fetch(url, { credentials: 'include' }).then(async (response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return { bytes: new Uint8Array(await response.arrayBuffer()), type: response.headers.get('content-type') || '' };
+      });
+    }
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET', url, responseType: 'arraybuffer', timeout: timeoutMs, anonymous: false,
+        onload: (response) => {
+          if (response.status < 200 || response.status >= 300 || !response.response) return reject(new Error(`HTTP ${response.status}`));
+          const type = /content-type:\s*([^;\r\n]+)/i.exec(response.responseHeaders || '')?.[1]?.trim() || '';
+          resolve({ bytes: new Uint8Array(response.response), type });
+        },
+        onerror: () => reject(new Error('network error')),
+        ontimeout: () => reject(new Error('timeout')),
+      });
+    });
+  }
+
+  // EPUB core image types are kept as-is; other images (AVIF, BMP, …) are re-encoded to PNG when the
+  // browser can decode them, otherwise skipped.
+  async function toEpubImage(bytes, headerType) {
+    if (!bytes?.length || bytes.length > 25 * 1024 * 1024) return null;
+    const type = sniffImageType(bytes) || String(headerType || '').toLowerCase();
+    if (EPUB_IMAGE_TYPES[type]) return { data: bytes, mediaType: type };
+    if (!/^image\//.test(type) || typeof createImageBitmap !== 'function') return null;
+    try {
+      const bitmap = await createImageBitmap(new Blob([bytes], { type }));
+      const canvas = document.createElement('canvas');
+      canvas.width = bitmap.width; canvas.height = bitmap.height;
+      canvas.getContext('2d').drawImage(bitmap, 0, 0);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+      return blob ? { data: new Uint8Array(await blob.arrayBuffer()), mediaType: 'image/png' } : null;
+    } catch (_) { return null; }
+  }
+
+  // Generated cover (no AI): the room title on a calm gradient. PNG via canvas, SVG if that fails.
+  async function drawCover(title) {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1200; canvas.height = 1800;
+      const ctx = canvas.getContext('2d');
+      const palette = [['#5b7aa6', '#24364f'], ['#8a6aa8', '#3d2a4f'], ['#6f9a80', '#2f4a3e'], ['#a8705f', '#4f2e2a'], ['#7f8c8d', '#2c3e50']][parseInt(stableUuid(title).slice(0, 2), 16) % 5];
+      const gradient = ctx.createLinearGradient(0, 0, 500, 1800);
+      gradient.addColorStop(0, palette[0]); gradient.addColorStop(1, palette[1]);
+      ctx.fillStyle = gradient; ctx.fillRect(0, 0, 1200, 1800);
+      ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 4; ctx.strokeRect(90, 90, 1020, 1620);
+      ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = '700 100px "Noto Serif KR","Apple SD Gothic Neo","Malgun Gothic",serif';
+      const lines = []; let line = '';
+      for (const ch of Array.from(title)) {
+        if (ctx.measureText(line + ch).width > 900 && line) { lines.push(line); line = ''; }
+        line += ch;
+      }
+      if (line) lines.push(line);
+      const shown = lines.slice(0, 6);
+      shown.forEach((text, index) => ctx.fillText(text, 600, 700 - (shown.length - 1) * 65 + index * 130));
+      ctx.font = '400 44px "Apple SD Gothic Neo","Malgun Gothic",sans-serif'; ctx.fillStyle = 'rgba(255,255,255,.8)';
+      ctx.fillText('Crack 캐릭터채팅', 600, 1560);
+      // JPEG keeps the generated cover small (a gradient PNG at this size is ~1.5 MB).
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+      if (blob) return { data: new Uint8Array(await blob.arrayBuffer()), mediaType: 'image/jpeg' };
+    } catch (_) { /* canvas unavailable: SVG below */ }
+    return { data: new TextEncoder().encode(coverSvg(title)), mediaType: 'image/svg+xml' };
+  }
+
+  class BookExporter {
+    constructor(engine) { this.engine = engine; }
+
+    // Full active branch, chronological. API first (all pages), then the stored log as a fallback.
+    async loadActiveMessages(onStep) {
+      const { api, db, world, worldInfo } = this.engine;
+      try {
+        const all = await api.fetchMessages(worldInfo.episodeId, { full: true, onProgress: (info) => onStep('fetch', `${Fmt.int(info.messages)}개`) });
+        const active = resolveActiveBranch(all).filter((message) => !message.status || message.status === 'end');
+        if (!active.length) throw new Error('메시지가 없습니다');
+        return { messages: active, warning: null };
+      } catch (error) {
+        const stored = await db.getAllByWorld(STORES.messages, world.id);
+        const position = new Map((world.activeMessageIds || []).map((id, index) => [id, index]));
+        const active = stored.filter((message) => position.has(message._id)).sort((a, b) => position.get(a._id) - position.get(b._id));
+        if (!active.length) throw new Error(`전체 로그를 불러오지 못했습니다: ${error.message}`);
+        return { messages: active, warning: `Crack API에서 전체 로그를 받지 못해(${error.message}) 저장된 로그 ${active.length}개로 만들었습니다.` };
+      }
+    }
+
+    async export(options, onStep = () => {}) {
+      const { world, worldInfo, api } = this.engine;
+      if (!world || !worldInfo) throw new Error('RP world가 아직 연결되지 않았습니다.');
+      if (!world.chatTitle) await this.engine.refreshChatTitle({ force: true });
+      const title = world.chatTitle;
+      if (!title) throw new Error('현재 채팅방 제목을 확인하지 못했습니다. 잠시 후 다시 시도하세요.');
+
+      onStep('fetch', '');
+      const { messages, warning } = await this.loadActiveMessages(onStep);
+      let userName = String(options.userName || '').trim();
+      if (!userName && options.unifyDialogue) userName = await api.fetchChatProfileName(worldInfo).catch(() => null) || '';
+
+      onStep('clean', '');
+      await yieldToUi();
+      const turns = buildTurns(messages);
+      const { chapters } = buildBookChapters(messages, turns, { userName, unifyDialogue: options.unifyDialogue !== false, sceneMarkers: options.sceneMarkers !== false, includeImages: options.includeImages !== false });
+      if (!chapters.length) throw new Error('정리한 본문이 비어 있습니다.');
+      onStep('clean', `${chapters.length}화`);
+
+      const urls = [...new Set(chapters.flatMap((chapter) => chapter.blocks.filter((block) => block.type === 'img').map((block) => block.url)))];
+      const images = new Map(); let failed = 0; let done = 0;
+      onStep('images', urls.length ? `0 / ${urls.length}` : '없음');
+      const queue = [...urls];
+      const worker = async () => {
+        while (queue.length) {
+          const url = queue.shift();
+          try {
+            const { bytes, type } = await fetchBinary(url);
+            const image = await toEpubImage(bytes, type);
+            if (image) images.set(url, image); else failed += 1;
+          } catch (error) {
+            failed += 1;
+            console.warn('[RP Fanverse] EPUB image skipped:', error.message);
+          }
+          done += 1;
+          onStep('images', `${done} / ${urls.length}`);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(3, urls.length) }, worker));
+
+      onStep('package', '');
+      await yieldToUi();
+      const modified = new Date();
+      const files = buildEpubFiles({
+        title, language: 'ko', identifier: `urn:uuid:${stableUuid(`rp-fanverse:${world.id}`)}`, modified,
+        description: `「${title}」 Crack 캐릭터채팅 로그를 웹소설 형식으로 정리한 개인 소장용 EPUB (RP Fanverse ${APP_VERSION}).`,
+        source: `https://crack.wrtn.ai/stories/${worldInfo.storyId}/episodes/${worldInfo.episodeId}`,
+        chapters, cover: await drawCover(title),
+      }, images);
+      const parts = await createZip(files, { date: modified, onEntry: (index, total) => { onStep('package', `${index} / ${total}`); return index % 8 ? null : yieldToUi(); } });
+      const fileName = epubFileName(title);
+      Utils.download(fileName, new Blob(parts, { type: 'application/epub+zip' }), 'application/epub+zip');
+      return { fileName, chapters: chapters.length, messages: messages.length, images: { embedded: images.size, failed }, warning };
+    }
+  }
+
   // Inline SVG icons (own drawings; no external assets are loaded or hotlinked).
   const ICON_PATHS = {
     menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
@@ -2273,6 +3113,8 @@ ${this.world.sync.error}`);
     gear: '<circle cx="12" cy="12" r="3"/><path d="M12 3.8v2.4M12 17.8v2.4M3.8 12h2.4M17.8 12h2.4M6.2 6.2l1.7 1.7M16.1 16.1l1.7 1.7M6.2 17.8l1.7-1.7M16.1 7.9l1.7-1.7"/>',
     check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
     warning: '<path d="M12 4.5 20.5 19h-17z" stroke-linejoin="round"/><path d="M12 10v4M12 16.6v.2"/>',
+    book: '<path d="M4.5 5h5.2a2.3 2.3 0 0 1 2.3 2.3v12.2a1.8 1.8 0 0 0-1.8-1.8H4.5z" stroke-linejoin="round"/><path d="M19.5 5h-5.2A2.3 2.3 0 0 0 12 7.3v12.2a1.8 1.8 0 0 1 1.8-1.8h5.7z" stroke-linejoin="round"/>',
+    download: '<path d="M12 4.5v10.5M7.5 10.5 12 15l4.5-4.5M5 19.5h14"/>',
     copy: '<rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a1.5 1.5 0 0 0-1.5-1.5h-8A1.5 1.5 0 0 0 5 6v8a1.5 1.5 0 0 0 1.5 1.5H8"/>',
   };
 
@@ -2333,7 +3175,7 @@ button{font:inherit;color:inherit;-webkit-tap-highlight-color:transparent}
 .brand small{color:#8e8e93;font:500 10px/1 -apple-system,system-ui,sans-serif;white-space:nowrap}
 main.screen{position:relative;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;background:#fff;min-height:0}
 main.screen::-webkit-scrollbar{width:0;height:0}
-.phone nav{display:grid;grid-template-columns:repeat(4,1fr);border-top:.5px solid #0000002e;background:#f9f9f9;z-index:5}
+.phone nav{display:grid;grid-template-columns:repeat(5,1fr);border-top:.5px solid #0000002e;background:#f9f9f9;z-index:5}
 .phone nav button{position:relative;border:0;background:transparent;color:#8e8e93;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;cursor:pointer;font-size:10px}
 .phone nav button.active{color:#007aff}
 .phone nav .app-badge{right:calc(50% - 22px);top:4px;min-width:16px;height:16px;line-height:16px;font-size:9px;padding:0 4px}
@@ -2358,6 +3200,7 @@ main.screen::-webkit-scrollbar{width:0;height:0}
 .sf-tile.pixiv{background:#0096fa;color:#fff;font:800 34px/1 "Helvetica Neue",Arial,sans-serif}
 .sf-tile.reddit{background:#fff}
 .sf-tile.guide{background:#fff;color:#5e5ce6}
+.sf-tile.books{background:#1f8ce6;color:#fff}
 .sf-tile.settings{background:#8e8e93;color:#fff}
 .sf-tile.letter{background:var(--t,#e5e5ea);color:#fff;font:600 24px/1 -apple-system,system-ui,sans-serif}
 .sf-label{width:100%;color:#3c3c43;font-size:12px;line-height:15px;text-align:center;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all}
@@ -2448,6 +3291,93 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
 .gi-actions button{height:46px;border:0;border-radius:12px;background:#fff;color:#007aff;font-size:15px;cursor:pointer}
 .gi-actions button.primary{background:#007aff;color:#fff;font-weight:600}
 .gi-actions button:disabled{opacity:.45;cursor:default}
+
+.nav-layer{position:absolute;left:0;right:0;z-index:1;overflow:hidden;pointer-events:none;contain:strict}
+.nav-ghost{position:absolute;inset:0;overflow:hidden;background:#fff}
+.nav-dim{position:absolute;inset:0;background:#000;opacity:0}
+main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
+.sheet-layer{position:absolute;inset:0;z-index:30}
+.sheet-dim{position:absolute;inset:0;background:#0000004d}
+.sheet{position:absolute;left:0;right:0;bottom:0;max-height:82%;overflow:auto;padding:8px 20px 22px;border-radius:14px 14px 0 0;background:#fff;box-shadow:0 -6px 24px #00000024;font-family:-apple-system,"SF Pro Text",system-ui,"Noto Sans KR",sans-serif;color:#000}
+.sh-grab{width:36px;height:5px;margin:0 auto 12px;border-radius:3px;background:#d1d1d6}
+.sh-title{margin:0;font:700 18px/24px -apple-system,system-ui,sans-serif}
+.sh-sub{margin-top:2px;color:#8a8a8e;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sh-steps{list-style:none;margin:14px 0 0;padding:0}
+.sh-steps li{display:flex;align-items:center;gap:10px;padding:9px 0;color:#8a8a8e;font-size:14px}
+.sh-steps .sh-detail{margin-left:auto;color:#8a8a8e;font-size:12px}
+.sh-dot{flex:none;width:18px;height:18px;border:2px solid #d1d1d6;border-radius:50%;display:grid;place-items:center}
+.sh-steps li.active{color:#000}
+.sh-steps li.active .sh-dot{border-color:#007aff;border-right-color:transparent;animation:shspin .8s linear infinite}
+.sh-steps li.done{color:#000}
+.sh-steps li.done .sh-dot{border-color:#34c759;background:#34c759}
+.sh-steps li.done .sh-dot:after{content:"";width:7px;height:3px;border:2px solid #fff;border-top:0;border-right:0;transform:translateY(-1px) rotate(-45deg)}
+.sh-steps li.error{color:#ff3b30}
+.sh-steps li.error .sh-dot{border-color:#ff3b30;background:#ff3b30}
+@keyframes shspin{to{transform:rotate(360deg)}}
+.sh-result{margin-top:10px;padding:10px 12px;border-radius:10px;background:#f2f2f7;color:#3a3a3c;font-size:12px;line-height:18px;white-space:pre-line;word-break:break-word}
+.sh-result[data-kind="error"]{background:#ffecec;color:#c41d1d}
+.sh-btn{width:100%;height:46px;margin-top:14px;border:0;border-radius:12px;background:#007aff;color:#fff;font-size:16px;font-weight:600;cursor:pointer}
+@media (prefers-reduced-motion:reduce){.sh-steps li.active .sh-dot{animation:none}.launcher{transition:none}}
+`;
+
+  // Books (Korean e-book store detail page: RIDI-like layout and tokens, own drawing, no brand assets).
+  const BOOKS_CSS = `
+.screen-books{--bk-blue:#1f8ce6;--bk-t1:#303538;--bk-t2:#636c73;--bk-t3:#9ea7ad;--bk-line:#e6e8eb;--bk-bg2:#f2f4f5;background:#fff;color:var(--bk-t1);font-family:-apple-system,"Apple SD Gothic Neo","Noto Sans KR",sans-serif;font-size:14px;line-height:1.4}
+.bk-top{position:sticky;top:0;z-index:5;display:grid;grid-template-columns:44px 1fr 44px;align-items:center;height:48px;padding:0 4px;background:#fff;border-bottom:1px solid var(--bk-line)}
+.bk-top h1{margin:0;text-align:center;font-size:16px;font-weight:700}
+.bk-iconbtn{width:40px;height:40px;border:0;border-radius:50%;background:transparent;color:var(--bk-t1);display:grid;place-items:center;cursor:pointer}
+.bk-tabs{display:flex;gap:20px;padding:0 16px;border-bottom:1px solid var(--bk-line)}
+.bk-tabs span{padding:12px 0 10px;color:var(--bk-t3);font-size:15px;font-weight:700}
+.bk-tabs span.on{color:var(--bk-t1);box-shadow:inset 0 -2px 0 var(--bk-t1)}
+.bk-shelf{display:grid;grid-template-columns:repeat(3,1fr);gap:20px 12px;padding:20px 16px 8px}
+.bk-book{display:flex;flex-direction:column;gap:6px;min-width:0;padding:0;border:0;background:transparent;color:var(--bk-t1);text-align:left;cursor:pointer}
+.bk-book:active .bk-cover{transform:scale(.97)}
+.bk-book b{font-size:13px;line-height:18px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:keep-all}
+.bk-book small{color:var(--bk-t3);font-size:11px}
+.bk-badge{align-self:flex-start;padding:1px 5px;border:1px solid var(--bk-blue);border-radius:3px;color:var(--bk-blue);font-size:10px;font-weight:700}
+.bk-cover{position:relative;display:flex;flex-direction:column;justify-content:space-between;border-radius:3px 5px 5px 3px;color:#fff;background:linear-gradient(170deg,var(--c1),var(--c2));box-shadow:0 2px 10px #0000002e,inset 4px 0 0 #ffffff24;overflow:hidden;transition:transform .12s}
+.bk-cover:after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,#0000001f,transparent 6%)}
+.bk-cover-t{position:relative;font-family:"Noto Serif KR","Apple SD Gothic Neo",serif;font-weight:700;word-break:keep-all;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}
+.bk-cover-s{position:relative;opacity:.82;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bk-cover.m{width:100%;aspect-ratio:2/3;padding:16% 11%}
+.bk-cover.m .bk-cover-t{font-size:12px;line-height:17px;-webkit-line-clamp:5}
+.bk-cover.m .bk-cover-s{font-size:8px}
+.bk-cover.l{width:148px;height:222px;padding:24px 16px}
+.bk-cover.l .bk-cover-t{font-size:18px;line-height:26px;-webkit-line-clamp:6}
+.bk-cover.l .bk-cover-s{font-size:10px}
+.bk-hero{display:flex;justify-content:center;padding:28px 0 22px;background:var(--bk-bg2)}
+.bk-head{padding:18px 20px 4px;text-align:center}
+.bk-kicker{color:var(--bk-blue);font-size:12px;font-weight:700}
+.bk-title{margin:6px 0;font-size:21px;line-height:28px;font-weight:800;word-break:keep-all}
+.bk-author{color:var(--bk-t2);font-size:13px}
+.bk-meta{margin-top:8px;color:var(--bk-t3);font-size:12px}
+.bk-cta{padding:16px 20px 18px;border-bottom:8px solid var(--bk-bg2)}
+.bk-primary{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;height:50px;border:0;border-radius:6px;background:var(--bk-blue);color:#fff;font-size:16px;font-weight:700;cursor:pointer;transition:transform .12s,filter .12s}
+.bk-primary:active,.bk-primary.pressed{transform:scale(.97);filter:brightness(.9)}
+.bk-primary:disabled{cursor:default;filter:grayscale(.3) brightness(.95)}
+.bk-cta-note{margin-top:8px;color:var(--bk-t3);font-size:11px;text-align:center}
+.bk-section{padding:20px 20px 22px;border-bottom:8px solid var(--bk-bg2)}
+.bk-section:last-child{border-bottom:0}
+.bk-section h2{display:flex;align-items:baseline;gap:6px;margin:0 0 12px;font-size:16px;font-weight:800}
+.bk-section h2 small{color:var(--bk-blue);font-size:13px}
+.bk-info{display:grid;grid-template-columns:68px 1fr;gap:9px 10px;margin:0;font-size:13px}
+.bk-info dt{color:var(--bk-t3)}
+.bk-info dd{margin:0;color:var(--bk-t1);word-break:break-word}
+.bk-intro{margin:0;color:var(--bk-t2);font-size:14px;line-height:22px;word-break:keep-all}
+.bk-field{display:block;margin:0 0 6px}
+.bk-field span{display:block;margin-bottom:6px;color:var(--bk-t2);font-size:12px;font-weight:600}
+.bk-field input{width:100%;height:40px;padding:0 12px;border:1px solid var(--bk-line);border-radius:6px;color:var(--bk-t1);font:14px -apple-system,"Noto Sans KR",sans-serif;outline:0}
+.bk-field input:focus{border-color:var(--bk-blue)}
+.bk-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 0;border-top:1px solid var(--bk-line);font-size:14px}
+.bk-toggle input{flex:none;width:20px;height:20px;accent-color:var(--bk-blue)}
+.bk-hint{margin:4px 0 10px;color:var(--bk-t3);font-size:11px;line-height:16px}
+.bk-toc{list-style:none;margin:0;padding:0}
+.bk-toc li{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:8px;align-items:center;padding:11px 0;border-top:1px solid var(--bk-line);font-size:13px}
+.bk-toc li:first-child{border-top:0}
+.bk-toc span{color:var(--bk-t2);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.bk-toc em{color:var(--bk-t3);font-size:11px;font-style:normal}
+.bk-more{width:100%;height:40px;margin-top:8px;border:1px solid var(--bk-line);border-radius:6px;background:#fff;color:var(--bk-t2);font-size:13px;cursor:pointer}
+.bk-note{margin:8px 16px 24px;padding:12px 14px;border-radius:8px;background:var(--bk-bg2);color:var(--bk-t2);font-size:12px;line-height:18px}
 `;
 
   // Pixiv (mobile web, measured from pixiv.net novel tag/detail/user pages).
@@ -2749,7 +3679,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       this.host.id = 'rp-fanverse-host';
       this.root = this.host.attachShadow({ mode: 'open' });
       const navButton = (view, iconName, label) => `<button data-view="${view}" aria-label="${label}">${icon(iconName, 22)}<span>${label}</span></button>`;
-      this.root.innerHTML = `<style>${SHELL_CSS}${PIXIV_CSS}${REDDIT_CSS}</style><button class="launcher" aria-label="RP Fanverse 열기" aria-expanded="false"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="6.5" y="2.8" width="11" height="18.4" rx="2.6"/><path d="M10.5 5.6h3"/></svg><span class="launcher-badge" hidden></span></button><div class="veil" hidden aria-hidden="true"><section class="phone" role="dialog" aria-modal="true" aria-label="RP Fanverse"><header class="statusbar"><div class="sb-left"><button data-action="back" aria-label="뒤로">${icon('back', 18)}</button><span class="clock"></span></div><div class="brand"><small></small></div><div class="sb-right"><span class="sb-icons">${STATUS_ICONS}</span><button data-action="close" aria-label="닫기">${icon('close', 16)}</button></div></header><main class="screen screen-home"></main><nav>${navButton('home', 'home', 'Home')}${navButton('pixiv', 'pen', 'Pixiv')}${navButton('reddit', 'comment', 'Reddit')}${navButton('settings', 'gear', 'Settings')}</nav><div class="toast" hidden></div></section></div>`;
+      this.root.innerHTML = `<style>${SHELL_CSS}${PIXIV_CSS}${REDDIT_CSS}${BOOKS_CSS}</style><button class="launcher" aria-label="RP Fanverse 열기" aria-expanded="false"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="6.5" y="2.8" width="11" height="18.4" rx="2.6"/><path d="M10.5 5.6h3"/></svg><span class="launcher-badge" hidden></span></button><div class="veil" hidden aria-hidden="true"><section class="phone" role="dialog" aria-modal="true" aria-label="RP Fanverse"><header class="statusbar"><div class="sb-left"><button data-action="back" aria-label="뒤로">${icon('back', 18)}</button><span class="clock"></span></div><div class="brand"><small></small></div><div class="sb-right"><span class="sb-icons">${STATUS_ICONS}</span><button data-action="close" aria-label="닫기">${icon('close', 16)}</button></div></header><main class="screen screen-home"></main><nav>${navButton('home', 'home', 'Home')}${navButton('pixiv', 'pen', 'Pixiv')}${navButton('reddit', 'comment', 'Reddit')}${navButton('books', 'book', 'Books')}${navButton('settings', 'gear', 'Settings')}</nav><div class="toast" hidden></div></section></div>`;
       document.documentElement.appendChild(this.host);
       this.host.style.setProperty('--ui-scale', String(this.getSettings().uiScale || 1));
       this.bind(); this.refreshBadges();
@@ -2792,41 +3722,154 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       return true;
     }
 
-    // Bottom-nav switch: a fresh stack per app.
+    // Bottom-nav switch: a fresh stack per app (short crossfade, never a slide).
     go(view, route = null) {
       if (!this.confirmDiscardDraft()) return;
       this.view = view; this.route = route; this.history = [];
-      this.render();
+      this.render({ transition: 'tab' });
     }
 
-    // In-app navigation: remembers where the user was (including scroll) for back().
+    // In-app navigation: remembers where the user was (including scroll) for back(). Slides in from the right.
     push(route, view = this.view) {
       if (!this.confirmDiscardDraft()) return;
       this.history.push({ view: this.view, route: this.route, scroll: this.root.querySelector('main').scrollTop });
       this.view = view; this.route = route;
-      this.render();
+      this.render({ transition: 'push' });
     }
 
-    // Same screen, different parameters (sort, tab, search): no history entry.
+    // Same screen, different parameters (sort, tab, search): no history entry, no transition.
     replace(route, options = { keepScroll: false }) {
       this.route = route;
       this.render(options);
     }
 
+    // Exact reverse of push().
     back() {
       if (!this.confirmDiscardDraft()) return;
       const previous = this.history.pop();
-      if (previous) { this.view = previous.view; this.route = previous.route; this.render({ restoreScroll: previous.scroll }); return; }
-      if (this.route) { this.route = null; this.render(); return; }
+      if (previous) { this.view = previous.view; this.route = previous.route; this.render({ restoreScroll: previous.scroll, transition: 'pop' }); return; }
+      if (this.route) { this.route = null; this.render({ transition: 'pop' }); return; }
       if (this.view !== 'home') this.go('home');
     }
 
+    reducedMotion() {
+      try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (_) { return false; }
+    }
+
+    // ---------- navigation transitions ----------
+    // render() replaces main's content. Only for the duration of a transition, the old content is moved
+    // (not cloned) into an absolutely positioned layer over main and animated with transform/opacity;
+    // the layer is removed when the animation ends. push: new screen from the right, old one shifts
+    // 28% left under a light dim. pop: the reverse. tab: the new screen fades in over the old one.
+    beginTransition(main) {
+      this.finishTransition();
+      const phone = this.root.querySelector('.phone');
+      const layer = document.createElement('div');
+      layer.className = 'nav-layer';
+      layer.setAttribute('aria-hidden', 'true');
+      layer.style.top = `${main.offsetTop}px`;
+      layer.style.height = `${main.offsetHeight}px`;
+      const ghost = document.createElement('div');
+      ghost.className = `${main.className} nav-ghost`;
+      ghost.inert = true;
+      const scroll = main.scrollTop;
+      ghost.append(...main.childNodes);
+      const dim = document.createElement('div');
+      dim.className = 'nav-dim';
+      layer.append(ghost, dim);
+      phone.insertBefore(layer, this.root.querySelector('.phone nav'));
+      ghost.scrollTop = scroll;
+      return { layer, ghost, dim };
+    }
+
+    runTransition(kind, main, parts) {
+      const { layer, ghost, dim } = parts;
+      const ease = 'cubic-bezier(0.32, 0.72, 0, 1)';
+      const duration = kind === 'tab' ? 180 : 320;
+      const timing = { duration, easing: kind === 'tab' ? 'ease-out' : ease, fill: 'both' };
+      const animations = [];
+      if (kind === 'push') {
+        layer.style.zIndex = '1'; main.style.zIndex = '2'; main.classList.add('nav-front');
+        animations.push(main.animate([{ transform: 'translateX(100%)' }, { transform: 'translateX(0)' }], timing));
+        animations.push(ghost.animate([{ transform: 'translateX(0)' }, { transform: 'translateX(-28%)' }], timing));
+        animations.push(dim.animate([{ opacity: 0 }, { opacity: 0.1 }], timing));
+      } else if (kind === 'pop') {
+        layer.style.zIndex = '3'; ghost.style.boxShadow = '-10px 0 28px #0000001f';
+        layer.insertBefore(dim, ghost); // dim covers the returning screen, under the leaving one
+        animations.push(ghost.animate([{ transform: 'translateX(0)' }, { transform: 'translateX(100%)' }], timing));
+        animations.push(main.animate([{ transform: 'translateX(-28%)' }, { transform: 'translateX(0)' }], timing));
+        animations.push(dim.animate([{ opacity: 0.1 }, { opacity: 0 }], timing));
+      } else {
+        layer.style.zIndex = '1'; main.style.zIndex = '2';
+        animations.push(main.animate([{ opacity: 0 }, { opacity: 1 }], timing));
+      }
+      const state = { layer, main, animations };
+      this.navTransition = state;
+      const fallback = setTimeout(() => this.finishTransition(state), duration + 150);
+      Promise.all(animations.map((animation) => animation.finished)).catch(() => {}).then(() => { clearTimeout(fallback); this.finishTransition(state); });
+    }
+
+    // Ends the running transition (or the given one) at once and removes its temporary layer.
+    finishTransition(state = this.navTransition) {
+      if (!state || state.done) return;
+      state.done = true;
+      for (const animation of state.animations || []) { try { animation.cancel(); } catch (_) { /* already finished */ } }
+      state.layer?.remove();
+      if (state.main) { state.main.style.zIndex = ''; state.main.classList.remove('nav-front'); }
+      if (this.navTransition === state) this.navTransition = null;
+    }
+
+    // Toast: short fade + small vertical slide.
     notify(kind, message) {
       const toast = this.root?.querySelector('.toast');
       if (!toast) return;
+      const wasHidden = toast.hidden;
       toast.textContent = message; toast.hidden = false; toast.dataset.kind = kind;
-      clearTimeout(this.toastTimer); this.toastTimer = setTimeout(() => { toast.hidden = true; }, kind === 'error' ? 7000 : 3200);
+      const animate = !this.reducedMotion() && typeof toast.animate === 'function';
+      this.toastAnimation?.cancel();
+      if (wasHidden && animate) this.toastAnimation = toast.animate([{ opacity: 0, transform: 'translateY(8px)' }, { opacity: 1, transform: 'translateY(0)' }], { duration: 200, easing: 'ease-out' });
+      const serial = (this.toastSerial || 0) + 1;
+      this.toastSerial = serial;
+      clearTimeout(this.toastTimer);
+      this.toastTimer = setTimeout(() => {
+        if (!animate) { toast.hidden = true; return; }
+        this.toastAnimation = toast.animate([{ opacity: 1, transform: 'translateY(0)' }, { opacity: 0, transform: 'translateY(6px)' }], { duration: 180, easing: 'ease-in', fill: 'forwards' });
+        const hideNow = () => { if (this.toastSerial === serial && !toast.hidden) { toast.hidden = true; this.toastAnimation?.cancel(); } };
+        this.toastAnimation.finished.then(hideNow, () => {});
+        setTimeout(hideNow, 320); // animations do not advance in a hidden tab
+      }, kind === 'error' ? 7000 : 3200);
       if (this.open) this.renderHeader();
+    }
+
+    // Bottom sheet over the phone: slides up from translateY(100%) over a light dim.
+    openSheet(html, { dismissible = false } = {}) {
+      this.closeSheet(true);
+      const layer = document.createElement('div');
+      layer.className = 'sheet-layer';
+      layer.dataset.dismissible = dismissible ? '1' : '0';
+      layer.innerHTML = `<div class="sheet-dim"></div><section class="sheet" role="dialog" aria-modal="true">${html}</section>`;
+      this.root.querySelector('.phone').appendChild(layer);
+      if (!this.reducedMotion() && typeof layer.animate === 'function') {
+        layer.querySelector('.sheet-dim').animate([{ opacity: 0 }, { opacity: 1 }], { duration: 260, easing: 'ease-out' });
+        layer.querySelector('.sheet').animate([{ transform: 'translateY(100%)' }, { transform: 'translateY(0)' }], { duration: 340, easing: 'cubic-bezier(0.32, 0.72, 0, 1)' });
+      }
+      layer.addEventListener('click', (event) => {
+        if (event.target.closest('[data-sheet-close]') || (layer.dataset.dismissible === '1' && event.target.classList.contains('sheet-dim'))) this.closeSheet();
+      });
+      this.sheet = layer;
+      return layer;
+    }
+
+    closeSheet(immediate = false) {
+      const layer = this.sheet;
+      if (!layer) return;
+      this.sheet = null;
+      if (immediate || this.reducedMotion() || typeof layer.animate !== 'function') { layer.remove(); return; }
+      const timing = { duration: 240, easing: 'cubic-bezier(0.4, 0, 1, 1)', fill: 'forwards' };
+      layer.style.pointerEvents = 'none';
+      layer.querySelector('.sheet-dim').animate([{ opacity: 1 }, { opacity: 0 }], timing);
+      layer.querySelector('.sheet').animate([{ transform: 'translateY(0)' }, { transform: 'translateY(100%)' }], timing).finished.then(() => layer.remove(), () => layer.remove());
+      setTimeout(() => layer.remove(), 400); // animations do not advance in a hidden tab
     }
 
     renderHeader() {
@@ -2854,7 +3897,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       }
     }
 
-    async render({ keepScroll = false, restoreScroll = null } = {}) {
+    async render({ keepScroll = false, restoreScroll = null, transition = null } = {}) {
       if (!this.open) { this.refreshBadges(); return; }
       const token = ++this.renderToken;
       const main = this.root.querySelector('main');
@@ -2870,16 +3913,22 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
         else if (this.view === 'home') html = await this.homeHtml();
         else if (this.view === 'reddit') html = await this.redditHtml();
         else if (this.view === 'pixiv') html = await this.pixivHtml();
+        else if (this.view === 'books') html = await this.booksHtml();
         else html = this.settingsHtml();
       } catch (error) {
         html = `<div class="empty">${Utils.escapeHtml(error.message)}</div>`;
       }
       if (token !== this.renderToken) return; // a newer render started while this one awaited IndexedDB
       const screen = startup ? 'settings' : this.view;
+      // A transition needs something on screen to move away; reduced motion swaps instantly.
+      const animate = Boolean(transition) && main.childNodes.length > 0 && typeof main.animate === 'function' && !this.reducedMotion();
+      if (!animate) this.finishTransition();
+      const parts = animate ? this.beginTransition(main) : null;
       main.className = `screen screen-${screen}`;
       this.root.querySelector('.statusbar').style.setProperty('--sb-bg', screen === 'home' || screen === 'settings' ? '#f2f2f7' : '#fff');
       main.innerHTML = html;
       main.scrollTop = restoreScroll ?? (keepScroll ? previousScroll : 0);
+      if (parts) this.runTransition(transition, main, parts);
       this.refreshBadges();
     }
 
@@ -2891,6 +3940,13 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
     storyTitle() { return this.engine.world?.chatTitle || null; }
     communityTitle() { return this.storyTitle() || '채팅방 제목 확인 중'; }
     communityName() { return `r/${this.communityTitle()}`; }
+
+    // Fan-visible copies of stored posts/works: internal IDs and "Canon #N" are scrubbed for display
+    // (older saved text); the stored records and their source ID fields are not changed.
+    fanPost(post) { const t = (text) => this.engine.fanText(text); return { ...post, title: t(post.title), body: t(post.body), comments: (post.comments || []).map((comment) => ({ ...comment, body: t(comment.body) })) }; }
+    fanWork(work) { const t = (text) => this.engine.fanText(text); return { ...work, title: t(work.title), caption: t(work.caption), summary: t(work.summary), seriesTitle: t(work.seriesTitle), tags: (work.tags || []).map(t) }; }
+    async loadFanIndex() { this.fanIndex = await this.engine.fanReferenceIndex().catch(() => null); return this.fanIndex; }
+    episodeAt(turn) { return this.fanIndex?.episodeLabelForTurnCount(turn) || null; }
 
     paragraphs(text) {
       return String(text || '').split(/\n{2,}/).map((block) => block.trim()).filter(Boolean).map((block) => `<p>${Utils.nl2br(block)}</p>`).join('');
@@ -2964,15 +4020,18 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       const world = this.engine.world;
       const settings = this.getSettings();
       const q = String(this.route?.q || '');
-      const [works, posts] = await Promise.all([
+      const [rawWorks, rawPosts] = await Promise.all([
         this.db.getAllByWorld(STORES.pixivWorks, world.id).catch(() => []),
         this.db.getAllByWorld(STORES.redditPosts, world.id).catch(() => []),
       ]);
+      await this.loadFanIndex();
+      const works = rawWorks.map((work) => this.fanWork(work));
+      const posts = rawPosts.map((post) => this.fanPost(post));
       const search = `<div class="sf-searchwrap"><label class="sf-search">${icon('search', 18)}<input data-sf-search placeholder="Fanverse 검색 또는 fandom://current" value="${this.esc(q)}" enterkeyhint="search" autocomplete="off" spellcheck="false">${q ? `<button data-act="sf-clear" aria-label="검색어 지우기">${icon('close', 14)}</button>` : ''}</label></div>`;
       if (q.trim() && !/^fandom:\/\/current\/?$/i.test(q.trim())) return search + this.sfSearchHtml(q.trim(), works, posts);
 
       const fav = (attrs, cls, glyph, label, badge = 0) => `<button class="sf-fav" ${attrs}><span class="sf-tile ${cls}">${glyph}</span><span class="sf-label">${label}</span>${badge ? `<span class="app-badge">${badge > 99 ? '99+' : badge}</span>` : ''}</button>`;
-      const favorites = `<div class="sf-grid">${fav('data-act="sf-open" data-view="pixiv"', 'pixiv', 'P', 'Pixiv', world.badges.pixiv)}${fav('data-act="sf-open" data-view="reddit"', 'reddit', this.rdLogo(44), 'Reddit', world.badges.reddit)}${fav('data-act="open-instruction"', 'guide', icon('pen', 30), 'Gemini 지침')}${fav('data-act="sf-open" data-view="settings"', 'settings', icon('gear', 32), '설정')}</div>`;
+      const favorites = `<div class="sf-grid">${fav('data-act="sf-open" data-view="pixiv"', 'pixiv', 'P', 'Pixiv', world.badges.pixiv)}${fav('data-act="sf-open" data-view="reddit"', 'reddit', this.rdLogo(44), 'Reddit', world.badges.reddit)}${fav('data-act="sf-open" data-view="books"', 'books', icon('book', 32), 'Books')}${fav('data-act="open-instruction"', 'guide', icon('pen', 30), 'Gemini 지침')}${fav('data-act="sf-open" data-view="settings"', 'settings', icon('gear', 32), '설정')}</div>`;
 
       const ships = [...world.fandom.ships, ...world.fandom.tags].filter((item, index, list) => list.findIndex((other) => other.tag === item.tag) === index).slice(0, 8);
       const shipsHtml = ships.length ? `<div class="sf-grid">${ships.map((item) => fav(`data-act="px-tag" data-tag="${this.esc(item.tag)}"`, 'letter', this.esc(Array.from(item.tag)[0] || '#'), `#${this.esc(item.tag)}`).replace('class="sf-tile letter"', `class="sf-tile letter" style="--t:${this.sfTileColor(item.tag)}"`)).join('')}</div>` : '<div class="sf-empty">아직 팬덤 데이터가 없습니다. RP가 진행되면 CP와 태그가 쌓입니다.</div>';
@@ -2987,7 +4046,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       else if (world.needsImport) activity.push(this.sfRow({ act: 'sf-open', attrs: 'data-view="settings"', color: '#ff9500', glyph: icon('warning', 18), title: '기존 장기 로그가 있습니다', sub: 'Settings에서 현재 RP를 원작으로 가져오기' }));
       if (!this.engine.gemini.providerReady()) activity.push(this.sfRow({ act: 'sf-open', attrs: 'data-view="settings"', color: '#ff3b30', glyph: icon('warning', 18), title: 'AI 생성 사용 불가', sub: 'Settings에서 AI Backend 상태를 확인하세요' }));
       for (const entry of (world.fandom.history || []).slice(-3).reverse()) {
-        activity.push(this.sfRow({ act: 'sf-open', attrs: 'data-view="reddit"', color: '#5e5ce6', glyph: icon('sparkle', 18), title: `turn ${entry.turn} · 팬덤 갱신`, sub: `Canon 사건 ${(entry.canonEventIds || []).length} · 새 해석 ${(entry.interpretationIds || []).length}`, time: Fmt.ago(entry.at) }));
+        activity.push(this.sfRow({ act: 'sf-open', attrs: 'data-view="reddit"', color: '#5e5ce6', glyph: icon('sparkle', 18), title: `${this.episodeAt(entry.turn) || '본편'} · 팬덤 갱신`, sub: `새 장면 ${(entry.canonEventIds || []).length} · 새 해석 ${(entry.interpretationIds || []).length}`, time: Fmt.ago(entry.at) }));
       }
 
       return `${search}${this.sfHeader('즐겨찾기')}${favorites}${this.sfHeader('Trending Ships', ships.length ? 'sf-open' : '', 'data-view="pixiv"')}${shipsHtml}${this.sfHeader('최근 Pixiv', recentWorks.length ? 'sf-open' : '', 'data-view="pixiv"')}${recentWorks.length ? this.sfPages(recentWorks.map((work) => this.sfPixivCard(work))) : '<div class="sf-empty">다음 Fanverse 갱신에서 작품이 올라옵니다.</div>'}${this.sfHeader('Reddit에서 화제', hotPosts.length ? 'sf-open' : '', 'data-view="reddit"')}${hotPosts.length ? this.sfPages(hotPosts.map((post) => this.sfRedditCard(post))) : '<div class="sf-empty">다음 Fanverse 갱신 뒤 토론이 생깁니다.</div>'}${this.sfHeader('최근 Fanverse 활동')}<div class="sf-list">${activity.join('')}</div><div class="sf-foot">fandom://current · ${this.esc(this.communityTitle())} · Fanverse ${APP_VERSION}</div>`;
@@ -3011,7 +4070,8 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
 
     async pixivHtml() {
       const world = this.engine.world;
-      const all = await this.db.getAllByWorld(STORES.pixivWorks, world.id);
+      await this.loadFanIndex();
+      const all = (await this.db.getAllByWorld(STORES.pixivWorks, world.id)).map((work) => this.fanWork(work));
       all.sort((a, b) => (b.publishOrder || 0) - (a.publishOrder || 0));
       this.pxSeriesMap = new Map();
       for (const work of [...all].reverse()) {
@@ -3133,7 +4193,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       let readerHtml;
       let pageCount = 1;
       if (cached) {
-        const body = this.pxReaderBody(cached.text);
+        const body = this.pxReaderBody(this.engine.fanText(cached.text));
         pageCount = body.pages;
         readerHtml = `<div ${attr}>${body.html}<div class="px-pagecount">${pageCount} / ${pageCount} 페이지</div></div>`;
       } else {
@@ -3144,7 +4204,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       const continuity = cached?.continuity?.issues?.length ? `<div class="px-continuity">Fanverse continuity check${cached.revisionApplied ? ' · 수정 pass 적용됨' : ''}<br>${cached.continuity.issues.map((issue) => `· ${this.esc(issue)}`).join('<br>')}</div>` : '';
       const others = all.filter((item) => item.authorId === work.authorId && item.id !== work.id).slice(0, 3);
       const related = all.filter((item) => item.id !== work.id && item.authorId !== work.authorId).map((item) => ({ item, score: (item.ship && item.ship === work.ship ? 3 : 0) + (item.tags || []).filter((tag) => (work.tags || []).includes(tag)).length })).filter((entry) => entry.score > 0).sort((a, b) => b.score - a.score).slice(0, 6).map((entry) => entry.item);
-      return `${authorBar}<div class="px-detail-head"><div class="px-detail-title">${this.esc(work.title)}</div>${work.seriesTitle ? `<button class="px-detail-series" data-act="px-series" data-title="${this.esc(work.seriesTitle)}">${this.esc(work.seriesTitle)} #${series.number}</button>` : ''}${next ? `<button class="px-detail-next" data-act="px-work" data-id="${next.id}" data-replace="1" aria-label="다음 화">${icon('chevronRight', 24)}</button>` : ''}<div class="px-detail-cover"><span class="px-charbadge">${Fmt.int(chars)}글자</span>${this.pxCover(work, 'l')}</div></div>${likeBar}<div class="px-caption" data-act="px-caption-detail">${this.esc(work.caption || work.summary || '')}</div><div class="px-detail-name">${this.esc(work.title)}</div><div class="px-detail-tags">${this.pxTagLine(work)}</div><div class="px-detail-stats"><span>${icon('smile', 14)}${Fmt.int(this.pxLikeCount(work))}</span><span>${icon('heart', 14)}${Fmt.int(work.bookmarks)}</span><span>${icon('eye', 14)}${Fmt.int(work.views)}</span><span>${readingMinutes(chars)}분</span></div><div class="px-date">${this.esc(Fmt.pixivDate(work.createdAt))} · RP turn ${work.turn}</div><div class="px-readerbar"><button data-act="px-reader-top" aria-label="본문 처음으로">${icon('list', 22)}</button><button class="${this.route?.readerPanel ? 'on' : ''}" data-act="px-reader-panel" aria-label="표시 설정">${icon('textSize', 22)}</button><button class="${work.userBookmarked ? 'on' : ''}" data-act="px-bookmark" data-id="${work.id}" aria-label="북마크">${icon('bookmark', 22)}</button><button data-act="px-copy-text" data-id="${work.id}" aria-label="본문 복사">${icon('more', 22)}</button></div>${panel}${readerHtml}${cached ? likeBar : ''}${seriesBox}${continuity}<div style="margin-top:24px;border-top:8px solid var(--px-bg2)"></div>${authorBar}${others.length ? `<div class="px-graylist">${others.map((item) => `<div class="px-graycard" data-act="px-work" data-id="${item.id}" data-replace="1"><div class="px-item-body">${item.seriesTitle ? `<div class="px-item-series">${this.esc(item.seriesTitle)}</div>` : ''}<div class="px-item-title">${this.esc(item.title)}</div><div class="px-item-stats" style="padding:0">${Fmt.int(item.fictionalCharacterCount)}글자</div><div class="px-item-tags" style="padding:0">${this.pxTagLine(item)}</div></div></div>`).join('')}</div><div style="padding:0 16px 8px"><button class="px-pill black" data-act="px-author" data-id="${this.esc(work.authorId)}">모두 보기</button></div>` : ''}<div class="px-section-title">이쪽도 추천드려요</div>${related.length ? `<div class="px-list">${related.map((item) => this.pxItemHtml(item)).join('')}</div>` : '<div class="empty" style="padding-top:8px">아직 추천할 작품이 없습니다.</div>'}`;
+      return `${authorBar}<div class="px-detail-head"><div class="px-detail-title">${this.esc(work.title)}</div>${work.seriesTitle ? `<button class="px-detail-series" data-act="px-series" data-title="${this.esc(work.seriesTitle)}">${this.esc(work.seriesTitle)} #${series.number}</button>` : ''}${next ? `<button class="px-detail-next" data-act="px-work" data-id="${next.id}" data-replace="1" aria-label="다음 화">${icon('chevronRight', 24)}</button>` : ''}<div class="px-detail-cover"><span class="px-charbadge">${Fmt.int(chars)}글자</span>${this.pxCover(work, 'l')}</div></div>${likeBar}<div class="px-caption" data-act="px-caption-detail">${this.esc(work.caption || work.summary || '')}</div><div class="px-detail-name">${this.esc(work.title)}</div><div class="px-detail-tags">${this.pxTagLine(work)}</div><div class="px-detail-stats"><span>${icon('smile', 14)}${Fmt.int(this.pxLikeCount(work))}</span><span>${icon('heart', 14)}${Fmt.int(work.bookmarks)}</span><span>${icon('eye', 14)}${Fmt.int(work.views)}</span><span>${readingMinutes(chars)}분</span></div><div class="px-date">${this.esc(Fmt.pixivDate(work.createdAt))}${this.episodeAt(work.turn) ? ` · 본편 ${this.esc(this.episodeAt(work.turn))} 시점` : ''}</div><div class="px-readerbar"><button data-act="px-reader-top" aria-label="본문 처음으로">${icon('list', 22)}</button><button class="${this.route?.readerPanel ? 'on' : ''}" data-act="px-reader-panel" aria-label="표시 설정">${icon('textSize', 22)}</button><button class="${work.userBookmarked ? 'on' : ''}" data-act="px-bookmark" data-id="${work.id}" aria-label="북마크">${icon('bookmark', 22)}</button><button data-act="px-copy-text" data-id="${work.id}" aria-label="본문 복사">${icon('more', 22)}</button></div>${panel}${readerHtml}${cached ? likeBar : ''}${seriesBox}${continuity}<div style="margin-top:24px;border-top:8px solid var(--px-bg2)"></div>${authorBar}${others.length ? `<div class="px-graylist">${others.map((item) => `<div class="px-graycard" data-act="px-work" data-id="${item.id}" data-replace="1"><div class="px-item-body">${item.seriesTitle ? `<div class="px-item-series">${this.esc(item.seriesTitle)}</div>` : ''}<div class="px-item-title">${this.esc(item.title)}</div><div class="px-item-stats" style="padding:0">${Fmt.int(item.fictionalCharacterCount)}글자</div><div class="px-item-tags" style="padding:0">${this.pxTagLine(item)}</div></div></div>`).join('')}</div><div style="padding:0 16px 8px"><button class="px-pill black" data-act="px-author" data-id="${this.esc(work.authorId)}">모두 보기</button></div>` : ''}<div class="px-section-title">이쪽도 추천드려요</div>${related.length ? `<div class="px-list">${related.map((item) => this.pxItemHtml(item)).join('')}</div>` : '<div class="empty" style="padding-top:8px">아직 추천할 작품이 없습니다.</div>'}`;
     }
 
     pxAuthorHtml(all, id) {
@@ -3214,7 +4274,8 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
 
     async redditHtml() {
       const world = this.engine.world;
-      const posts = await this.db.getAllByWorld(STORES.redditPosts, world.id);
+      await this.loadFanIndex();
+      const posts = (await this.db.getAllByWorld(STORES.redditPosts, world.id)).map((post) => this.fanPost(post));
       this.rdRevealed ||= new Set();
       this.rdCollapsed ||= new Set();
       const route = this.route || {};
@@ -3244,8 +4305,8 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
     rdAboutHtml(posts, stats) {
       const world = this.engine.world;
       const flairs = posts.reduce((map, post) => map.set(post.category, (map.get(post.category) || 0) + 1), new Map());
-      const rules = ['Canon과 팬 해석을 구분해서 쓰기', '최신 회차 내용은 스포일러 태그 필수', 'CP·캐릭터 비하 금지 — 해석은 자유, 공격은 금지', '밈은 밈 플레어로', '근거 없는 "공식 확정" 단정 금지'];
-      return `<div class="rd-about"><div class="rd-about-card"><h2>${this.esc(this.communityName())}</h2><p>공식 RP를 원작(Canon)으로 실시간 읽는 가상 팬 커뮤니티입니다. 같은 Canon을 공유하지만 해석은 저마다 다릅니다.</p><div style="font-size:12px;color:var(--rd-weak)">${icon('clock', 14).replace('class="ic ', 'style="display:inline;vertical-align:-2px" class="ic ')} 생성일 ${new Date(world.createdAt || Date.now()).toLocaleDateString('ko-KR')}</div><div class="rd-about-stats"><div><b>${Fmt.compact(stats.members)}</b>멤버</div><div><b>${stats.online}</b>온라인</div><div><b>${posts.length}</b>게시물</div></div></div><div class="rd-about-card"><h3>${this.esc(this.communityName())} 규칙</h3>${rules.map((rule, index) => `<div class="rd-rule"><span>${index + 1}</span>${this.esc(rule)}</div>`).join('')}</div>${flairs.size ? `<div class="rd-about-card"><h3>플레어</h3><div class="rd-flairs">${[...flairs].map(([name, count]) => `${this.rdFlair(name)}<span style="font-size:12px;color:var(--rd-weak);margin-right:6px">${count}</span>`).join('')}</div></div>` : ''}<div class="rd-about-card"><h3>활동 중인 멤버</h3>${world.personas.reddit.map((persona) => `<div class="rd-member">${this.rdAvatar(persona.name, 32)}<div>u/${this.esc(persona.name)}<small>${this.esc(persona.archetype)} · ${this.esc(persona.bias)}</small></div></div>`).join('')}</div></div>`;
+      const rules = ['원작에서 확정된 내용과 팬 해석을 구분해서 쓰기', '최신 회차 내용은 스포일러 태그 필수', 'CP·캐릭터 비하 금지 — 해석은 자유, 공격은 금지', '밈은 밈 플레어로', '근거 없는 "공식 확정" 단정 금지'];
+      return `<div class="rd-about"><div class="rd-about-card"><h2>${this.esc(this.communityName())}</h2><p>본편을 실시간으로 따라 읽는 가상 팬 커뮤니티입니다. 같은 원작을 보지만 해석은 저마다 다릅니다.</p><div style="font-size:12px;color:var(--rd-weak)">${icon('clock', 14).replace('class="ic ', 'style="display:inline;vertical-align:-2px" class="ic ')} 생성일 ${new Date(world.createdAt || Date.now()).toLocaleDateString('ko-KR')}</div><div class="rd-about-stats"><div><b>${Fmt.compact(stats.members)}</b>멤버</div><div><b>${stats.online}</b>온라인</div><div><b>${posts.length}</b>게시물</div></div></div><div class="rd-about-card"><h3>${this.esc(this.communityName())} 규칙</h3>${rules.map((rule, index) => `<div class="rd-rule"><span>${index + 1}</span>${this.esc(rule)}</div>`).join('')}</div>${flairs.size ? `<div class="rd-about-card"><h3>플레어</h3><div class="rd-flairs">${[...flairs].map(([name, count]) => `${this.rdFlair(name)}<span style="font-size:12px;color:var(--rd-weak);margin-right:6px">${count}</span>`).join('')}</div></div>` : ''}<div class="rd-about-card"><h3>활동 중인 멤버</h3>${world.personas.reddit.map((persona) => `<div class="rd-member">${this.rdAvatar(persona.name, 32)}<div>u/${this.esc(persona.name)}<small>${this.esc(persona.archetype)} · ${this.esc(persona.bias)}</small></div></div>`).join('')}</div></div>`;
     }
 
     rdCommentTime(post, comment, index) {
@@ -3297,7 +4358,101 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       const tree = this.rdCommentsSorted(post, roots).map((comment) => this.rdCommentHtml(post, comment, 0)).join('');
       const remaining = Math.max(0, (post.estimatedCommentCount || 0) - comments.length);
       const menu = route.csortMenu ? `<div class="rd-menu" style="left:16px;top:30px"><div class="rd-menu-title">댓글 정렬</div>${Object.entries(csortLabels).map(([value, label]) => `<button class="${csort === value ? 'active' : ''}" data-act="rd-csort" data-sort="${value}">${label}</button>`).join('')}</div>` : '';
-      return `<div class="reddit-shell">${this.rdHeaderHtml()}<div class="rd-detail-head"><button class="rd-iconbtn filled" data-act="rd-back" aria-label="뒤로">${icon('back', 18)}</button>${this.rdLogo(32)}<div class="col"><span><b>${this.esc(this.communityName())}</b> <span class="dot">•</span> <time>${Fmt.ago(post.createdAt)}</time></span><span>${this.esc(name)}</span></div><span class="grow"></span><button class="rd-iconbtn" data-act="rd-noop" aria-label="더보기">${icon('more', 18)}</button></div><h1 class="rd-detail-title">${this.esc(post.title)}</h1><div class="rd-detail-body"><div class="rd-flairs">${this.rdFlair(post.category)}${post.spoiler ? `<span class="rd-spoiler-badge">${icon('warning', 12)}스포일러</span>` : ''}</div>${this.rdBody(post)}<p class="rd-canon-note">RP canon turn ${post.turn} 시점의 반응${post.sourceCanonEventIds?.length ? ` · 관련 Canon event ${post.sourceCanonEventIds.length}개` : ''}</p></div><div class="rd-detail-actions"><div class="rd-actions">${this.rdVote(post.id, post.userVote, post.score)}<button class="rd-pill" data-act="rd-noop">${icon('comment', 18)}${Fmt.compact(Math.max(comments.length, post.estimatedCommentCount || 0))}</button><button class="rd-pill" data-act="rd-share" data-id="${post.id}">${icon('share', 18)}공유</button></div></div><div class="rd-composer" data-act="rd-compose">대화 참여하기</div><div class="rd-csort"><span>정렬 기준:</span><button class="rd-sortbtn" data-act="rd-csort-menu" aria-haspopup="menu">${csortLabels[csort]}${icon('chevronDown', 16)}</button>${menu}</div>${route.focus ? `<div style="padding:0 16px"><button class="rd-morec" style="margin:0" data-act="rd-unfocus">${icon('back', 16)}전체 댓글 보기</button></div>` : ''}<div class="rd-comments">${tree || '<div class="empty" style="padding:24px 0">아직 댓글이 없습니다.</div>'}${!route.focus && post.hasMoreComments ? `<button class="rd-morec" data-act="rd-more" data-id="${post.id}">${icon('plusCircle', 20)}댓글 더 보기${remaining ? ` (약 ${remaining}개)` : ''}</button>` : ''}</div></div>`;
+      return `<div class="reddit-shell">${this.rdHeaderHtml()}<div class="rd-detail-head"><button class="rd-iconbtn filled" data-act="rd-back" aria-label="뒤로">${icon('back', 18)}</button>${this.rdLogo(32)}<div class="col"><span><b>${this.esc(this.communityName())}</b> <span class="dot">•</span> <time>${Fmt.ago(post.createdAt)}</time></span><span>${this.esc(name)}</span></div><span class="grow"></span><button class="rd-iconbtn" data-act="rd-noop" aria-label="더보기">${icon('more', 18)}</button></div><h1 class="rd-detail-title">${this.esc(post.title)}</h1><div class="rd-detail-body"><div class="rd-flairs">${this.rdFlair(post.category)}${post.spoiler ? `<span class="rd-spoiler-badge">${icon('warning', 12)}스포일러</span>` : ''}</div>${this.rdBody(post)}<p class="rd-canon-note">${this.episodeAt(post.turn) ? `본편 ${this.esc(this.episodeAt(post.turn))} 시점의 반응` : '본편 진행 중의 반응'}</p></div><div class="rd-detail-actions"><div class="rd-actions">${this.rdVote(post.id, post.userVote, post.score)}<button class="rd-pill" data-act="rd-noop">${icon('comment', 18)}${Fmt.compact(Math.max(comments.length, post.estimatedCommentCount || 0))}</button><button class="rd-pill" data-act="rd-share" data-id="${post.id}">${icon('share', 18)}공유</button></div></div><div class="rd-composer" data-act="rd-compose">대화 참여하기</div><div class="rd-csort"><span>정렬 기준:</span><button class="rd-sortbtn" data-act="rd-csort-menu" aria-haspopup="menu">${csortLabels[csort]}${icon('chevronDown', 16)}</button>${menu}</div>${route.focus ? `<div style="padding:0 16px"><button class="rd-morec" style="margin:0" data-act="rd-unfocus">${icon('back', 16)}전체 댓글 보기</button></div>` : ''}<div class="rd-comments">${tree || '<div class="empty" style="padding:24px 0">아직 댓글이 없습니다.</div>'}${!route.focus && post.hasMoreComments ? `<button class="rd-morec" data-act="rd-more" data-id="${post.id}">${icon('plusCircle', 20)}댓글 더 보기${remaining ? ` (약 ${remaining}개)` : ''}</button>` : ''}</div></div>`;
+    }
+
+    // ---------- books (RIDI-like library + detail; EPUB export only, no in-app reader) ----------
+
+    bookOptions() {
+      return { userName: '', unifyDialogue: true, sceneMarkers: true, includeImages: true, ...(this.engine.world?.books || {}) };
+    }
+
+    bkCover(title, size = 'm') {
+      const palette = [['#5b7aa6', '#24364f'], ['#8a6aa8', '#3d2a4f'], ['#6f9a80', '#2f4a3e'], ['#a8705f', '#4f2e2a'], ['#7f8c8d', '#2c3e50']][parseInt(stableUuid(title || 'book').slice(0, 2), 16) % 5];
+      return `<div class="bk-cover ${size}" style="--c1:${palette[0]};--c2:${palette[1]}"><span class="bk-cover-t">${this.esc(title || '제목 확인 중')}</span><span class="bk-cover-s">Crack 캐릭터채팅</span></div>`;
+    }
+
+    // Local summary of the active branch for the detail page (stored messages only; the export
+    // itself re-reads the full log from the Crack API).
+    async bookSummary() {
+      const turns = await this.engine.allActiveTurns();
+      await this.engine.fanReferenceIndex().catch(() => null);
+      const scenes = this.engine.fanScenes?.scenes || turns.map(turnScene);
+      const episodes = segmentEpisodes(scenes);
+      const toc = [];
+      episodes.forEach((number, index) => {
+        let entry = toc[toc.length - 1];
+        if (!entry || entry.number !== number) { entry = { number, from: index + 1, to: index + 1, place: null, time: null }; toc.push(entry); }
+        entry.to = index + 1;
+        if (!entry.place && scenes[index]?.place) entry.place = scenes[index].place;
+        if (!entry.time && scenes[index]?.time) entry.time = scenes[index].time;
+      });
+      const characters = turns.reduce((sum, turn) => sum + String(turn.user || '').length + String(turn.assistant || '').length, 0);
+      return { turns: turns.length, episodes: toc.length, toc, characters };
+    }
+
+    async booksHtml() {
+      const world = this.engine.world;
+      const title = this.storyTitle();
+      const route = this.route || {};
+      if (route.type === 'book') return this.bookDetailHtml(world, title, route);
+      const summary = await this.bookSummary();
+      return `<div class="bk-top"><span></span><h1>내 서재</h1><span></span></div><div class="bk-tabs"><span class="on">전체</span><span>캐릭터채팅</span></div><div class="bk-shelf"><button class="bk-book" data-act="bk-open">${this.bkCover(title, 'm')}<b>${this.esc(title || '채팅방 제목 확인 중')}</b><small>총 ${Fmt.int(summary.episodes)}화 · ${Fmt.int(summary.turns)}턴</small><span class="bk-badge">EPUB</span></button></div><div class="bk-note">지금 열려 있는 Crack 캐릭터채팅 방이 한 권의 책으로 꽂혀 있습니다. 작품을 누르면 상세 페이지에서 전체 로그를 웹소설 형식의 EPUB으로 받을 수 있습니다. 본문은 외부 전자책 앱에서 읽으세요.</div>`;
+    }
+
+    async bookDetailHtml(world, title, route) {
+      const summary = await this.bookSummary();
+      const options = this.bookOptions();
+      const updated = world.sync?.lastAt ? new Date(world.sync.lastAt).toLocaleString('ko-KR', { year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '동기화 전';
+      const tocItems = route.tocAll ? summary.toc : summary.toc.slice(0, 8);
+      const toc = summary.toc.length ? `<ol class="bk-toc">${tocItems.map((entry) => `<li><b>${entry.number}화</b><span>${this.esc([entry.place, entry.time].filter(Boolean).join(' · ') || '장면 정보 없음')}</span><em>${entry.from === entry.to ? `${entry.from}턴` : `${entry.from}–${entry.to}턴`}</em></li>`).join('')}</ol>${summary.toc.length > tocItems.length ? `<button class="bk-more" data-act="bk-toc-all">${summary.toc.length - tocItems.length}개 회차 더 보기</button>` : ''}` : '<p class="bk-intro">아직 동기화된 턴이 없습니다.</p>';
+      return `<div class="bk-top"><button class="bk-iconbtn" data-act="bk-back" aria-label="뒤로">${icon('back', 20)}</button><h1>작품 상세</h1><span></span></div>
+<div class="bk-hero">${this.bkCover(title, 'l')}</div>
+<div class="bk-head"><div class="bk-kicker">캐릭터채팅 · 웹소설형 EPUB</div><h1 class="bk-title">${this.esc(title || '채팅방 제목 확인 중')}</h1><div class="bk-author">Crack 캐릭터채팅 기록</div><div class="bk-meta">총 ${Fmt.int(summary.episodes)}화 · ${Fmt.int(summary.turns)}턴 · 약 ${Fmt.int(summary.characters)}자</div></div>
+<div class="bk-cta"><button class="bk-primary" data-act="bk-export" ${title ? '' : 'disabled'}>${icon('download', 20)}EPUB 다운로드</button><div class="bk-cta-note">${title ? 'EPUB 3 · 전체 활성 분기 로그 · 외부 전자책 앱에서 읽기' : '채팅방 제목을 확인한 뒤 다운로드할 수 있습니다'}</div></div>
+<div class="bk-section"><h2>작품 정보</h2><dl class="bk-info"><dt>회차</dt><dd>총 ${Fmt.int(summary.episodes)}화 · 장소/날짜 변화 기준 자동 구분</dd><dt>분량</dt><dd>동기화된 ${Fmt.int(summary.turns)}턴 · 약 ${Fmt.int(summary.characters)}자 (정리 전) · EPUB은 다운로드할 때 Crack에서 전체 로그를 다시 받아 만듭니다</dd><dt>업데이트</dt><dd>${this.esc(updated)}</dd><dt>원본</dt><dd>Crack 캐릭터채팅 · 현재 활성 분기</dd><dt>형식</dt><dd>EPUB 3 · 이미지 포함 가능</dd></dl></div>
+<div class="bk-section"><h2>작품 소개</h2><p class="bk-intro">「${this.esc(title || '제목 확인 중')}」 캐릭터채팅의 전체 로그를 채팅 UI 흔적 없이 하나의 웹소설 본문으로 이은 개인 소장용 EPUB입니다. 본문은 원문 그대로이며, 상태창·단축 명령·로어 컨텍스트만 걷어 내고 시간과 장소가 바뀌는 곳에만 장면 구분을 넣습니다.</p></div>
+<div class="bk-section"><h2>내보내기 설정</h2><label class="bk-field"><span>내 캐릭터 이름 (대사 형식 통일용 · 비우면 Crack 프로필 이름 사용)</span><input data-book-setting="userName" value="${this.esc(options.userName)}" placeholder="예: 유진" autocomplete="off"></label><p class="bk-hint">이름을 확인할 수 없으면 사용자 대사는 원문 형식 그대로 둡니다.</p><label class="bk-toggle"><span>사용자 대사를 「이름 | "대사"」 형식으로 통일</span><input type="checkbox" data-book-setting="unifyDialogue" ${options.unifyDialogue ? 'checked' : ''}></label><label class="bk-toggle"><span>시간·장소가 바뀔 때 장면 구분 표시</span><input type="checkbox" data-book-setting="sceneMarkers" ${options.sceneMarkers ? 'checked' : ''}></label><label class="bk-toggle"><span>로그 속 이미지를 EPUB에 포함</span><input type="checkbox" data-book-setting="includeImages" ${options.includeImages ? 'checked' : ''}></label></div>
+<div class="bk-section"><h2>목차 <small>${Fmt.int(summary.episodes)}화</small></h2>${toc}<p class="bk-hint">동기화된 로그 기준 미리보기입니다.</p></div>`;
+    }
+
+    async startEpubExport(button) {
+      if (this.exporting) return;
+      this.exporting = true;
+      button?.classList.add('pressed');
+      setTimeout(() => button?.classList.remove('pressed'), 180);
+      const steps = [['fetch', '전체 로그 불러오는 중'], ['clean', '본문 정리 중'], ['images', '이미지 수집 중'], ['package', 'EPUB 만드는 중'], ['done', '완료']];
+      const sheet = this.openSheet(`<div class="sh-grab"></div><h2 class="sh-title">EPUB 만들기</h2><div class="sh-sub">${this.esc(this.storyTitle() || '')}</div><ol class="sh-steps">${steps.map(([id, label]) => `<li data-step="${id}"><span class="sh-dot"></span><span>${label}</span><span class="sh-detail"></span></li>`).join('')}</ol><div class="sh-result" hidden></div><button class="sh-btn" data-sheet-close hidden>닫기</button>`);
+      const order = steps.map(([id]) => id);
+      let current = null;
+      const setStep = (id, detail = '') => {
+        const index = order.indexOf(id);
+        sheet.querySelectorAll('.sh-steps li').forEach((item, i) => {
+          item.classList.toggle('done', i < index || (id === 'done' && i === index));
+          item.classList.toggle('active', i === index && id !== 'done');
+        });
+        if (detail != null) { const slot = sheet.querySelector(`[data-step="${id}"] .sh-detail`); if (slot) slot.textContent = detail; }
+        current = id;
+      };
+      const result = sheet.querySelector('.sh-result');
+      const close = sheet.querySelector('[data-sheet-close]');
+      try {
+        this.bookExporter ||= new BookExporter(this.engine);
+        const done = await this.bookExporter.export(this.bookOptions(), (id, detail) => setStep(id, detail));
+        setStep('done', '');
+        const notes = [`${done.fileName}`, `${done.chapters}화 · ${Fmt.int(done.messages)}개 메시지 · 이미지 ${done.images.embedded}개 포함${done.images.failed ? ` · ${done.images.failed}개는 받지 못해 제외` : ''}`];
+        if (done.warning) notes.push(done.warning);
+        result.hidden = false; result.dataset.kind = 'ok'; result.textContent = notes.join('\n');
+        close.hidden = false;
+        if (!done.warning && !done.images.failed) setTimeout(() => { if (this.sheet === sheet) this.closeSheet(); }, 2400);
+      } catch (error) {
+        const item = current && sheet.querySelector(`[data-step="${current}"]`);
+        if (item) { item.classList.remove('active'); item.classList.add('error'); }
+        result.hidden = false; result.dataset.kind = 'error'; result.textContent = `EPUB을 만들지 못했습니다.\n${error.message}`;
+        close.hidden = false;
+      } finally {
+        this.exporting = false;
+      }
     }
 
     // ---------- settings (iOS Settings-style navigation) ----------
@@ -3582,6 +4737,11 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
             return this.render({ keepScroll: true });
           }
           case 'rd-noop': return;
+          // books
+          case 'bk-open': return this.push({ type: 'book' }, 'books');
+          case 'bk-back': return this.back();
+          case 'bk-toc-all': return this.replace({ ...route, tocAll: true }, { keepScroll: true });
+          case 'bk-export': return this.startEpubExport(target);
           default: return;
         }
       } catch (error) {
@@ -3750,6 +4910,12 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
     async handleChange(event) {
       const input = event.target;
       try {
+        if (input.dataset.bookSetting && this.engine.world) {
+          const key = input.dataset.bookSetting;
+          this.engine.world.books = { ...this.bookOptions(), [key]: input.type === 'checkbox' ? input.checked : String(input.value || '').trim().slice(0, 40) };
+          await this.engine.saveWorld();
+          return;
+        }
         if (input.dataset.readerSetting) {
           const settings = this.getSettings();
           settings.pixivReader = { ...settings.pixivReader, [input.dataset.readerSetting]: input.value };
