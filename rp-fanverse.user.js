@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RP Fanverse
 // @namespace    https://crack.wrtn.ai/
-// @version      0.9.0
+// @version      0.10.0
 // @description  Treats a Crack RP episode as canon and grows a persistent virtual Pixiv/Reddit fandom around it.
 // @author       Personal userscript
 // @match        https://crack.wrtn.ai/stories/*/episodes/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '0.9.0';
+  const APP_VERSION = '0.10.0';
   const DB_NAME = 'rp-fanverse';
   const DB_VERSION = 1;
   const SETTINGS_KEY = 'rp-fanverse:settings:v1';
@@ -77,6 +77,18 @@
     parseJson(text) {
       const source = String(text ?? '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
       return JSON.parse(source);
+    },
+    validateSchema(value, schema, path = '$') {
+      const allowedTypes = Array.isArray(schema?.type) ? schema.type : [schema?.type].filter(Boolean);
+      const actualType = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value === 'number' && Number.isInteger(value) ? 'integer' : typeof value;
+      if (allowedTypes.length && !allowedTypes.includes(actualType) && !(actualType === 'integer' && allowedTypes.includes('number'))) throw new Error(`${path} must be ${allowedTypes.join('|')}`);
+      if (schema?.enum && !schema.enum.includes(value)) throw new Error(`${path} is outside enum`);
+      if (actualType === 'object') {
+        for (const key of schema.required || []) if (!(key in value)) throw new Error(`${path}.${key} is required`);
+        for (const [key, child] of Object.entries(schema.properties || {})) if (key in value) Utils.validateSchema(value[key], child, `${path}.${key}`);
+      }
+      if (actualType === 'array' && schema?.items) value.forEach((item, index) => Utils.validateSchema(item, schema.items, `${path}[${index}]`));
+      return true;
     },
     sleep(ms) {
       return new Promise((resolve) => setTimeout(resolve, ms));
@@ -169,13 +181,34 @@
     return flexDirection === 'column-reverse' ? list.reverse() : list;
   }
 
+  function planPendingExecution(events, currentTurn, canonRevision = 1) {
+    const plan = { reddit: [], pixiv: [], expired: [], waiting: [], skipped: [] };
+    for (const event of events || []) {
+      const kind = ['reddit', 'pixiv', 'cross'].includes(event.kind) ? event.kind : null;
+      const generated = event.generatedPlatforms || { reddit: false, pixiv: false };
+      if (!kind || event.status === 'generated' || event.status === 'expired' || event.status === 'superseded' || event.status === 'suspended') {
+        plan.skipped.push(event); continue;
+      }
+      if (event.branchRevision != null && event.branchRevision !== canonRevision) {
+        plan.skipped.push(event); continue;
+      }
+      if (Number(event.expiryTurn) < currentTurn) { plan.expired.push(event); continue; }
+      if (Number(event.dueTurn) > currentTurn) { plan.waiting.push(event); continue; }
+      if ((kind === 'reddit' || kind === 'cross') && !generated.reddit) plan.reddit.push(event);
+      if ((kind === 'pixiv' || kind === 'cross') && !generated.pixiv) plan.pixiv.push(event);
+    }
+    return plan;
+  }
+
   if (typeof window === 'undefined' || !window.document) {
     globalThis.__RP_FANVERSE_TEST_HOOKS__ = {
       parseWorldFromUrl,
       resolveActiveBranch,
       buildTurns,
       normalizeDomMessageOrder,
+      planPendingExecution,
       hash: Utils.hash,
+      validateSchema: Utils.validateSchema,
     };
     return;
   }
@@ -444,7 +477,10 @@
       return `You simulate a persistent fandom reacting to an ongoing official RP canon. Keep CANON separate from FAN INTERPRETATION. Decide what fans would ship, debate, meme, or create now. One-to-one ships, triangles, poly relationships, and character-centric devotion tags are equally valid. Momentum is not romance-game affection. Schedule reactions to mature over later RP turns: quick reactions soon, essays/theories later, short canon-axis works after that, IF/AU and long works later. Activity level is ${input.activity}.\n\nCANON UPDATE:\n${JSON.stringify(input.canonUpdate)}\n\nCURRENT FANDOM STATE:\n${JSON.stringify(input.fandom)}\n\nCURRENT TURN: ${input.currentTurn}\nReturn interpretation updates, ship/tag deltas, reaction points, and pending events with dueTurn and expiryTurn.`;
     },
     redditGenerator(input) {
-      return `Create virtual Reddit-like fandom posts reacting to the supplied canon and fan interpretations. Use only the persistent persona IDs provided. Users share canon facts but disagree in interpretation. Include analysis, theories, episode discussion, CP discussion, unpopular opinions, and occasional text memes. Comments are a flat list with id and parentId for nested rendering. Do not claim fan theories are canon. Language: Korean, with natural fandom jargon.\n\nPERSONAS:\n${JSON.stringify(input.personas)}\n\nREACTION INPUT:\n${JSON.stringify(input.reactions)}\n\nACTIVITY: ${input.activity}`;
+      return `Create virtual Reddit-like fandom posts reacting to the supplied canon and fan interpretations. Use only the persistent persona IDs provided. Users share canon facts but disagree in interpretation. Include analysis, theories, episode discussion, CP discussion, unpopular opinions, and occasional text memes. Generate only a small initial comment sample per post; the rest will be generated on demand. Comments are a flat list with id and parentId for nested rendering. Supply estimatedCommentCount, hasMoreComments, and continuationTopics so later batches can continue naturally. Do not claim fan theories are canon. Language: Korean, with natural fandom jargon.\n\nPERSONAS:\n${JSON.stringify(input.personas)}\n\nREACTION INPUT:\n${JSON.stringify(input.reactions)}\n\nACTIVITY: ${input.activity}`;
+    },
+    redditMoreComments(input) {
+      return `Continue a persistent virtual Reddit discussion. Generate only the next comment batch, not the post again. Reuse only the supplied persona IDs. Comments may reply to an existing comment ID or another new temporary ID from this batch. Preserve disagreements and persona biases, avoid repeating existing comments, and ground all claims in the supplied canon/fandom context. Return hasMoreComments based on whether the discussion still has worthwhile unexplored threads. Language: Korean.\n\nPOST:\n${JSON.stringify(input.post)}\n\nEXISTING COMMENTS:\n${JSON.stringify(input.existingComments)}\n\nCONTINUATION TOPICS:\n${JSON.stringify(input.continuationTopics)}\n\nPERSONAS:\n${JSON.stringify(input.personas)}\n\nCANON/FANDOM CONTEXT:\n${JSON.stringify(input.context)}`;
     },
     pixivMetadataGenerator(input) {
       return `Create metadata only for virtual Japanese Pixiv-like fanworks based on the supplied fandom reaction input. Do NOT write the full work. Use only persistent author persona IDs provided. Mix 原作軸, 幕間, IF, AU, future fabrication, multi-person relationships, and character-centric works as appropriate. Titles/captions/tags should feel natural in Japanese. Source canon IDs must be retained.\n\nAUTHORS:\n${JSON.stringify(input.personas)}\n\nREACTION INPUT:\n${JSON.stringify(input.reactions)}\n\nACTIVITY: ${input.activity}`;
@@ -457,6 +493,9 @@
     },
     continuity(input) {
       return `Check this virtual fanwork against its own outline and supplied canon. Fanwork divergence is allowed when labeled; identify only accidental contradictions, name drift, timeline breaks, and unresolved continuity problems. Return concise issues and continuityNotes.\n${JSON.stringify(input)}`;
+    },
+    fanworkRevision(input) {
+      return `Revise the complete virtual fanwork to fix every accidental continuity issue listed below. Preserve the work's title, voice, emotional arc, approximate length, deliberate IF/AU divergences, and all passages that do not need changes. Return only the full corrected fanwork with no preface or commentary. Language: ${input.language}.\n\nOUTLINE:\n${JSON.stringify(input.outline)}\n\nCANON CONTEXT:\n${JSON.stringify(input.canon)}\n\nISSUES TO FIX:\n${JSON.stringify(input.issues)}\n\nCONTINUITY NOTES:\n${JSON.stringify(input.continuityNotes)}\n\nORIGINAL FANWORK:\n${input.text}`;
     },
   };
 
@@ -485,9 +524,10 @@
     },
     reddit: {
       type: 'object', properties: { posts: { type: 'array', items: { type: 'object', properties: {
-        personaId: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, category: { type: 'string' }, spoiler: { type: 'boolean' }, score: { type: 'integer' }, sourceCanonEventIds: { type: 'array', items: { type: 'string' } }, comments: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, parentId: { type: ['string', 'null'] }, personaId: { type: 'string' }, body: { type: 'string' }, score: { type: 'integer' } }, required: ['id', 'parentId', 'personaId', 'body', 'score'] } },
-      }, required: ['personaId', 'title', 'body', 'category', 'spoiler', 'score', 'sourceCanonEventIds', 'comments'] } } }, required: ['posts'],
+        personaId: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, category: { type: 'string' }, spoiler: { type: 'boolean' }, score: { type: 'integer' }, sourceCanonEventIds: { type: 'array', items: { type: 'string' } }, estimatedCommentCount: { type: 'integer' }, hasMoreComments: { type: 'boolean' }, continuationTopics: { type: 'array', items: { type: 'string' } }, comments: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, parentId: { type: ['string', 'null'] }, personaId: { type: 'string' }, body: { type: 'string' }, score: { type: 'integer' } }, required: ['id', 'parentId', 'personaId', 'body', 'score'] } },
+      }, required: ['personaId', 'title', 'body', 'category', 'spoiler', 'score', 'sourceCanonEventIds', 'estimatedCommentCount', 'hasMoreComments', 'continuationTopics', 'comments'] } } }, required: ['posts'],
     },
+    redditComments: { type: 'object', properties: { hasMoreComments: { type: 'boolean' }, continuationTopics: { type: 'array', items: { type: 'string' } }, comments: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, parentId: { type: ['string', 'null'] }, personaId: { type: 'string' }, body: { type: 'string' }, score: { type: 'integer' } }, required: ['id', 'parentId', 'personaId', 'body', 'score'] } } }, required: ['hasMoreComments', 'continuationTopics', 'comments'] },
     pixiv: {
       type: 'object', properties: { works: { type: 'array', items: { type: 'object', properties: {
         authorId: { type: 'string' }, title: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } }, ship: { type: 'string' }, caption: { type: 'string' }, summary: { type: 'string' }, fictionalCharacterCount: { type: 'integer' }, views: { type: 'integer' }, bookmarks: { type: 'integer' }, sourceCanonEventIds: { type: 'array', items: { type: 'string' } }, workType: { type: 'string' }, tone: { type: 'string' }, seriesTitle: { type: 'string' },
@@ -514,6 +554,7 @@
       return new Promise((resolve, reject) => {
         let consumed = 0;
         let accumulated = '';
+        let sseBuffer = '';
         GM_xmlhttpRequest({
           method: 'POST', url: this.endpoint(stream),
           headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.apiKey },
@@ -521,7 +562,10 @@
           onprogress: stream ? (response) => {
             const fresh = String(response.responseText || '').slice(consumed);
             consumed += fresh.length;
-            for (const line of fresh.split(/\r?\n/)) {
+            sseBuffer += fresh;
+            const lines = sseBuffer.split(/\r?\n/);
+            sseBuffer = lines.pop() || '';
+            for (const line of lines) {
               if (!line.startsWith('data: ')) continue;
               try {
                 const json = JSON.parse(line.slice(6));
@@ -569,6 +613,7 @@
           });
           const parsed = Utils.parseJson(text);
           if (!parsed || typeof parsed !== 'object') throw new Error('Structured response is not an object');
+          Utils.validateSchema(parsed, schema);
           return parsed;
         } catch (error) { lastError = error; }
       }
@@ -614,6 +659,7 @@
       schemaVersion: DB_VERSION, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       sync: { adapter: 'none', status: 'new', lastAt: null, error: null },
       activeMessageIds: [], processedTurnIds: [], turnCount: 0, lastProcessedTurn: 0,
+      canonRevision: 1,
       canon: { facts: [], characters: [], relationships: [], recentEventIds: [] },
       fandom: { interpretations: [], ships: [], tags: [], history: [], recentPlatformSignals: [] },
       personas: seedPersonas(),
@@ -632,6 +678,11 @@
     async attach(info) {
       this.worldInfo = info;
       this.world = await this.db.get(STORES.worlds, info.id) || createWorld(info);
+      this.world.canonRevision = Number(this.world.canonRevision) || 1;
+      this.world.fandom ||= { interpretations: [], ships: [], tags: [], history: [] };
+      this.world.fandom.recentPlatformSignals ||= [];
+      this.world.fandom.history ||= [];
+      this.world.badges ||= { phone: 0, reddit: 0, pixiv: 0 };
       await this.db.put(STORES.worlds, this.world);
       return this.world;
     }
@@ -666,7 +717,11 @@
         const active = resolveActiveBranch(newest ? [newest, ...all.filter((message) => message._id !== newest._id)] : all);
         const turns = buildTurns(active);
         const activeTurnIds = new Set(turns.map((turn) => turn.id));
-        if (this.world.processedTurnIds.some((id) => !activeTurnIds.has(id))) this.world.needsCanonRebuild = true;
+        const branchChanged = this.world.processedTurnIds.some((id) => !activeTurnIds.has(id));
+        if (branchChanged && !this.world.needsCanonRebuild) {
+          this.world.needsCanonRebuild = true;
+          await this.suspendPendingForBranchChange();
+        }
         this.world.activeMessageIds = active.map((message) => message._id);
         this.world.turnCount = turns.length;
         await this.saveWorld();
@@ -713,6 +768,29 @@
         ships: this.world.fandom.ships.slice(-40), tags: this.world.fandom.tags.slice(-80),
         recentPlatformSignals: (this.world.fandom.recentPlatformSignals || []).slice(-20),
       };
+    }
+
+    async buildCanonContext(sourceCanonEventIds = [], hints = []) {
+      const allEvents = (await this.db.getAllByWorld(STORES.canonEvents, this.world.id)).sort((a, b) => a.turn - b.turn);
+      const sourceIds = new Set(sourceCanonEventIds || []);
+      const sourceEvents = allEvents.filter((event) => sourceIds.has(event.id));
+      const characterNames = new Set(sourceEvents.flatMap((event) => event.characters || []));
+      const hintText = (hints || []).join(' ').toLowerCase();
+      for (const state of [...this.world.canon.characters, ...this.world.canon.relationships]) {
+        const names = [state.name, state.from, state.to].filter(Boolean);
+        if (names.some((name) => hintText.includes(String(name).toLowerCase()))) names.forEach((name) => characterNames.add(name));
+      }
+      const relatedPastEvents = allEvents.filter((event) => !sourceIds.has(event.id) && ((event.characters || []).some((name) => characterNames.has(name)) || (event.title && hintText.includes(event.title.toLowerCase())))).slice(-50);
+      const facts = this.world.canon.facts.slice(-180);
+      const characterState = this.world.canon.characters.slice(-100);
+      const relationshipState = this.world.canon.relationships.slice(-120);
+      const focus = {
+        characterNames: [...characterNames],
+        facts: facts.filter((fact) => !characterNames.size || characterNames.has(fact.subject) || [...characterNames].some((name) => fact.text?.includes(name))),
+        characterState: characterState.filter((state) => !characterNames.size || characterNames.has(state.name)),
+        relationshipState: relationshipState.filter((state) => !characterNames.size || characterNames.has(state.from) || characterNames.has(state.to)),
+      };
+      return { facts, characterState, relationshipState, sourceEvents, relatedPastEvents, recentEvents: allEvents.slice(-30), focus };
     }
 
     prepareTurns(turns) {
@@ -776,15 +854,104 @@
       this.world.fandom.interpretations.push(...interpretations);
       this.world.fandom.ships = this.mergeMomentum(this.world.fandom.ships, fandomResult.shipDeltas, currentTurn);
       this.world.fandom.tags = this.mergeMomentum(this.world.fandom.tags, fandomResult.tagDeltas, currentTurn);
-      const pending = (fandomResult.pendingEvents || []).map((event) => ({ ...event, id: Utils.uid('pending'), worldId: this.world.id, createdTurn: currentTurn, generated: false }));
-      await this.db.bulkPut(STORES.pendingEvents, pending);
-      const allPending = await this.db.getAllByWorld(STORES.pendingEvents, this.world.id);
-      const due = allPending.filter((event) => !event.generated && event.dueTurn <= currentTurn && event.expiryTurn >= currentTurn);
-      const reactions = { immediate: fandomResult.reactionPoints || [], due, canonEvents, interpretations };
-      await Promise.all([this.generateReddit(reactions, currentTurn), this.generatePixiv(reactions, currentTurn)]);
-      for (const event of due) { event.generated = true; event.generatedTurn = currentTurn; await this.db.put(STORES.pendingEvents, event); }
+      const pending = (fandomResult.pendingEvents || []).map((event) => {
+        const kind = ['reddit', 'pixiv', 'cross'].includes(event.kind) ? event.kind : 'reddit';
+        const dueTurn = Math.max(currentTurn, Number(event.dueTurn) || currentTurn);
+        const expiryTurn = Math.max(dueTurn, Number(event.expiryTurn) || dueTurn + 20);
+        const sourceCanonEventIds = [...new Set(event.sourceCanonEventIds || [])];
+        const id = `pending_${Utils.hash(`${this.world.id}:${this.world.canonRevision}:${kind}:${dueTurn}:${event.payload}:${sourceCanonEventIds.sort().join(',')}`)}`;
+        return { ...event, id, kind, dueTurn, expiryTurn, sourceCanonEventIds, worldId: this.world.id, createdTurn: currentTurn, branchRevision: this.world.canonRevision, status: 'pending', generated: false, generatedPlatforms: { reddit: false, pixiv: false } };
+      });
+      const existingPending = new Map((await this.db.getAllByWorld(STORES.pendingEvents, this.world.id)).map((event) => [event.id, event]));
+      const dedupedPending = pending.map((event) => {
+        const existing = existingPending.get(event.id);
+        if (!existing) return event;
+        return { ...event, ...existing, expiryTurn: Math.max(event.expiryTurn, existing.expiryTurn || 0), sourceCanonEventIds: [...new Set([...(existing.sourceCanonEventIds || []), ...(event.sourceCanonEventIds || [])])] };
+      });
+      await this.db.bulkPut(STORES.pendingEvents, dedupedPending);
+      await this.executePendingEvents(currentTurn, { immediate: fandomResult.reactionPoints || [], canonEvents, interpretations });
       this.world.fandom.history.push({ turn: currentTurn, at: new Date().toISOString(), canonEventIds: canonEvents.map((event) => event.id), interpretationIds: interpretations.map((item) => item.id) });
       return { fandomResult, interpretations };
+    }
+
+    async suspendPendingForBranchChange() {
+      const pending = await this.db.getAllByWorld(STORES.pendingEvents, this.world.id);
+      for (const event of pending) {
+        if (!['generated', 'expired', 'superseded'].includes(event.status)) {
+          event.status = 'suspended';
+          event.suspendedReason = 'canon-branch-changed';
+          await this.db.put(STORES.pendingEvents, event);
+        }
+      }
+    }
+
+    async executePendingEvents(currentTurn, context = {}) {
+      const allPending = await this.db.getAllByWorld(STORES.pendingEvents, this.world.id);
+      const plan = planPendingExecution(allPending, currentTurn, this.world.canonRevision);
+      for (const event of plan.expired) {
+        event.status = 'expired'; event.expiredAtTurn = currentTurn;
+        await this.db.put(STORES.pendingEvents, event);
+      }
+      const redditOnly = plan.reddit.filter((event) => event.kind === 'reddit');
+      const redditCross = plan.reddit.filter((event) => event.kind === 'cross');
+      const pixivOnly = plan.pixiv.filter((event) => event.kind === 'pixiv');
+      const pixivCross = plan.pixiv.filter((event) => event.kind === 'cross');
+      let crossRedditPosts = [];
+      const runRedditGroup = async (events, isCross) => {
+        if (!events.length) return [];
+        try {
+          const posts = await this.generateReddit({ ...context, due: events, crossLink: isCross }, currentTurn, events.map((event) => event.id));
+          for (const event of events) {
+            event.generatedPlatforms ||= { reddit: false, pixiv: false };
+            event.generatedPlatforms.reddit = true;
+            event.redditGeneratedTurn = currentTurn;
+            event.lastError = null;
+            await this.db.put(STORES.pendingEvents, event);
+          }
+          return posts;
+        } catch (error) {
+          for (const event of events) { event.status = 'failed'; event.lastError = `reddit: ${error.message}`; await this.db.put(STORES.pendingEvents, event); }
+          this.notify('error', `Reddit pending event retry scheduled: ${error.message}`);
+          return [];
+        }
+      };
+      await runRedditGroup(redditOnly, false);
+      crossRedditPosts = await runRedditGroup(redditCross, true);
+      const runPixivGroup = async (events, crossPosts = []) => {
+        if (!events.length) return [];
+        try {
+          const works = await this.generatePixiv({ ...context, due: events, crossRedditPosts: crossPosts.map((post) => ({ id: post.id, title: post.title, body: post.body, score: post.score })), crossLink: Boolean(crossPosts.length) }, currentTurn, events.map((event) => event.id));
+          for (const event of events) {
+            event.generatedPlatforms ||= { reddit: false, pixiv: false };
+            event.generatedPlatforms.pixiv = true;
+            event.pixivGeneratedTurn = currentTurn;
+            event.lastError = null;
+            await this.db.put(STORES.pendingEvents, event);
+          }
+          return works;
+        } catch (error) {
+          for (const event of events) { event.status = 'failed'; event.lastError = `pixiv: ${error.message}`; await this.db.put(STORES.pendingEvents, event); }
+          this.notify('error', `Pixiv pending event retry scheduled: ${error.message}`);
+          return [];
+        }
+      };
+      await runPixivGroup(pixivOnly);
+      if (pixivCross.length && !crossRedditPosts.length) {
+        const crossIds = new Set(pixivCross.map((event) => event.id));
+        crossRedditPosts = (await this.db.getAllByWorld(STORES.redditPosts, this.world.id)).filter((post) => post.sourcePendingEventIds?.some((id) => crossIds.has(id)));
+      }
+      await runPixivGroup(pixivCross, crossRedditPosts);
+      const touched = new Set([...plan.reddit, ...plan.pixiv].map((event) => event.id));
+      for (const event of allPending.filter((item) => touched.has(item.id))) {
+        const latest = await this.db.get(STORES.pendingEvents, event.id) || event;
+        const generated = latest.generatedPlatforms || {};
+        const complete = latest.kind === 'reddit' ? generated.reddit : latest.kind === 'pixiv' ? generated.pixiv : generated.reddit && generated.pixiv;
+        latest.generated = Boolean(complete);
+        latest.status = complete ? 'generated' : (latest.lastError ? 'failed' : 'pending');
+        if (complete) latest.generatedTurn = currentTurn;
+        await this.db.put(STORES.pendingEvents, latest);
+      }
+      return plan;
     }
 
     async runFandomUpdate(turns) {
@@ -821,14 +988,32 @@
       return table[this.getSettings().activity]?.[kind] || 2;
     }
 
-    async generateReddit(reactions, currentTurn) {
+    initialCommentLimit() {
+      return { Quiet: 2, Normal: 3, Active: 4, Chaos: 5 }[this.getSettings().activity] || 3;
+    }
+
+    normalizeComments(comments, postId, existingComments = []) {
+      const personaIds = new Set(this.world.personas.reddit.map((persona) => persona.id));
+      const existingIds = new Set(existingComments.map((comment) => comment.id));
+      const idMap = new Map();
+      (comments || []).forEach((comment, index) => idMap.set(comment.id, `comment_${Utils.hash(`${postId}:${existingComments.length + index}:${comment.personaId}:${comment.body}`)}`));
+      return (comments || []).map((comment, index) => {
+        const mappedParent = comment.parentId ? (idMap.get(comment.parentId) || (existingIds.has(comment.parentId) ? comment.parentId : null)) : null;
+        return { ...comment, id: idMap.get(comment.id) || `comment_${Utils.hash(`${postId}:${existingComments.length + index}`)}`, parentId: mappedParent, personaId: personaIds.has(comment.personaId) ? comment.personaId : this.world.personas.reddit[0].id };
+      });
+    }
+
+    async generateReddit(reactions, currentTurn, sourcePendingEventIds = []) {
       const result = await this.gemini.generateJson(PromptLibrary.redditGenerator({ personas: this.world.personas.reddit, reactions, activity: this.getSettings().activity }), Schemas.reddit, { retries: 1, temperature: 0.85 });
       const personaIds = new Set(this.world.personas.reddit.map((persona) => persona.id));
-      const posts = (result.posts || []).slice(0, this.activityLimit('reddit')).map((post) => ({
-        ...post, id: Utils.uid('reddit'), worldId: this.world.id, turn: currentTurn, createdAt: new Date().toISOString(),
-        personaId: personaIds.has(post.personaId) ? post.personaId : this.world.personas.reddit[0].id,
-        comments: (post.comments || []).map((comment) => ({ ...comment, personaId: personaIds.has(comment.personaId) ? comment.personaId : this.world.personas.reddit[0].id })),
-      }));
+      const eventKey = [...sourcePendingEventIds].sort().join(',');
+      const posts = (result.posts || []).slice(0, this.activityLimit('reddit')).map((post, index) => {
+        const id = `reddit_${Utils.hash(`${this.world.id}:${eventKey}:${index}`)}`;
+        const comments = this.normalizeComments((post.comments || []).slice(0, this.initialCommentLimit()), id);
+        const estimatedCommentCount = Math.max(comments.length, Number(post.estimatedCommentCount) || comments.length);
+        return { ...post, id, worldId: this.world.id, turn: currentTurn, createdAt: new Date().toISOString(), sourcePendingEventIds: [...sourcePendingEventIds], personaId: personaIds.has(post.personaId) ? post.personaId : this.world.personas.reddit[0].id, comments, estimatedCommentCount, hasMoreComments: Boolean(post.hasMoreComments || estimatedCommentCount > comments.length), continuationTopics: post.continuationTopics || [], commentBatchesGenerated: 0 };
+      });
+      if (!posts.length) throw new Error('Gemini returned no Reddit posts for due events');
       await this.db.bulkPut(STORES.redditPosts, posts);
       const redditText = posts.map((post) => `${post.title} ${post.body} ${post.comments.map((comment) => comment.body).join(' ')}`).join(' ');
       for (const collection of [this.world.fandom.ships, this.world.fandom.tags]) {
@@ -836,16 +1021,57 @@
       }
       this.world.fandom.recentPlatformSignals = [...(this.world.fandom.recentPlatformSignals || []), ...posts.filter((post) => post.score >= 100).map((post) => ({ kind: 'reddit', turn: currentTurn, summary: `Reddit 화제: ${post.title}`, score: post.score, sourceCanonEventIds: post.sourceCanonEventIds }))].slice(-30);
       this.world.badges.reddit += posts.length; this.world.badges.phone += posts.length;
+      return posts;
     }
 
-    async generatePixiv(reactions, currentTurn) {
+    async loadMoreRedditComments(post) {
+      if (!post?.hasMoreComments) return post;
+      const context = await this.buildCanonContext(post.sourceCanonEventIds || [], [post.title, post.body, ...(post.continuationTopics || [])]);
+      const result = await this.gemini.generateJson(PromptLibrary.redditMoreComments({
+        post: { id: post.id, title: post.title, body: post.body, category: post.category, sourceCanonEventIds: post.sourceCanonEventIds },
+        existingComments: post.comments,
+        continuationTopics: post.continuationTopics || [],
+        personas: this.world.personas.reddit,
+        context: { canon: context, fandom: this.fandomSnapshot() },
+      }), Schemas.redditComments, { retries: 1, temperature: 0.85 });
+      const batch = this.normalizeComments((result.comments || []).slice(0, 12), post.id, post.comments || []);
+      if (!batch.length) throw new Error('Gemini returned no additional comments');
+      const known = new Set((post.comments || []).map((comment) => comment.id));
+      post.comments = [...(post.comments || []), ...batch.filter((comment) => !known.has(comment.id))];
+      post.commentBatchesGenerated = (post.commentBatchesGenerated || 0) + 1;
+      post.continuationTopics = result.continuationTopics || post.continuationTopics || [];
+      post.estimatedCommentCount = Math.max(post.estimatedCommentCount || 0, post.comments.length + (result.hasMoreComments ? 6 : 0));
+      post.hasMoreComments = Boolean(result.hasMoreComments);
+      post.lastCommentBatchAt = new Date().toISOString();
+      await this.db.put(STORES.redditPosts, post);
+      return post;
+    }
+
+    async voteRedditPost(postId, requestedVote) {
+      const post = await this.db.get(STORES.redditPosts, postId);
+      if (!post) throw new Error('게시물을 찾을 수 없습니다.');
+      const previous = Number(post.userVote) || 0;
+      const next = previous === requestedVote ? 0 : requestedVote;
+      post.score = (Number(post.score) || 0) + next - previous;
+      post.userVote = next;
+      await this.db.put(STORES.redditPosts, post);
+      return post;
+    }
+
+    async generatePixiv(reactions, currentTurn, sourcePendingEventIds = []) {
       const result = await this.gemini.generateJson(PromptLibrary.pixivMetadataGenerator({ personas: this.world.personas.pixiv, reactions, activity: this.getSettings().activity }), Schemas.pixiv, { retries: 1, temperature: 0.9 });
       const personaIds = new Set(this.world.personas.pixiv.map((persona) => persona.id));
+      const eventKey = [...sourcePendingEventIds].sort().join(',');
+      const existing = await this.db.getAllByWorld(STORES.pixivWorks, this.world.id);
+      const existingById = new Map(existing.map((work) => [work.id, work]));
       const works = (result.works || []).slice(0, this.activityLimit('pixiv')).map((work, index) => ({
-        ...work, id: Utils.uid('pixiv'), worldId: this.world.id, turn: currentTurn, publishOrder: Date.now() + index,
-        createdAt: new Date().toISOString(), hasFullText: false,
+        ...work, id: `pixiv_${Utils.hash(`${this.world.id}:${eventKey}:${index}`)}`, worldId: this.world.id, turn: currentTurn, publishOrder: Date.now() + index,
+        createdAt: existingById.get(`pixiv_${Utils.hash(`${this.world.id}:${eventKey}:${index}`)}`)?.createdAt || new Date().toISOString(),
+        hasFullText: existingById.get(`pixiv_${Utils.hash(`${this.world.id}:${eventKey}:${index}`)}`)?.hasFullText || false,
+        sourcePendingEventIds: [...sourcePendingEventIds],
         authorId: personaIds.has(work.authorId) ? work.authorId : this.world.personas.pixiv[0].id,
       }));
+      if (!works.length) throw new Error('Gemini returned no Pixiv works for due events');
       await this.db.bulkPut(STORES.pixivWorks, works);
       for (const work of works) {
         for (const collection of [this.world.fandom.ships, this.world.fandom.tags]) {
@@ -859,6 +1085,7 @@
       }
       this.world.fandom.recentPlatformSignals = [...(this.world.fandom.recentPlatformSignals || []), ...works.filter((work) => work.bookmarks >= 500).map((work) => ({ kind: 'pixiv', turn: currentTurn, summary: `Pixiv 인기작: ${work.title}`, bookmarks: work.bookmarks, tags: work.tags, sourceCanonEventIds: work.sourceCanonEventIds }))].slice(-30);
       this.world.badges.pixiv += works.length; this.world.badges.phone += works.length;
+      return works;
     }
 
     async generateFanwork(work, onChunk) {
@@ -866,10 +1093,9 @@
       if (cached) return cached;
       const settings = this.getSettings();
       const author = this.world.personas.pixiv.find((persona) => persona.id === work.authorId);
-      const canonEvents = await this.db.getAllByWorld(STORES.canonEvents, this.world.id);
-      const relevant = canonEvents.filter((event) => work.sourceCanonEventIds?.includes(event.id));
-      let text; let outline = null; let continuity = null;
-      const input = { work, author, canon: relevant, fandom: this.fandomSnapshot(), language: settings.fanworkLanguage, targetLength: settings.fanworkTargetLength };
+      const canonContext = await this.buildCanonContext(work.sourceCanonEventIds || [], [work.title, work.ship, work.summary, ...(work.tags || [])]);
+      let text; let outline = null; let continuity = null; let initialContinuity = null; let revisionApplied = false;
+      const input = { work, author, canon: canonContext, fandom: this.fandomSnapshot(), language: settings.fanworkLanguage, targetLength: settings.fanworkTargetLength };
       if (settings.fanworkTargetLength > 8000) {
         outline = await this.gemini.generateJson(PromptLibrary.fanworkOutline(input), Schemas.outline, { retries: 1, temperature: 0.65 });
         const sections = [];
@@ -879,11 +1105,19 @@
           sections.push(section);
         }
         text = sections.join('\n\n');
-        continuity = await this.gemini.generateJson(PromptLibrary.continuity({ outline, text, canon: relevant }), Schemas.continuity, { retries: 1, temperature: 0.2 });
+        initialContinuity = await this.gemini.generateJson(PromptLibrary.continuity({ outline, text, canon: canonContext }), Schemas.continuity, { retries: 1, temperature: 0.2 });
+        continuity = initialContinuity;
+        if (initialContinuity.issues?.length) {
+          onChunk?.(`${text}\n\n[continuity revision in progress…]`);
+          text = await this.gemini.generateText(PromptLibrary.fanworkRevision({ outline, text, canon: canonContext, issues: initialContinuity.issues, continuityNotes: initialContinuity.continuityNotes, language: settings.fanworkLanguage }), { stream: false, temperature: 0.55 });
+          revisionApplied = true;
+          continuity = await this.gemini.generateJson(PromptLibrary.continuity({ outline, text, canon: canonContext }), Schemas.continuity, { retries: 1, temperature: 0.15 });
+          onChunk?.(text);
+        }
       } else {
         text = await this.gemini.generateText(PromptLibrary.fanwork(input), { stream: settings.streaming, onChunk });
       }
-      const record = { id: work.id, worldId: this.world.id, text, outline, continuity, generatedAt: new Date().toISOString(), language: settings.fanworkLanguage };
+      const record = { id: work.id, worldId: this.world.id, text, outline, continuity, initialContinuity, revisionApplied, generatedAt: new Date().toISOString(), language: settings.fanworkLanguage };
       await this.db.put(STORES.fanworks, record);
       work.hasFullText = true;
       await this.db.put(STORES.pixivWorks, work);
@@ -905,6 +1139,7 @@
         const canonResult = await this.extractCanon(chunk);
         const currentTurn = index + chunk.length;
         await this.applyCanon(canonResult, currentTurn);
+        await this.executePendingEvents(currentTurn, { canonEvents: [], interpretations: [], immediate: [] });
         this.world.importJob.nextIndex = index + chunk.length;
         await this.saveWorld();
         onProgress?.(`원작 분석 중 · ${Math.min(index + chunk.length, turns.length)} / ${turns.length} turns`);
@@ -928,6 +1163,14 @@
     }
 
     async rebuildCanon(onProgress) {
+      const oldPending = await this.db.getAllByWorld(STORES.pendingEvents, this.world.id);
+      for (const event of oldPending) {
+        if (!['generated', 'expired', 'superseded'].includes(event.status)) {
+          event.status = 'superseded'; event.supersededReason = 'canon-rebuild';
+          await this.db.put(STORES.pendingEvents, event);
+        }
+      }
+      this.world.canonRevision = (Number(this.world.canonRevision) || 1) + 1;
       await this.db.deleteWorld(this.world.id, { preserveFandom: true });
       this.world.canon = { facts: [], characters: [], relationships: [], recentEventIds: [] };
       this.world.importJob = { mode: 'rebuild', status: 'analyzing', nextIndex: 0, total: this.world.turnCount };
@@ -961,14 +1204,14 @@
       this.host = document.createElement('div');
       this.host.id = 'rp-fanverse-host';
       this.root = this.host.attachShadow({ mode: 'open' });
-      this.root.innerHTML = `<style>${this.css()}</style><button class="launcher" aria-label="RP Fanverse 열기">▣<span class="launcher-badge"></span></button><div class="veil" hidden><section class="phone" role="dialog" aria-label="RP Fanverse"><header><button data-action="back" aria-label="뒤로">‹</button><div class="brand">FANVERSE <small></small></div><button data-action="close" aria-label="닫기">×</button></header><main></main><nav><button data-view="home">⌂<span>Home</span></button><button data-view="pixiv">P<span>Pixiv</span></button><button data-view="reddit">R<span>Reddit</span></button><button data-view="settings">⚙<span>Settings</span></button></nav><div class="toast" hidden></div></section></div>`;
+      this.root.innerHTML = `<style>${this.css()}</style><button class="launcher" aria-label="RP Fanverse 열기" aria-expanded="false">▣<span class="launcher-badge"></span></button><div class="veil" hidden aria-hidden="true"><section class="phone" role="dialog" aria-modal="true" aria-label="RP Fanverse"><header><button data-action="back" aria-label="뒤로">‹</button><div class="brand">FANVERSE <small></small></div><button data-action="close" aria-label="닫기">×</button></header><main></main><nav><button data-view="home">⌂<span>Home</span></button><button data-view="pixiv">P<span>Pixiv</span></button><button data-view="reddit">R<span>Reddit</span></button><button data-view="settings">⚙<span>Settings</span></button></nav><div class="toast" hidden></div></section></div>`;
       document.documentElement.appendChild(this.host);
       this.host.style.setProperty('--ui-scale', String(this.getSettings().uiScale || 1));
       this.bind(); this.refreshBadges();
     }
 
     css() {
-      return `:host{all:initial;--ink:#252329;--muted:#77717c;--paper:#fbfaf8;--accent:#7567d8;--pink:#ee6c9f;--line:#e8e3ea;font-family:Inter,"Noto Sans KR",system-ui,sans-serif;color:var(--ink)}*{box-sizing:border-box}.launcher{position:fixed;right:18px;bottom:96px;z-index:2147483000;width:46px;height:58px;border:2px solid #29252e;border-radius:12px;background:#f9f7ff;color:#7567d8;font-size:24px;box-shadow:0 5px 22px #0003;cursor:pointer}.launcher:before{content:"";position:absolute;inset:5px;border:1px solid #bcb4da;border-radius:7px}.launcher-badge,.app-badge{position:absolute;right:-7px;top:-7px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:#e54863;color:white;font:700 11px/20px system-ui;text-align:center}.veil{position:fixed;inset:0;z-index:2147483001;background:#15121b88;display:grid;place-items:center;padding:16px}.phone{width:min(410px,calc(100vw - 20px));height:min(780px,calc(100vh - 24px));background:var(--paper);border:1px solid #3b3542;border-radius:28px;overflow:hidden;box-shadow:0 26px 70px #0007;display:grid;grid-template-rows:58px 1fr 62px;transform:scale(var(--ui-scale,1))}.phone>header{display:grid;grid-template-columns:48px 1fr 48px;align-items:center;padding:0 8px;border-bottom:1px solid var(--line);background:#fff}.phone header button{border:0;background:transparent;font-size:29px;color:var(--ink);cursor:pointer}.brand{text-align:center;font:800 14px/1.1 system-ui;letter-spacing:.15em}.brand small{display:block;margin-top:4px;color:var(--muted);font:500 9px/1 system-ui;letter-spacing:.02em}.phone main{overflow:auto;padding:16px;background:linear-gradient(160deg,#fdfcf9,#f7f4fb)}.phone nav{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--line);background:#fff}.phone nav button{position:relative;border:0;background:transparent;color:var(--muted);font-size:20px;cursor:pointer}.phone nav button span{display:block;font-size:9px}.phone nav button.active{color:var(--accent)}.toast{position:absolute;left:24px;right:24px;bottom:78px;background:#242129;color:white;padding:11px 14px;border-radius:12px;font:12px/1.4 system-ui;box-shadow:0 6px 20px #0004}.hero{padding:18px;border-radius:20px;background:linear-gradient(135deg,#302b42,#7a68d9);color:white;margin-bottom:14px}.hero h2{margin:0 0 6px;font-size:20px}.hero p{margin:0;opacity:.8;font-size:12px}.apps{display:grid;grid-template-columns:1fr 1fr;gap:12px}.app{position:relative;border:1px solid var(--line);border-radius:18px;background:white;padding:20px 12px;text-align:center;cursor:pointer;box-shadow:0 4px 14px #4030540b}.app strong{display:block;font-size:14px;margin-top:9px}.app .icon{margin:auto;width:54px;height:54px;border-radius:16px;display:grid;place-items:center;color:white;font:800 23px/1 system-ui}.app.pixiv .icon{background:linear-gradient(135deg,#4aa7ff,#2b63d9)}.app.reddit .icon{background:linear-gradient(135deg,#ff7e62,#dd4c40)}.app .app-badge{right:8px;top:8px}.status{margin-top:14px;padding:12px;border:1px solid var(--line);border-radius:14px;background:#fff;font-size:11px;color:var(--muted)}.toolbar{display:flex;gap:7px;align-items:center;margin-bottom:12px}.toolbar input,.toolbar select{min-width:0;flex:1;border:1px solid var(--line);border-radius:10px;padding:9px;background:white;color:var(--ink)}.tabs{display:flex;gap:6px;margin-bottom:12px}.tabs button,.chip,.small-btn{border:1px solid var(--line);background:white;border-radius:999px;padding:7px 10px;font-size:11px;cursor:pointer}.tabs button.active,.chip.active{background:var(--ink);color:white}.card{border:1px solid var(--line);background:white;border-radius:16px;padding:14px;margin-bottom:10px;box-shadow:0 3px 13px #4030540a;cursor:pointer}.card h3{font-size:14px;margin:0 0 6px}.meta{color:var(--muted);font-size:10px}.body{font-size:12px;line-height:1.6;margin-top:9px}.tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}.tag{color:#456bb0;background:#edf4ff;border-radius:7px;padding:3px 6px;font-size:10px}.score{color:#d85a46;font-weight:700}.spoiler{filter:blur(5px);cursor:pointer}.spoiler:hover{filter:none}.comments{margin-top:12px}.comment{border-left:2px solid var(--line);margin-top:8px;padding-left:10px}.work-title{font-family:Georgia,"Noto Serif JP",serif;font-size:16px}.work-body{font-family:Georgia,"Noto Serif JP",serif;font-size:13px;line-height:1.9;white-space:pre-wrap}.setting{display:block;margin-bottom:12px}.setting>span{display:block;font-size:11px;font-weight:700;margin-bottom:5px}.setting input,.setting select{width:100%;border:1px solid var(--line);border-radius:9px;padding:9px;background:white}.setting.inline{display:flex;align-items:center;gap:9px}.setting.inline>span{margin:0;flex:1}.setting.inline input{width:auto}.actions{display:grid;gap:8px}.actions button{border:1px solid var(--line);background:white;border-radius:11px;padding:10px;text-align:left;cursor:pointer}.actions button.danger{color:#b8384b;border-color:#efc8cf}.section-title{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:16px 0 8px}.empty{text-align:center;color:var(--muted);padding:34px 10px;font-size:12px}.progress{height:7px;background:#ece8ef;border-radius:9px;overflow:hidden;margin:8px 0}.progress span{display:block;height:100%;background:var(--accent)}@media(max-width:500px){.launcher{right:10px;bottom:78px}.veil{padding:0}.phone{width:100vw;height:100vh;border:0;border-radius:0;transform:none}}`;
+      return `:host{all:initial;--ink:#252329;--muted:#77717c;--paper:#fbfaf8;--accent:#7567d8;--pink:#ee6c9f;--line:#e8e3ea;font-family:Inter,"Noto Sans KR",system-ui,sans-serif;color:var(--ink)}*{box-sizing:border-box}.launcher{position:fixed;right:18px;bottom:96px;z-index:2147483000;width:46px;height:58px;border:2px solid #29252e;border-radius:12px;background:#f9f7ff;color:#7567d8;font-size:24px;box-shadow:0 5px 22px #0003;cursor:pointer}.launcher:before{content:"";position:absolute;inset:5px;border:1px solid #bcb4da;border-radius:7px}.launcher-badge,.app-badge{position:absolute;right:-7px;top:-7px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:#e54863;color:white;font:700 11px/20px system-ui;text-align:center}.veil[hidden]{display:none!important}.veil{position:fixed;inset:0;z-index:2147483001;background:#15121b88;display:grid;place-items:center;padding:16px}.phone{position:relative;width:min(410px,calc(100vw - 20px));height:min(780px,calc(100vh - 24px));background:var(--paper);border:1px solid #3b3542;border-radius:28px;overflow:hidden;box-shadow:0 26px 70px #0007;display:grid;grid-template-rows:58px 1fr 62px;transform:scale(var(--ui-scale,1))}.phone>header{display:grid;grid-template-columns:48px 1fr 48px;align-items:center;padding:0 8px;border-bottom:1px solid var(--line);background:#fff}.phone header button{border:0;background:transparent;font-size:29px;color:var(--ink);cursor:pointer}.brand{text-align:center;font:800 14px/1.1 system-ui;letter-spacing:.15em}.brand small{display:block;margin-top:4px;color:var(--muted);font:500 9px/1 system-ui;letter-spacing:.02em}.phone main{overflow:auto;padding:16px;background:linear-gradient(160deg,#fdfcf9,#f7f4fb)}.phone nav{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--line);background:#fff}.phone nav button{position:relative;border:0;background:transparent;color:var(--muted);font-size:20px;cursor:pointer}.phone nav button span{display:block;font-size:9px}.phone nav button.active{color:var(--accent)}.toast{position:absolute;left:24px;right:24px;bottom:78px;background:#242129;color:white;padding:11px 14px;border-radius:12px;font:12px/1.4 system-ui;box-shadow:0 6px 20px #0004}.hero{padding:18px;border-radius:20px;background:linear-gradient(135deg,#302b42,#7a68d9);color:white;margin-bottom:14px}.hero h2{margin:0 0 6px;font-size:20px}.hero p{margin:0;opacity:.8;font-size:12px}.apps{display:grid;grid-template-columns:1fr 1fr;gap:12px}.app{position:relative;border:1px solid var(--line);border-radius:18px;background:white;padding:20px 12px;text-align:center;cursor:pointer;box-shadow:0 4px 14px #4030540b}.app strong{display:block;font-size:14px;margin-top:9px}.app .icon{margin:auto;width:54px;height:54px;border-radius:16px;display:grid;place-items:center;color:white;font:800 23px/1 system-ui}.app.pixiv .icon{background:linear-gradient(135deg,#4aa7ff,#2b63d9)}.app.reddit .icon{background:linear-gradient(135deg,#ff7e62,#dd4c40)}.app .app-badge{right:8px;top:8px}.status{margin-top:14px;padding:12px;border:1px solid var(--line);border-radius:14px;background:#fff;font-size:11px;color:var(--muted)}.toolbar{display:flex;gap:7px;align-items:center;margin-bottom:12px}.toolbar input,.toolbar select{min-width:0;flex:1;border:1px solid var(--line);border-radius:10px;padding:9px;background:white;color:var(--ink)}.tabs{display:flex;gap:6px;margin-bottom:12px}.tabs button,.chip,.small-btn{border:1px solid var(--line);background:white;border-radius:999px;padding:7px 10px;font-size:11px;cursor:pointer}.tabs button.active,.chip.active{background:var(--ink);color:white}.card{border:1px solid var(--line);background:white;border-radius:16px;padding:14px;margin-bottom:10px;box-shadow:0 3px 13px #4030540a;cursor:pointer}.card h3{font-size:14px;margin:0 0 6px}.meta{color:var(--muted);font-size:10px}.body{font-size:12px;line-height:1.6;margin-top:9px}.tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}.tag{color:#456bb0;background:#edf4ff;border-radius:7px;padding:3px 6px;font-size:10px}.score{color:#d85a46;font-weight:700}.spoiler{filter:blur(5px);cursor:pointer}.spoiler:hover{filter:none}.comments{margin-top:12px}.comment{border-left:2px solid var(--line);margin-top:8px;padding-left:10px}.work-title{font-family:Georgia,"Noto Serif JP",serif;font-size:16px}.work-body{font-family:Georgia,"Noto Serif JP",serif;font-size:13px;line-height:1.9;white-space:pre-wrap}.setting{display:block;margin-bottom:12px}.setting>span{display:block;font-size:11px;font-weight:700;margin-bottom:5px}.setting input,.setting select{width:100%;border:1px solid var(--line);border-radius:9px;padding:9px;background:white}.setting.inline{display:flex;align-items:center;gap:9px}.setting.inline>span{margin:0;flex:1}.setting.inline input{width:auto}.actions{display:grid;gap:8px}.actions button{border:1px solid var(--line);background:white;border-radius:11px;padding:10px;text-align:left;cursor:pointer}.actions button.danger{color:#b8384b;border-color:#efc8cf}.section-title{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:16px 0 8px}.empty{text-align:center;color:var(--muted);padding:34px 10px;font-size:12px}.progress{height:7px;background:#ece8ef;border-radius:9px;overflow:hidden;margin:8px 0}.progress span{display:block;height:100%;background:var(--accent)}@media(max-width:500px){.launcher{right:10px;bottom:78px}.veil{padding:0}.phone{width:100vw;height:100vh;border:0;border-radius:0;transform:none}}`;
     }
 
     bind() {
@@ -982,8 +1225,19 @@
       this.root.querySelector('main').addEventListener('change', (event) => this.handleChange(event));
     }
 
-    show() { this.open = true; this.root.querySelector('.veil').hidden = false; this.render(); }
-    hide() { this.open = false; this.root.querySelector('.veil').hidden = true; }
+    show() {
+      this.open = true;
+      const veil = this.root.querySelector('.veil');
+      veil.hidden = false; veil.setAttribute('aria-hidden', 'false');
+      this.root.querySelector('.launcher').setAttribute('aria-expanded', 'true');
+      this.render();
+    }
+    hide() {
+      this.open = false;
+      const veil = this.root.querySelector('.veil');
+      veil.hidden = true; veil.setAttribute('aria-hidden', 'true');
+      this.root.querySelector('.launcher').setAttribute('aria-expanded', 'false');
+    }
     go(view, route = null) { this.view = view; this.route = route; this.render(); }
 
     notify(kind, message) {
@@ -1034,7 +1288,7 @@
         const post = posts.find((item) => item.id === this.route.id);
         if (!post) return '<div class="empty">게시물을 찾을 수 없습니다.</div>';
         const persona = this.engine.world.personas.reddit.find((item) => item.id === post.personaId);
-        return `<article class="card"><div class="meta">r/Fanverse · u/${Utils.escapeHtml(persona?.name || post.personaId)} · ${Utils.escapeHtml(post.category)}</div><h3>${Utils.escapeHtml(post.title)}</h3><div class="body ${post.spoiler ? 'spoiler' : ''}">${Utils.nl2br(post.body)}</div><div class="meta"><span class="score">▲ ${post.score}</span> · ${post.comments.length} comments</div></article><div class="comments">${this.commentTree(post.comments)}</div>`;
+        return `<article class="card"><div class="meta">r/Fanverse · u/${Utils.escapeHtml(persona?.name || post.personaId)} · ${Utils.escapeHtml(post.category)}</div><h3>${Utils.escapeHtml(post.title)}</h3><div class="body ${post.spoiler ? 'spoiler' : ''}" ${post.spoiler ? 'data-spoiler-toggle="true"' : ''}>${Utils.nl2br(post.body)}</div><div class="meta"><button class="small-btn ${post.userVote === 1 ? 'active' : ''}" data-vote-post="${post.id}" data-vote-value="1">▲</button> <span class="score">${post.score}</span> <button class="small-btn ${post.userVote === -1 ? 'active' : ''}" data-vote-post="${post.id}" data-vote-value="-1">▼</button> · ${post.comments.length}${post.estimatedCommentCount ? ` / 약 ${post.estimatedCommentCount}` : ''} comments</div></article><div class="comments">${this.commentTree(post.comments)}</div>${post.hasMoreComments ? `<button class="small-btn" data-more-comments="${post.id}">more comments 불러오기</button>` : ''}`;
       }
       this.engine.world.badges.reddit = 0;
       this.engine.world.badges.phone = this.engine.world.badges.pixiv;
@@ -1088,10 +1342,25 @@
     }
 
     async handleClick(event) {
-      const target = event.target.closest('button,[data-reddit-id],[data-pixiv-id]');
+      const target = event.target.closest('button,[data-reddit-id],[data-pixiv-id],[data-spoiler-toggle]');
       if (!target) return;
+      if (target.dataset.spoilerToggle) { target.classList.remove('spoiler'); target.removeAttribute('data-spoiler-toggle'); return; }
+      if (target.dataset.votePost) {
+        try { await this.engine.voteRedditPost(target.dataset.votePost, Number(target.dataset.voteValue)); await this.render(); }
+        catch (error) { this.notify('error', error.message); }
+        return;
+      }
       if (target.dataset.go) return this.go(target.dataset.go);
       if (target.dataset.redditId) { this.route = { type: 'reddit-post', id: target.dataset.redditId }; return this.render(); }
+      if (target.dataset.moreComments) {
+        const posts = await this.db.getAllByWorld(STORES.redditPosts, this.engine.world.id);
+        const post = posts.find((item) => item.id === target.dataset.moreComments);
+        if (!post) return;
+        target.disabled = true; target.textContent = '댓글 생성 중…';
+        try { await this.engine.loadMoreRedditComments(post); this.notify('success', '새 댓글을 저장했습니다.'); await this.render(); }
+        catch (error) { target.disabled = false; target.textContent = '다시 시도'; this.notify('error', error.message); }
+        return;
+      }
       if (target.dataset.pixivId) { this.route = { type: 'pixiv-work', id: target.dataset.pixivId }; return this.render(); }
       if (target.dataset.authorId) { this.route = { type: 'author', id: target.dataset.authorId }; return this.render(); }
       if (target.dataset.series) { this.route = { type: 'series', title: target.dataset.series }; return this.render(); }
@@ -1184,8 +1453,8 @@
       if (location.href === this.lastUrl) return;
       this.lastUrl = location.href;
       const info = parseWorldFromUrl(location.href);
-      if (!info) { this.ui.host.hidden = true; return; }
-      this.ui.host.hidden = false;
+      if (!info) { this.ui.hide(); this.ui.host.hidden = true; this.ui.host.style.display = 'none'; return; }
+      this.ui.host.hidden = false; this.ui.host.style.display = '';
       await this.engine.attach(info);
       this.ui.refreshBadges();
       await this.engine.sync().catch((error) => this.ui.notify('error', error.message));
