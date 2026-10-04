@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RP Fanverse
 // @namespace    https://crack.wrtn.ai/
-// @version      0.12.0
+// @version      0.12.1
 // @description  Treats a Crack RP episode as canon and grows a persistent virtual Pixiv/Reddit fandom around it.
 // @author       Personal userscript
 // @match        https://crack.wrtn.ai/stories/*/episodes/*
