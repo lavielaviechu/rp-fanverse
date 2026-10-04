@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RP Fanverse
 // @namespace    https://crack.wrtn.ai/
-// @version      0.12.1
+// @version      0.12.2
 // @description  Treats a Crack RP episode as canon and grows a persistent virtual Pixiv/Reddit fandom around it.
 // @author       Personal userscript
 // @match        https://crack.wrtn.ai/stories/*/episodes/*
@@ -11,7 +11,7 @@
 // @grant        GM_deleteValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
-// @require      https://accounts.google.com/gsi/client
+// @grant        unsafeWindow
 // @connect      crack-api.wrtn.ai
 // @connect      generativelanguage.googleapis.com
 // @connect      aiplatform.googleapis.com
@@ -22,7 +22,7 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '0.12.0';
+  const APP_VERSION = '0.12.2';
   const DB_NAME = 'rp-fanverse';
   const DB_VERSION = 1;
   const SETTINGS_KEY = 'rp-fanverse:settings:v1';
@@ -584,18 +584,84 @@ ORIGINAL FANWORK:
     return;
   }
 
+  // GM storage that never takes startup down. If the GM_* grants are unavailable (for example a
+  // damaged metadata block), values live in memory for this page view only; they are deliberately
+  // not written to page-readable localStorage because settings include the API key.
+  const gmMemory = new Map();
+  const gmAvailable = () => typeof GM_getValue === 'function' && typeof GM_setValue === 'function' && typeof GM_deleteValue === 'function';
   const GMStore = {
+    available: gmAvailable,
     async get(key, fallback) {
-      const value = await Promise.resolve(GM_getValue(key, fallback));
-      return value == null ? fallback : value;
+      try {
+        const value = gmAvailable() ? await Promise.resolve(GM_getValue(key, fallback)) : gmMemory.get(key);
+        return value == null ? fallback : value;
+      } catch (error) {
+        console.warn(`[RP Fanverse] GM_getValue(${key}) failed`, error);
+        return fallback;
+      }
     },
     async set(key, value) {
+      if (!gmAvailable()) { gmMemory.set(key, value); return; }
       return Promise.resolve(GM_setValue(key, value));
     },
     async remove(key) {
+      if (!gmAvailable()) { gmMemory.delete(key); return; }
       return Promise.resolve(GM_deleteValue(key));
     },
   };
+
+  function withTimeout(promise, ms, message) {
+    let timer;
+    return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })]).finally(() => clearTimeout(timer));
+  }
+
+  // Google Identity Services is only needed for the Vertex "Google 로그인" button, so it is never
+  // part of startup. It is injected on demand as a page <script>; with Tampermonkey's sandbox the
+  // resulting `google` global lives on the page window, hence unsafeWindow.
+  const GIS_SRC = 'https://accounts.google.com/gsi/client';
+  const GIS_TIMEOUT_MS = 15000;
+  let gisLoading = null;
+
+  function pageWindow() {
+    try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow) return unsafeWindow; } catch (_) { /* no unsafeWindow grant */ }
+    return window;
+  }
+
+  function googleOAuth() {
+    return pageWindow().google?.accounts?.oauth2 || globalThis.google?.accounts?.oauth2 || null;
+  }
+
+  function loadGoogleIdentityServices(timeoutMs = GIS_TIMEOUT_MS) {
+    const ready = googleOAuth();
+    if (ready) return Promise.resolve(ready);
+    if (gisLoading) return gisLoading; // a second click while loading shares the same request
+    let script = null;
+    gisLoading = new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error); else resolve(value);
+      };
+      const timer = setTimeout(() => finish(new Error(`Google 로그인 라이브러리 로딩 시간 초과 (${Math.round(timeoutMs / 1000)}초)`)), timeoutMs);
+      script = document.createElement('script');
+      script.src = GIS_SRC;
+      script.async = true;
+      script.dataset.rpFanverseGis = '1';
+      script.onload = () => {
+        const oauth = googleOAuth();
+        finish(oauth ? null : new Error('Google 로그인 라이브러리는 받았지만 google.accounts.oauth2를 찾을 수 없습니다'), oauth);
+      };
+      script.onerror = () => finish(new Error('Google 로그인 라이브러리를 불러오지 못했습니다 (네트워크 또는 차단)'));
+      (document.head || document.documentElement).appendChild(script);
+    }).catch((error) => {
+      gisLoading = null; // allow a later retry
+      script?.remove();
+      throw error;
+    });
+    return gisLoading;
+  }
 
   class Database {
     constructor() {
@@ -1070,12 +1136,20 @@ ORIGINAL FANWORK:
       return this.status();
     }
 
-    // Must run inside the click handler: GIS opens its consent popup from requestAccessToken().
-    authorize() {
+    // Called from the "Google 로그인" click: GIS is lazy-loaded here, then opens its consent popup
+    // from requestAccessToken(). If loading took long enough for the click's user activation to
+    // lapse, the browser may block the popup; the library is cached by then, so a second click works.
+    async authorize() {
       const settings = this.getSettings();
-      if (!settings.vertexOAuthClientId) return Promise.reject(new Error('Vertex OAuth Client ID is not configured'));
-      const oauth = globalThis.google?.accounts?.oauth2;
-      if (!oauth) return Promise.reject(new Error('Google Identity Services 라이브러리를 불러오지 못했습니다. Tampermonkey @require 로딩을 확인하거나 수동 token을 사용하세요.'));
+      if (!settings.vertexOAuthClientId) throw new Error('Vertex OAuth Client ID가 없습니다. Settings에 OAuth Client ID를 먼저 입력하세요.');
+      const loadStarted = Date.now();
+      let oauth;
+      try {
+        oauth = await loadGoogleIdentityServices();
+      } catch (error) {
+        throw new Error(`${error.message}. 잠시 후 다시 시도하거나 아래 수동 access token을 사용하세요.`);
+      }
+      const slowLoad = Date.now() - loadStarted > 3000;
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('Google OAuth window timed out or was closed')), 180000);
         const settle = (fn) => (value) => { clearTimeout(timer); fn(value); };
@@ -1084,7 +1158,7 @@ ORIGINAL FANWORK:
           if (typeof oauth.hasGrantedAllScopes === 'function' && !oauth.hasGrantedAllScopes(response, VERTEX_SCOPE)) { reject(new Error('cloud-platform scope가 승인되지 않았습니다. 동의 화면에서 권한을 허용하세요.')); return; }
           resolve(await this.setToken(response.access_token, response.expires_in, 'oauth'));
         });
-        const onError = settle((error) => reject(new Error(error?.type === 'popup_closed' ? 'Google 로그인 창이 닫혔습니다.' : error?.type === 'popup_failed_to_open' ? '팝업이 차단되었습니다. 이 사이트의 팝업을 허용하세요.' : error?.message || error?.type || 'Google OAuth popup failed')));
+        const onError = settle((error) => reject(new Error(error?.type === 'popup_closed' ? 'Google 로그인 창이 닫혔습니다.' : error?.type === 'popup_failed_to_open' ? (slowLoad ? '라이브러리 로딩이 끝났습니다. "Google 로그인"을 한 번 더 눌러 주세요.' : '팝업이 차단되었습니다. 이 사이트의 팝업을 허용하세요.') : error?.message || error?.type || 'Google OAuth popup failed')));
         if (!this.tokenClient || this.tokenClientId !== settings.vertexOAuthClientId) {
           // The token client lives across requests; its callbacks dispatch to whichever request is
           // pending, so an abandoned popup's late response cannot settle a newer request.
@@ -1132,7 +1206,7 @@ ORIGINAL FANWORK:
       const token = this.accessToken;
       await this.clearAccessToken();
       if (!token) return;
-      const oauth = globalThis.google?.accounts?.oauth2;
+      const oauth = googleOAuth(); // never loads GIS just to log out
       if (oauth?.revoke) { oauth.revoke(token, () => {}); return; }
       GM_xmlhttpRequest({ method: 'POST', url: 'https://oauth2.googleapis.com/revoke', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, data: `token=${encodeURIComponent(token)}` });
     }
@@ -2370,16 +2444,20 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
     }
 
     async render({ keepScroll = false, restoreScroll = null } = {}) {
-      if (!this.open || !this.engine.world) { this.refreshBadges(); return; }
+      if (!this.open) { this.refreshBadges(); return; }
       const token = ++this.renderToken;
       const main = this.root.querySelector('main');
       const previousScroll = main.scrollTop;
       this.renderHeader();
       this.root.querySelectorAll('nav [data-view]').forEach((button) => button.classList.toggle('active', button.dataset.view === this.view));
-      this.root.querySelector('.phone').classList.toggle('dark-bar', this.view === 'home');
+      // Without a world (still starting, or IndexedDB/route attach failed) only Settings and the
+      // status screen are available, so opening the phone can never show a blank page.
+      const startup = !this.engine.world && this.view !== 'settings';
+      this.root.querySelector('.phone').classList.toggle('dark-bar', this.view === 'home' && !startup);
       let html;
       try {
-        if (this.view === 'home') html = this.homeHtml();
+        if (startup) html = this.startupHtml();
+        else if (this.view === 'home') html = this.homeHtml();
         else if (this.view === 'reddit') html = await this.redditHtml();
         else if (this.view === 'pixiv') html = await this.pixivHtml();
         else if (this.route?.type === 'prompt-list') html = this.promptListHtml();
@@ -2389,7 +2467,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
         html = `<div class="empty">${Utils.escapeHtml(error.message)}</div>`;
       }
       if (token !== this.renderToken) return; // a newer render started while this one awaited IndexedDB
-      main.className = `screen screen-${this.view}`;
+      main.className = `screen screen-${startup ? 'settings' : this.view}`;
       main.innerHTML = html;
       main.scrollTop = restoreScroll ?? (keepScroll ? previousScroll : 0);
       if (this.route?.type === 'prompt-editor') this.updatePromptValidation();
@@ -2425,6 +2503,13 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       const [c1, c2] = PX_COVERS[Fmt.seed(work.seriesTitle || work.title || work.id, PX_COVERS.length)];
       const author = this.pixivAuthor(work.authorId);
       return `<div class="px-cover ${size}" style="--c1:${c1};--c2:${c2}"><span class="px-cover-t">${this.esc(work.seriesTitle || work.title)}</span><span class="px-cover-a">${this.esc(author?.name || '')}</span></div>`;
+    }
+
+    // ---------- startup / degraded ----------
+
+    startupHtml() {
+      const issues = this.startupIssues || [];
+      return `<div class="st-title">Fanverse</div><div class="st-section">상태</div><div class="st-card"><div class="st-status"><span class="st-dot ${issues.length ? 'bad' : ''}"></span>${issues.length ? '일부 초기화 단계가 실패했습니다' : 'RP world 연결 중…'}</div>${issues.map((issue) => `<div class="st-status">${this.esc(issue)}</div>`).join('')}<button class="st-btn" data-go="settings">Settings 열기${icon('chevronRight', 18)}</button></div><div class="st-note">launcher와 Settings는 AI provider 설정이나 Vertex 인증 상태와 관계없이 항상 사용할 수 있습니다.</div>`;
     }
 
     // ---------- home ----------
@@ -2748,7 +2833,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       const minutes = Math.ceil(vertex.expiresInSeconds / 60);
       const tokenLine = vertex.authenticated ? `access token 유효 · 약 ${minutes}분 남음 (${vertex.source === 'manual' ? '수동 입력' : 'Google 로그인'})` : vertex.hasToken ? 'access token 만료 — 재인증 필요' : 'access token 없음';
       const endpoint = s.vertexProjectId ? buildVertexEndpoint(s, false) : '(Project ID를 입력하면 표시됩니다)';
-      return `<div class="st-card"><label class="st-field"><span>Google Cloud Project ID</span><input data-setting="vertexProjectId" value="${this.esc(s.vertexProjectId)}" placeholder="my-gcp-project" autocomplete="off"></label><label class="st-field"><span>Location · global 권장 (us / eu 멀티 리전 또는 us-central1 같은 리전도 가능)</span><input data-setting="vertexLocation" value="${this.esc(s.vertexLocation)}" list="rpf-vertex-locations" placeholder="global"><datalist id="rpf-vertex-locations"><option value="global"><option value="us"><option value="eu"><option value="us-central1"><option value="asia-northeast3"><option value="asia-northeast1"></datalist></label><label class="st-field"><span>API version</span><select data-setting="vertexApiVersion"><option value="v1" ${s.vertexApiVersion === 'v1' ? 'selected' : ''}>v1 (권장)</option><option value="v1beta1" ${s.vertexApiVersion === 'v1beta1' ? 'selected' : ''}>v1beta1</option></select></label><label class="st-field"><span>OAuth 2.0 Client ID (웹 애플리케이션)</span><input data-setting="vertexOAuthClientId" value="${this.esc(s.vertexOAuthClientId)}" placeholder="…apps.googleusercontent.com" autocomplete="off"></label><div class="st-status"><span class="st-dot ${vertex.authenticated ? 'ok' : vertex.hasToken ? 'bad' : ''}"></span>${tokenLine}</div><button class="st-btn" data-action="vertex-auth">${vertex.hasToken ? 'Google 재인증' : 'Google 로그인'}${icon('chevronRight', 18)}</button><button class="st-btn" data-action="test-vertex">Vertex AI 연결 테스트${icon('chevronRight', 18)}</button><button class="st-btn danger" data-action="vertex-revoke" ${vertex.hasToken ? '' : 'disabled'}>토큰 폐기 (로그아웃)</button></div><div class="st-note">Endpoint: <code>${this.esc(endpoint)}</code></div><div class="st-section">수동 access token (선택)</div><div class="st-card"><label class="st-field"><span><code class="st-code">gcloud auth print-access-token</code> 결과를 붙여넣기 · 약 1시간 유효</span><input type="password" data-vertex-manual-token autocomplete="off" placeholder="ya29.…"></label><button class="st-btn" data-action="vertex-manual-token">토큰 확인 후 적용${icon('chevronRight', 18)}</button></div><div class="st-section">Vertex AI 준비 순서</div><details class="st-details"><summary>설정 방법 보기 ${icon('chevronDown', 18)}</summary><ol class="st-steps"><li>Google Cloud 프로젝트에 결제 계정을 연결합니다. 신규 가입 무료 체험 크레딧은 일반 Vertex AI 사용량에도 적용됩니다.</li><li>프로젝트에서 <b>Vertex AI API</b>(aiplatform.googleapis.com)를 사용 설정합니다.</li><li>IAM에서 로그인할 Google 계정에 <b>Vertex AI User</b>(roles/aiplatform.user) 역할을 부여합니다.</li><li>OAuth 동의 화면을 구성하고(테스트 모드면 본인을 테스트 사용자로 추가), <b>사용자 인증 정보 → OAuth 클라이언트 ID → 웹 애플리케이션</b>을 만듭니다.</li><li>승인된 JavaScript 원본에 <code>https://crack.wrtn.ai</code>를 추가하고 Client ID를 위에 붙여넣습니다.</li><li>Google 로그인 → Vertex AI 연결 테스트. 토큰은 약 1시간 뒤 만료되며 그때 재인증합니다.</li></ol><div class="st-note" style="padding:0 14px 12px">서비스 계정 JSON key, refresh token, client secret은 사용·저장하지 않습니다. 로그인은 Google Identity Services 토큰 모델(브라우저 전용 앱용 공식 흐름)을 사용합니다.</div></details>`;
+      return `<div class="st-card"><label class="st-field"><span>Google Cloud Project ID</span><input data-setting="vertexProjectId" value="${this.esc(s.vertexProjectId)}" placeholder="my-gcp-project" autocomplete="off"></label><label class="st-field"><span>Location · global 권장 (us / eu 멀티 리전 또는 us-central1 같은 리전도 가능)</span><input data-setting="vertexLocation" value="${this.esc(s.vertexLocation)}" list="rpf-vertex-locations" placeholder="global"><datalist id="rpf-vertex-locations"><option value="global"><option value="us"><option value="eu"><option value="us-central1"><option value="asia-northeast3"><option value="asia-northeast1"></datalist></label><label class="st-field"><span>API version</span><select data-setting="vertexApiVersion"><option value="v1" ${s.vertexApiVersion === 'v1' ? 'selected' : ''}>v1 (권장)</option><option value="v1beta1" ${s.vertexApiVersion === 'v1beta1' ? 'selected' : ''}>v1beta1</option></select></label><label class="st-field"><span>OAuth 2.0 Client ID (웹 애플리케이션)</span><input data-setting="vertexOAuthClientId" value="${this.esc(s.vertexOAuthClientId)}" placeholder="…apps.googleusercontent.com" autocomplete="off"></label><div class="st-status"><span class="st-dot ${vertex.authenticated ? 'ok' : vertex.hasToken ? 'bad' : ''}"></span>${tokenLine}</div><button class="st-btn" data-action="vertex-auth">${vertex.hasToken ? 'Google 재인증' : 'Google 로그인'}${icon('chevronRight', 18)}</button><button class="st-btn" data-action="test-vertex">Vertex AI 연결 테스트${icon('chevronRight', 18)}</button><button class="st-btn danger" data-action="vertex-revoke" ${vertex.hasToken ? '' : 'disabled'}>토큰 폐기 (로그아웃)</button></div><div class="st-note">Endpoint: <code>${this.esc(endpoint)}</code></div><div class="st-section">수동 access token (선택)</div><div class="st-card"><label class="st-field"><span><code class="st-code">gcloud auth print-access-token</code> 결과를 붙여넣기 · 약 1시간 유효</span><input type="password" data-vertex-manual-token autocomplete="off" placeholder="ya29.…"></label><button class="st-btn" data-action="vertex-manual-token">토큰 확인 후 적용${icon('chevronRight', 18)}</button></div><div class="st-section">Vertex AI 준비 순서</div><details class="st-details"><summary>설정 방법 보기 ${icon('chevronDown', 18)}</summary><ol class="st-steps"><li>Google Cloud 프로젝트에 결제 계정을 연결합니다. 신규 가입 무료 체험 크레딧은 일반 Vertex AI 사용량에도 적용됩니다.</li><li>프로젝트에서 <b>Vertex AI API</b>(aiplatform.googleapis.com)를 사용 설정합니다.</li><li>IAM에서 로그인할 Google 계정에 <b>Vertex AI User</b>(roles/aiplatform.user) 역할을 부여합니다.</li><li>OAuth 동의 화면을 구성하고(테스트 모드면 본인을 테스트 사용자로 추가), <b>사용자 인증 정보 → OAuth 클라이언트 ID → 웹 애플리케이션</b>을 만듭니다.</li><li>승인된 JavaScript 원본에 <code>https://crack.wrtn.ai</code>를 추가하고 Client ID를 위에 붙여넣습니다.</li><li>Google 로그인 → Vertex AI 연결 테스트. 토큰은 약 1시간 뒤 만료되며 그때 재인증합니다.</li></ol><div class="st-note" style="padding:0 14px 12px">서비스 계정 JSON key, refresh token, client secret은 사용·저장하지 않습니다. 로그인은 Google Identity Services 토큰 모델(브라우저 전용 앱용 공식 흐름)을 사용하며, 라이브러리(accounts.google.com/gsi/client)는 "Google 로그인"을 누를 때만 불러옵니다.</div></details>`;
     }
 
     settingsHtml() {
@@ -2765,7 +2850,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
 <div class="st-section">Update</div><div class="st-card"><label class="st-field"><span>Turns per update</span><input type="number" min="1" max="100" data-setting="turnsPerUpdate" value="${s.turnsPerUpdate}"></label><label class="st-field"><span>Fandom activity</span><select data-setting="activity">${['Quiet', 'Normal', 'Active', 'Chaos'].map((value) => `<option ${s.activity === value ? 'selected' : ''}>${value}</option>`).join('')}</select></label><label class="st-inline"><span>Automatic fandom updates</span><input type="checkbox" data-setting="autoUpdate" ${s.autoUpdate ? 'checked' : ''}></label><button class="st-btn" data-action="update-now">처리 대기 turns 지금 갱신${icon('chevronRight', 18)}</button></div>
 <div class="st-section">Fanwork</div><div class="st-card"><label class="st-field"><span>Language</span><input data-setting="fanworkLanguage" value="${this.esc(s.fanworkLanguage)}"></label><label class="st-field"><span>Target length (characters) · 8,000 초과 시 개요 → 3섹션 → continuity check</span><input type="number" min="500" max="30000" data-setting="fanworkTargetLength" value="${s.fanworkTargetLength}"></label><label class="st-inline"><span>Streaming</span><input type="checkbox" data-setting="streaming" ${s.streaming ? 'checked' : ''}></label><label class="st-field"><span>UI scale</span><input type="number" min="0.75" max="1.25" step="0.05" data-setting="uiScale" value="${s.uiScale}"></label></div>
 <div class="st-section">World data</div><div class="st-card"><button class="st-btn" data-action="sync-now">지금 API 동기화${icon('chevronRight', 18)}</button><button class="st-btn" data-action="import-history">현재 RP를 원작으로 가져오기${icon('chevronRight', 18)}</button><button class="st-btn" data-action="rebuild-canon">Canon rebuild (팬덤 보존)${icon('chevronRight', 18)}</button><button class="st-btn" data-action="export-world">현재 world 내보내기${icon('chevronRight', 18)}</button><button class="st-btn" data-action="export-all">모든 worlds 내보내기${icon('chevronRight', 18)}</button><button class="st-btn" data-action="import-data">데이터 가져오기${icon('chevronRight', 18)}</button><input type="file" accept="application/json" data-import-file hidden><button class="st-btn danger" data-action="reset-world">현재 Fanverse 전체 초기화</button></div>
-<div class="st-note">world: ${this.esc(world.id)}<br>schema ${DB_VERSION} · app ${APP_VERSION} · sync ${this.esc(world.sync.status)}${world.sync.error ? ` · ${this.esc(world.sync.error)}` : ''}</div>`;
+<div class="st-note">${world ? `world: ${this.esc(world.id)}<br>schema ${DB_VERSION} · app ${APP_VERSION} · sync ${this.esc(world.sync.status)}${world.sync.error ? ` · ${this.esc(world.sync.error)}` : ''}` : `world 미연결 · app ${APP_VERSION}`}${this.startupIssues?.length ? `<br>startup: ${this.startupIssues.map((issue) => this.esc(issue)).join(' / ')}` : ''}</div>`;
     }
 
     // ---------- prompt editor ----------
@@ -2953,6 +3038,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
     async handleAction(action, target) {
       if (!action) return;
       try {
+        if (!this.engine.world && ['sync-now', 'update-now', 'import-history', 'rebuild-canon', 'export-world', 'reset-world'].includes(action)) throw new Error('RP world가 아직 연결되지 않았습니다. Crack 에피소드 페이지에서 잠시 후 다시 시도하세요.');
         if (action === 'open-prompt-editor') { this.push({ type: 'prompt-list' }, 'settings'); return; }
         if (action === 'save-prompt') {
           const promptId = target.dataset.promptId;
@@ -3175,21 +3261,47 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       await GMStore.set(PROMPTS_KEY, this.prompts);
     }
 
-    async init() {
-      const rawSettings = await GMStore.get(SETTINGS_KEY, {});
-      const rawPrompts = await GMStore.get(PROMPTS_KEY, null);
-      if (!rawPrompts && rawSettings?.promptOverrides && Object.keys(rawSettings.promptOverrides).length) {
-        // 0.11.0 → 0.12.0: overrides moved out of settings into their own key (with metadata).
-        await this.persistPrompts({ overrides: rawSettings.promptOverrides });
-      } else {
-        this.prompts = normalizePromptStore(rawPrompts);
+    // Startup is ordered so the launcher appears before anything optional runs, and every step is
+    // isolated: a failing step is logged and surfaced in the UI, never allowed to abort the rest.
+    // Required: settings (falls back to defaults) → IndexedDB → launcher. Optional after the launcher:
+    // Vertex token restore, world attach + sync.
+    async step(name, task) {
+      try {
+        return await task();
+      } catch (error) {
+        console.warn(`[RP Fanverse] startup step "${name}" failed`, error);
+        this.startupIssues.push(`${name}: ${error?.message || error}`);
+        return undefined;
       }
-      await this.persistSettings(rawSettings || {});
-      await this.gemini.vertex.restore();
-      await this.db.open(); this.ui.mount();
-      await this.routeChanged();
-      setInterval(() => this.routeChanged(), 2000);
-      setInterval(() => { if (this.engine.worldInfo && !document.hidden) this.engine.sync().catch((error) => this.ui.notify('error', error.message)); }, Math.max(15, this.settings.pollSeconds) * 1000);
+    }
+
+    async init() {
+      this.startupIssues = [];
+      this.ui.startupIssues = this.startupIssues;
+      if (!GMStore.available()) this.startupIssues.push('GM storage: Tampermonkey GM_* 권한을 사용할 수 없어 설정이 이 페이지에서만 유지됩니다 (userscript header 확인)');
+      await this.step('settings', async () => {
+        const rawSettings = await GMStore.get(SETTINGS_KEY, {});
+        const rawPrompts = await GMStore.get(PROMPTS_KEY, null);
+        if (!rawPrompts && rawSettings?.promptOverrides && Object.keys(rawSettings.promptOverrides).length) {
+          // 0.11.0 → 0.12.x: overrides moved out of settings into their own key (with metadata).
+          await this.persistPrompts({ overrides: rawSettings.promptOverrides });
+        } else {
+          this.prompts = normalizePromptStore(rawPrompts);
+        }
+        await this.persistSettings(rawSettings || {});
+      });
+      await this.step('database', () => withTimeout(this.db.open(), 10000, 'IndexedDB를 열지 못했습니다 (10초 초과)'));
+      try {
+        this.ui.mount();
+      } catch (error) {
+        console.error('[RP Fanverse] launcher mount failed', error);
+        return; // nothing below is reachable for the user without the launcher
+      }
+      if (this.startupIssues.length) this.ui.notify('error', `Fanverse 일부 초기화 실패 — Settings에서 확인하세요.\n${this.startupIssues.join('\n')}`);
+      await this.step('vertex token', () => this.gemini.vertex.restore());
+      await this.step('world', () => this.routeChanged());
+      setInterval(() => { this.routeChanged().catch((error) => console.warn('[RP Fanverse] route check failed', error)); }, 2000);
+      setInterval(() => { if (this.engine.worldInfo && !document.hidden && !this.engine.syncing) this.engine.sync().catch((error) => this.ui.notify('error', error.message)); }, Math.max(15, this.settings.pollSeconds) * 1000);
     }
 
     async routeChanged() {
@@ -3198,14 +3310,26 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       const info = parseWorldFromUrl(location.href);
       if (!info) { this.ui.hide(); this.ui.host.hidden = true; this.ui.host.style.display = 'none'; return; }
       this.ui.host.hidden = false; this.ui.host.style.display = '';
-      await this.engine.attach(info);
+      try {
+        await this.engine.attach(info);
+      } catch (error) {
+        this.lastUrl = ''; // retry on the next route check; the launcher stays usable meanwhile
+        if (!this.attachWarned) { this.attachWarned = true; this.ui.notify('error', `RP world 연결 실패: ${error.message}`); }
+        throw error;
+      }
+      this.attachWarned = false;
       this.ui.history = []; this.ui.route = null;
       this.ui.refreshBadges();
+      if (this.ui.open) await this.ui.render();
       await this.engine.sync().catch((error) => this.ui.notify('error', error.message));
       if (this.ui.open) await this.ui.render();
     }
   }
 
-  const app = new App();
-  app.init().catch((error) => console.error('[RP Fanverse]', error));
+  try {
+    const app = new App();
+    app.init().catch((error) => console.error('[RP Fanverse] startup failed', error));
+  } catch (error) {
+    console.error('[RP Fanverse] failed to construct app', error);
+  }
 })();
