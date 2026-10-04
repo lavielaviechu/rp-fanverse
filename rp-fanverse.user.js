@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RP Fanverse
 // @namespace    https://crack.wrtn.ai/
-// @version      0.12.3
+// @version      0.12.4
 // @description  Treats a Crack RP episode as canon and grows a persistent virtual Pixiv/Reddit fandom around it.
 // @author       Personal userscript
 // @match        https://crack.wrtn.ai/stories/*/episodes/*
@@ -13,39 +13,30 @@
 // @grant        GM_setClipboard
 // @grant        unsafeWindow
 // @connect      crack-api.wrtn.ai
+// @connect      generativelanguage.googleapis.com
+// @connect      aiplatform.googleapis.com
+// @connect      oauth2.googleapis.com
 // @connect      firebasevertexai.googleapis.com
 // @connect      content-firebaseappcheck.googleapis.com
-// @connect      generativelanguage.googleapis.com
 // @connect      googleapis.com
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const APP_VERSION = '0.12.3';
+  const APP_VERSION = '0.12.4';
   const DB_NAME = 'rp-fanverse';
   const DB_VERSION = 1;
   const SETTINGS_KEY = 'rp-fanverse:settings:v1';
-  // Retired keys, cleaned up once on startup: 0.12.0–0.12.2 per-prompt overrides and the direct
-  // Vertex OAuth access token. Fanverse world data lives in IndexedDB and is never touched.
+  // 0.12.0–0.12.2 per-prompt overrides. Kept as-is in GM storage (never deleted) but no longer read:
+  // the internal prompts are code, and the only user-editable text is globalGeminiInstruction.
   const LEGACY_PROMPTS_KEY = 'rp-fanverse:prompt-overrides:v1';
-  const LEGACY_VERTEX_TOKEN_KEY = 'rp-fanverse:vertex-token:v1';
-  const SETTINGS_VERSION = 3;
+  const VERTEX_TOKEN_KEY = 'rp-fanverse:vertex-token:v1';
+  const SETTINGS_VERSION = 4;
   const WORLD_RE = /^\/stories\/([^/]+)\/episodes\/([^/?#]+)/;
   const API_BASE = 'https://crack-api.wrtn.ai/crack-gen/v3';
   const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
-
-  // Firebase Web App config for this project. This is client configuration, not a secret: the apiKey
-  // identifies the Firebase project and is only used to initialise the Firebase app (it is never sent
-  // as a Gemini Developer API key). Abuse protection comes from App Check + API key restrictions.
-  const DEFAULT_FIREBASE_CONFIG = Object.freeze({
-    apiKey: 'AIzaSyAQaeJGobiV4E_jcas1yD5tjL-nv9uD1ek',
-    authDomain: 'c2-refined-31f10.firebaseapp.com',
-    projectId: 'c2-refined-31f10',
-    storageBucket: 'c2-refined-31f10.firebasestorage.app',
-    messagingSenderId: '441466223155',
-    appId: '1:441466223155:web:5b6d30e58cd1ef95fe0146',
-  });
+  const VERTEX_SCOPE = 'https://www.googleapis.com/auth/cloud-platform';
 
   const DEFAULT_GLOBAL_INSTRUCTION = `- 원작(RP 로그)에 없는 사실을 Canon처럼 단정하지 않는다. 팬 해석과 Canon을 구분한다.
 - 캐릭터의 말투와 성격을 원작에 맞게 유지하고 OOC를 피한다.
@@ -53,15 +44,31 @@
 - Reddit은 실제 커뮤니티처럼 의견이 갈리고, 사람마다 근거와 말투가 다르게 쓴다.
 - Pixiv 제목·캡션·태그는 실제 일본 팬덤에서 볼 법한 자연스러운 표현을 쓴다.`;
 
+  // Firebase Web App config fields. Nothing project-specific is shipped: the user pastes their own
+  // config in Settings and it is stored (GM storage) as settings.firebaseConfig.
+  const FIREBASE_CONFIG_FIELDS = Object.freeze(['apiKey', 'authDomain', 'projectId', 'storageBucket', 'messagingSenderId', 'appId']);
+  const FIREBASE_REQUIRED_FIELDS = Object.freeze(['apiKey', 'projectId', 'appId']);
+  const EMPTY_FIREBASE_CONFIG = Object.freeze(Object.fromEntries(FIREBASE_CONFIG_FIELDS.map((key) => [key, ''])));
+
+  const PROVIDERS = Object.freeze([
+    { id: 'developer', label: 'Gemini Developer API' },
+    { id: 'vertex', label: 'Vertex AI' },
+    { id: 'firebase', label: 'Firebase AI' },
+  ]);
+
   const DEFAULT_SETTINGS = Object.freeze({
     settingsVersion: SETTINGS_VERSION,
-    provider: 'firebase',
     apiKey: '',
+    provider: 'developer',
     model: 'gemini-3.8-flash',
     modelPreset: 'gemini-3.8-flash',
     customModelId: '',
+    vertexProjectId: '',
+    vertexLocation: 'global',
+    vertexApiVersion: 'v1',
+    vertexOAuthClientId: '',
+    firebaseConfig: EMPTY_FIREBASE_CONFIG,
     firebaseLocation: 'global',
-    firebaseConfigOverride: null,
     appCheckMode: 'off',
     appCheckSiteKey: '',
     appCheckDebugToken: '',
@@ -85,11 +92,14 @@
   // was never a deliberate choice, so migration moves it to the new default preset instead of
   // preserving it as a Custom model ID.
   const LEGACY_DEFAULT_MODELS = Object.freeze(['', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest']);
-  const RETIRED_SETTING_FIELDS = Object.freeze(['vertexProjectId', 'vertexLocation', 'vertexApiVersion', 'vertexOAuthClientId', 'promptOverrides']);
 
   function resolveModelId(settings) {
     if (settings.modelPreset === 'custom') return String(settings.customModelId || '').trim() || DEFAULT_SETTINGS.model;
     return MODEL_PRESETS.some((preset) => preset.id === settings.modelPreset) ? settings.modelPreset : DEFAULT_SETTINGS.model;
+  }
+
+  function modelLabel(settings) {
+    return settings.modelPreset === 'custom' ? resolveModelId(settings) : (MODEL_PRESETS.find((preset) => preset.id === settings.modelPreset)?.label || resolveModelId(settings));
   }
 
   function clampNumber(value, min, max, fallback) {
@@ -97,29 +107,50 @@
     return Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : fallback;
   }
 
-  // Accepts only the fields a Firebase web app needs; anything else in an override is dropped.
+  // Keeps exactly the six Firebase Web App fields as trimmed strings ('' when absent).
   function normalizeFirebaseConfig(config) {
-    if (!config || typeof config !== 'object') return null;
-    const picked = {};
-    for (const key of ['apiKey', 'authDomain', 'projectId', 'storageBucket', 'messagingSenderId', 'appId']) {
-      if (typeof config[key] === 'string' && config[key].trim()) picked[key] = config[key].trim();
-    }
-    return picked.apiKey && picked.projectId && picked.appId ? picked : null;
+    const source = config && typeof config === 'object' && !Array.isArray(config) ? config : {};
+    return Object.fromEntries(FIREBASE_CONFIG_FIELDS.map((key) => [key, typeof source[key] === 'string' ? source[key].trim() : '']));
   }
 
-  function resolveFirebaseConfig(settings) {
-    return normalizeFirebaseConfig(settings.firebaseConfigOverride) || { ...DEFAULT_FIREBASE_CONFIG };
+  function validateFirebaseConfig(config) {
+    const normalized = normalizeFirebaseConfig(config);
+    const missingRequired = FIREBASE_REQUIRED_FIELDS.filter((key) => !normalized[key]);
+    const missingRecommended = FIREBASE_CONFIG_FIELDS.filter((key) => !FIREBASE_REQUIRED_FIELDS.includes(key) && !normalized[key]);
+    const empty = FIREBASE_CONFIG_FIELDS.every((key) => !normalized[key]);
+    return { ok: missingRequired.length === 0, empty, missingRequired, missingRecommended, config: normalized };
+  }
+
+  // Accepts the JSON object, or the JavaScript snippet the Firebase console shows
+  // (`const firebaseConfig = { apiKey: "…", … };` with unquoted keys). Never evaluates code.
+  function parseFirebaseConfigInput(text) {
+    const source = String(text || '').trim();
+    if (!source) throw new Error('Firebase Web Config를 붙여넣으세요.');
+    const start = source.indexOf('{');
+    const end = source.lastIndexOf('}');
+    if (start < 0 || end < start) throw new Error('JSON 객체({ … })를 찾을 수 없습니다.');
+    const body = source.slice(start, end + 1);
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch (_) {
+      const jsonish = body
+        .replace(/\/\/[^\n]*/g, '')
+        .replace(/([{,]\s*)([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":')
+        .replace(/'([^'\\]*)'/g, '"$1"')
+        .replace(/,\s*([}\]])/g, '$1');
+      // The parser's own message quotes part of the input (which may include the key), so it is not shown.
+      try { parsed = JSON.parse(jsonish); } catch (_) { throw new Error('JSON 형식이 올바르지 않습니다. 쉼표·따옴표·중괄호를 확인하세요.'); }
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Firebase Web Config는 객체여야 합니다.');
+    return normalizeFirebaseConfig(parsed);
   }
 
   function normalizeSettings(saved = {}) {
     const source = saved && typeof saved === 'object' ? saved : {};
+    // Unknown/legacy fields (e.g. 0.11 `promptOverrides`) are carried along untouched.
     const result = { ...DEFAULT_SETTINGS, ...source };
-    // 0.12.3: Firebase AI Logic becomes the default backend. Older settings (direct Vertex or the
-    // Gemini Developer API) move to Firebase once; the Developer API key is kept for the advanced
-    // fallback, which the user can still select afterwards.
-    const previousVersion = Number(source.settingsVersion) || 0;
-    if (previousVersion < 3) result.provider = 'firebase';
-    result.provider = result.provider === 'developer' ? 'developer' : 'firebase';
+    result.provider = PROVIDERS.some((provider) => provider.id === result.provider) ? result.provider : 'developer';
     if (!source.modelPreset) {
       const legacyModel = String(source.model || '').trim();
       if (MODEL_PRESETS.some((preset) => preset.id === legacyModel)) result.modelPreset = legacyModel;
@@ -129,8 +160,15 @@
     if (!['custom', ...MODEL_PRESETS.map((preset) => preset.id)].includes(result.modelPreset)) result.modelPreset = DEFAULT_SETTINGS.modelPreset;
     result.customModelId = String(result.customModelId || '').trim();
     result.apiKey = String(result.apiKey || '').trim();
+    result.vertexProjectId = String(result.vertexProjectId || '').trim();
+    result.vertexLocation = String(result.vertexLocation || 'global').trim().toLowerCase() || 'global';
+    result.vertexApiVersion = ['v1', 'v1beta1'].includes(result.vertexApiVersion) ? result.vertexApiVersion : 'v1';
+    result.vertexOAuthClientId = String(result.vertexOAuthClientId || '').trim();
+    // 0.12.3 stored a user-entered Firebase config as `firebaseConfigOverride`; adopt it once.
+    if (source.firebaseConfigOverride && !source.firebaseConfig) result.firebaseConfig = source.firebaseConfigOverride;
+    delete result.firebaseConfigOverride;
+    result.firebaseConfig = normalizeFirebaseConfig(result.firebaseConfig);
     result.firebaseLocation = String(result.firebaseLocation || 'global').trim().toLowerCase() || 'global';
-    result.firebaseConfigOverride = normalizeFirebaseConfig(result.firebaseConfigOverride);
     result.appCheckMode = ['off', 'recaptcha-enterprise', 'debug'].includes(result.appCheckMode) ? result.appCheckMode : 'off';
     result.appCheckSiteKey = String(result.appCheckSiteKey || '').trim();
     result.appCheckDebugToken = String(result.appCheckDebugToken || '').trim();
@@ -145,15 +183,31 @@
       font: ['gothic', 'mincho'].includes(reader.font) ? reader.font : 'gothic',
       theme: ['light', 'sepia', 'dark'].includes(reader.theme) ? reader.theme : 'light',
     };
-    for (const field of RETIRED_SETTING_FIELDS) delete result[field];
     result.settingsVersion = SETTINGS_VERSION;
     result.model = resolveModelId(result);
     return result;
   }
 
+  // Vertex AI host per location: `global` uses the global endpoint, the `us`/`eu` multi-regions
+  // use the regional-endpoint (REP) hosts, and anything else is treated as a region name.
+  function vertexHost(location) {
+    if (location === 'global') return 'aiplatform.googleapis.com';
+    if (location === 'us' || location === 'eu') return `aiplatform.${location}.rep.googleapis.com`;
+    return `${location}-aiplatform.googleapis.com`;
+  }
+
+  function buildVertexEndpoint(settings, stream = false) {
+    const location = String(settings.vertexLocation || 'global').trim().toLowerCase() || 'global';
+    const version = settings.vertexApiVersion === 'v1beta1' ? 'v1beta1' : 'v1';
+    const project = encodeURIComponent(String(settings.vertexProjectId || '').trim());
+    const model = encodeURIComponent(resolveModelId(settings));
+    const method = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
+    return `https://${vertexHost(location)}/${version}/projects/${project}/locations/${encodeURIComponent(location)}/publishers/google/models/${model}:${method}`;
+  }
+
   // The user's common Gemini instruction travels as systemInstruction, separate from the internal
-  // task prompt. The preamble keeps task rules (JSON shape, canon/fan-interpretation split, source
-  // IDs) authoritative when a style preference would conflict with them.
+  // task prompt (user content) and the runtime data inside it. The preamble keeps task rules (JSON
+  // shape, canon/fan-interpretation split, source IDs) authoritative over style preferences.
   function buildSystemInstruction(instruction) {
     const text = String(instruction || '').trim();
     if (!text) return null;
@@ -539,11 +593,14 @@ ORIGINAL FANWORK:
       validateSchema: Utils.validateSchema,
       normalizeSettings,
       resolveModelId,
+      modelLabel,
+      buildVertexEndpoint,
       normalizeFirebaseConfig,
-      resolveFirebaseConfig,
+      validateFirebaseConfig,
+      parseFirebaseConfigInput,
       buildSystemInstruction,
       defaultGlobalInstruction: DEFAULT_GLOBAL_INSTRUCTION,
-      defaultFirebaseConfig: DEFAULT_FIREBASE_CONFIG,
+      emptyFirebaseConfig: EMPTY_FIREBASE_CONFIG,
       validatePromptTemplate,
       inspectPromptTemplate,
       renderPromptTemplate,
@@ -702,6 +759,16 @@ ORIGINAL FANWORK:
     const seconds = parseFloat(String(json.ttl || '3600s'));
     if (!json.token) throw new Error('App Check 응답에 token이 없습니다');
     return { token: json.token, expireTimeMillis: Date.now() + (Number.isFinite(seconds) ? seconds : 3600) * 1000 };
+  }
+
+  // Google Identity Services (Vertex "Google 로그인") — loaded only when that button is pressed.
+  const GIS_SRC = 'https://accounts.google.com/gsi/client';
+  function googleOAuth() {
+    return pageWindow().google?.accounts?.oauth2 || globalThis.google?.accounts?.oauth2 || null;
+  }
+  async function loadGoogleIdentityServices() {
+    await loadPageScript(GIS_SRC, () => Boolean(googleOAuth()), 'Google 로그인 라이브러리');
+    return googleOAuth();
   }
 
   async function recaptchaEnterpriseToken(siteKey) {
@@ -1011,45 +1078,46 @@ ORIGINAL FANWORK:
   // Shared request/stream/JSON logic. Provider subclasses only supply `request(payload, options)`
   // (endpoint + auth headers), so FanverseEngine never depends on which backend is active.
   // ---------- generation clients ----------
-  // Both clients implement the same interface — generateJson(prompt, schema, options),
-  // generateText(prompt, options), generateTextStream(prompt, options), testConnection(), ready() —
-  // and accept `options.systemInstruction`. FanverseEngine only ever talks to GeminiClient below.
+  // GenerationClient interface (all three providers): generateJson(prompt, schema, options),
+  // generateText(prompt, options), generateTextStream(prompt, options), testConnection(), ready().
+  // `options.systemInstruction` carries the user's common Gemini instruction. FanverseEngine only
+  // talks to the GeminiClient facade at the end of this section.
 
   function isRetryableStatus(status) {
     return !status || status === 429 || status >= 500;
   }
 
-  // Advanced fallback: the Gemini Developer API called directly with the user's own Gemini API key.
-  class GeminiDeveloperClient {
+  // Shared REST client for the Gemini Developer API and Vertex AI (same request/response shape).
+  class BaseGenerationClient {
     constructor(getSettings) {
       this.getSettings = getSettings;
     }
 
-    ready() { return Boolean(this.getSettings().apiKey); }
-
-    endpoint(stream = false) {
-      const method = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
-      return `${GEMINI_BASE}/${encodeURIComponent(resolveModelId(this.getSettings()))}:${method}`;
-    }
-
-    describeHttpError(status, body) {
+    describeHttpError(providerName, status, body) {
       let message = '';
       try { message = JSON.parse(body)?.error?.message || ''; } catch (_) { /* non-JSON error body */ }
-      const hints = { 400: '요청 형식 또는 model ID를 확인하세요.', 401: 'API key가 잘못되었습니다.', 403: '권한이 없거나 API가 사용 설정되지 않았습니다.', 404: 'model ID를 확인하세요.', 429: '요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.' };
-      return `Gemini Developer API HTTP ${status}${message ? `: ${message}` : ''}${hints[status] ? ` (${hints[status]})` : ''}`;
+      if (!message) {
+        try { message = JSON.parse(body)?.[0]?.error?.message || ''; } catch (_) { /* noop */ }
+      }
+      const hints = {
+        400: '요청 형식 또는 model ID를 확인하세요.',
+        401: '인증이 만료되었거나 잘못되었습니다.',
+        403: '권한이 없거나 API가 사용 설정되지 않았습니다.',
+        404: 'model ID, project, location 조합을 확인하세요.',
+        429: '할당량/요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.',
+      };
+      return `${providerName} HTTP ${status}${message ? `: ${message}` : ''}${hints[status] ? ` (${hints[status]})` : ''}`;
     }
 
-    request(payload, { stream = false, onChunk = null } = {}) {
-      const settings = this.getSettings();
-      if (!settings.apiKey) return Promise.reject(new Error('Gemini Developer API key가 없습니다. Settings > 고급 설정에서 입력하세요.'));
+    send(url, headers, payload, { stream = false, onChunk = null, providerName = 'Gemini' } = {}) {
       return new Promise((resolve, reject) => {
         let consumed = 0;
         let accumulated = '';
         let sseBuffer = '';
         GM_xmlhttpRequest({
-          method: 'POST', url: this.endpoint(stream), timeout: 300000,
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.apiKey },
-          data: JSON.stringify(payload),
+          method: 'POST', url,
+          headers,
+          data: JSON.stringify(payload), timeout: 180000,
           onprogress: stream ? (response) => {
             const fresh = String(response.responseText || '').slice(consumed);
             consumed += fresh.length;
@@ -1066,24 +1134,27 @@ ORIGINAL FANWORK:
           } : undefined,
           onload: (response) => {
             if (response.status < 200 || response.status >= 300) {
-              reject(Object.assign(new Error(this.describeHttpError(response.status, response.responseText)), { status: response.status }));
+              reject(Object.assign(new Error(this.describeHttpError(providerName, response.status, response.responseText)), { status: response.status }));
               return;
             }
             try {
               if (stream) {
                 const full = parseSseText(response.responseText);
-                if (!full && !accumulated) throw new Error('Gemini Developer API stream returned no text');
+                if (!full && !accumulated) throw new Error(`${providerName} stream returned no text`);
                 resolve(full || accumulated);
                 return;
               }
               const json = JSON.parse(response.responseText);
               const text = candidateText(json);
-              if (!text) throw new Error(`Gemini Developer API returned no text${json.promptFeedback?.blockReason ? ` (${json.promptFeedback.blockReason})` : ''}`);
+              if (!text) {
+                const reason = json.promptFeedback?.blockReason || json.candidates?.[0]?.finishReason;
+                throw new Error(`${providerName} returned no text candidate${reason ? ` (${reason})` : ''}`);
+              }
               resolve(text);
             } catch (error) { reject(error); }
           },
-          onerror: () => reject(new Error('Gemini Developer API network error')),
-          ontimeout: () => reject(new Error('Gemini Developer API request timed out')),
+          onerror: () => reject(new Error(`${providerName} network error`)),
+          ontimeout: () => reject(new Error(`${providerName} request timed out`)),
         });
       });
     }
@@ -1107,29 +1178,178 @@ ORIGINAL FANWORK:
           return parsed;
         } catch (error) {
           lastError = error;
-          if (!isRetryableStatus(error.status)) break;
+          if (!isRetryableStatus(error.status)) break; // auth/config errors won't fix themselves
         }
       }
       throw lastError;
     }
 
-    generateText(prompt, { stream = false, onChunk = null, temperature = 0.85, systemInstruction = null } = {}) {
+    async generateText(prompt, { stream = false, onChunk = null, temperature = 0.85, systemInstruction = null } = {}) {
       return this.request(this.payload(prompt, { temperature }, systemInstruction), { stream, onChunk });
     }
 
     generateTextStream(prompt, options = {}) { return this.generateText(prompt, { ...options, stream: true }); }
 
     async testConnection() {
-      return (await this.generateText('Reply with exactly OK.', { temperature: 0 })).trim().slice(0, 40);
+      const text = await this.request(this.payload('Reply with exactly OK.', { temperature: 0 }, null));
+      return text.trim().slice(0, 40);
     }
   }
 
-  // Default backend: Firebase AI Logic (firebase/ai) with AgentPlatformBackend — the Agent Platform
-  // (formerly Vertex AI) Gemini API of the configured Firebase/Google Cloud project, called through
-  // the Firebase AI Logic proxy. The SDK is bundled into this file (see createFirebaseSdk at the end)
-  // and only evaluated after the launcher is mounted. Nothing here can take down the UI: failures
-  // are kept in `state` and surfaced in Settings, and only AI generation is affected.
-  class FirebaseAILogicClient {
+  class GeminiDeveloperClient extends BaseGenerationClient {
+    endpoint(stream = false) {
+      const method = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
+      return `${GEMINI_BASE}/${encodeURIComponent(resolveModelId(this.getSettings()))}:${method}`;
+    }
+
+    ready() { return Boolean(this.getSettings().apiKey); }
+
+    request(payload, options = {}) {
+      const settings = this.getSettings();
+      if (!settings.apiKey) return Promise.reject(new Error('Gemini Developer API key is not configured'));
+      return this.send(this.endpoint(Boolean(options.stream)), { 'Content-Type': 'application/json', 'x-goog-api-key': settings.apiKey }, payload, { ...options, providerName: 'Gemini Developer API' });
+    }
+  }
+
+  // Vertex AI with a user OAuth access token. Tokens come from Google Identity Services' token
+  // model (the documented browser flow for apps without a backend) or are pasted from
+  // `gcloud auth print-access-token`. Only the short-lived access token and its expiry are kept
+  // (GM storage, never exported); no service-account key, refresh token or client secret is stored.
+  class VertexGeminiClient extends BaseGenerationClient {
+    constructor(getSettings) {
+      super(getSettings);
+      this.accessToken = '';
+      this.expiresAt = 0;
+      this.tokenSource = '';
+      this.tokenClient = null;
+      this.tokenClientId = '';
+    }
+
+    async restore() {
+      const saved = await GMStore.get(VERTEX_TOKEN_KEY, null);
+      if (saved?.accessToken && Number(saved.expiresAt) > Date.now() + 60000) {
+        this.accessToken = saved.accessToken; this.expiresAt = Number(saved.expiresAt); this.tokenSource = saved.source || 'oauth';
+      } else if (saved) {
+        await GMStore.remove(VERTEX_TOKEN_KEY);
+      }
+    }
+
+    async persist() {
+      if (this.accessToken) await GMStore.set(VERTEX_TOKEN_KEY, { accessToken: this.accessToken, expiresAt: this.expiresAt, source: this.tokenSource });
+      else await GMStore.remove(VERTEX_TOKEN_KEY);
+    }
+
+    status() {
+      const seconds = Math.max(0, Math.floor((this.expiresAt - Date.now()) / 1000));
+      return { authenticated: Boolean(this.accessToken && seconds > 30), expiresInSeconds: seconds, source: this.tokenSource, hasToken: Boolean(this.accessToken) };
+    }
+
+    ready() { return Boolean(this.getSettings().vertexProjectId && this.status().authenticated); }
+
+    async clearAccessToken() {
+      this.accessToken = ''; this.expiresAt = 0; this.tokenSource = '';
+      await this.persist();
+    }
+
+    async setToken(accessToken, expiresInSeconds, source) {
+      this.accessToken = accessToken;
+      this.expiresAt = Date.now() + Math.max(60, Number(expiresInSeconds) || 3600) * 1000;
+      this.tokenSource = source;
+      await this.persist();
+      return this.status();
+    }
+
+    // Called from the "Google 로그인" click: GIS is lazy-loaded here, then opens its consent popup
+    // from requestAccessToken(). If loading took long enough for the click's user activation to
+    // lapse, the browser may block the popup; the library is cached by then, so a second click works.
+    async authorize() {
+      const settings = this.getSettings();
+      if (!settings.vertexOAuthClientId) throw new Error('Vertex OAuth Client ID가 없습니다. 연결 설정에 OAuth Client ID를 먼저 입력하세요.');
+      const loadStarted = Date.now();
+      let oauth;
+      try {
+        oauth = await loadGoogleIdentityServices();
+      } catch (error) {
+        throw new Error(`${error.message}. 잠시 후 다시 시도하거나 Advanced의 수동 access token을 사용하세요.`);
+      }
+      const slowLoad = Date.now() - loadStarted > 3000;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Google OAuth window timed out or was closed')), 180000);
+        const settle = (fn) => (value) => { clearTimeout(timer); fn(value); };
+        const onToken = settle(async (response) => {
+          if (response?.error || !response?.access_token) { reject(new Error(response?.error_description || response?.error || 'Google OAuth returned no access token')); return; }
+          if (typeof oauth.hasGrantedAllScopes === 'function' && !oauth.hasGrantedAllScopes(response, VERTEX_SCOPE)) { reject(new Error('cloud-platform scope가 승인되지 않았습니다. 동의 화면에서 권한을 허용하세요.')); return; }
+          resolve(await this.setToken(response.access_token, response.expires_in, 'oauth'));
+        });
+        const onError = settle((error) => reject(new Error(error?.type === 'popup_closed' ? 'Google 로그인 창이 닫혔습니다.' : error?.type === 'popup_failed_to_open' ? (slowLoad ? '라이브러리 로딩이 끝났습니다. "Google 로그인"을 한 번 더 눌러 주세요.' : '팝업이 차단되었습니다. 이 사이트의 팝업을 허용하세요.') : error?.message || error?.type || 'Google OAuth popup failed')));
+        if (!this.tokenClient || this.tokenClientId !== settings.vertexOAuthClientId) {
+          // The token client lives across requests; its callbacks dispatch to whichever request is
+          // pending, so an abandoned popup's late response cannot settle a newer request.
+          this.tokenClient = oauth.initTokenClient({
+            client_id: settings.vertexOAuthClientId,
+            scope: VERTEX_SCOPE,
+            callback: (response) => this.pendingAuth?.onToken(response),
+            error_callback: (error) => this.pendingAuth?.onError(error),
+          });
+          this.tokenClientId = settings.vertexOAuthClientId;
+        }
+        this.pendingAuth?.onError({ type: 'superseded', message: '새 로그인 요청으로 대체되었습니다.' });
+        const pending = {
+          onToken: (response) => { if (this.pendingAuth === pending) { this.pendingAuth = null; onToken(response); } },
+          onError: (error) => { if (this.pendingAuth === pending) { this.pendingAuth = null; onError(error); } },
+        };
+        this.pendingAuth = pending;
+        this.tokenClient.requestAccessToken({ prompt: this.accessToken ? '' : 'consent' });
+      });
+    }
+
+    // Validates a pasted token with Google's tokeninfo endpoint (POST body, so the token never
+    // appears in a URL) and records its real expiry.
+    async useManualToken(token) {
+      const accessToken = String(token || '').trim().replace(/^Bearer\s+/i, '');
+      if (!accessToken) throw new Error('access token을 입력하세요.');
+      const info = await new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: 'POST', url: 'https://oauth2.googleapis.com/tokeninfo', timeout: 20000,
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          data: `access_token=${encodeURIComponent(accessToken)}`,
+          onload: (response) => {
+            if (response.status !== 200) { reject(new Error('유효하지 않거나 만료된 access token입니다.')); return; }
+            try { resolve(JSON.parse(response.responseText)); } catch (error) { reject(error); }
+          },
+          onerror: () => reject(new Error('tokeninfo network error')),
+          ontimeout: () => reject(new Error('tokeninfo timed out')),
+        });
+      });
+      if (!String(info.scope || '').split(' ').includes(VERTEX_SCOPE)) throw new Error('이 token에는 cloud-platform scope가 없습니다.');
+      return this.setToken(accessToken, info.expires_in, 'manual');
+    }
+
+    async revoke() {
+      const token = this.accessToken;
+      await this.clearAccessToken();
+      if (!token) return;
+      const oauth = googleOAuth(); // never loads GIS just to log out
+      if (oauth?.revoke) { oauth.revoke(token, () => {}); return; }
+      GM_xmlhttpRequest({ method: 'POST', url: 'https://oauth2.googleapis.com/revoke', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, data: `token=${encodeURIComponent(token)}` });
+    }
+
+    request(payload, options = {}) {
+      const settings = this.getSettings();
+      if (!settings.vertexProjectId) return Promise.reject(new Error('Vertex Google Cloud Project ID is not configured'));
+      if (!this.status().authenticated) return Promise.reject(new Error('Vertex access token이 없거나 만료되었습니다. Settings에서 Google 로그인/재인증을 하세요.'));
+      return this.send(buildVertexEndpoint(settings, Boolean(options.stream)), { 'Content-Type': 'application/json', Authorization: `Bearer ${this.accessToken}` }, payload, { ...options, providerName: 'Vertex AI' }).catch(async (error) => {
+        if (error.status === 401) await this.clearAccessToken();
+        throw error;
+      });
+    }
+  }
+
+  // Firebase AI (firebase/ai, AgentPlatformBackend) with the Firebase Web config the user saved in
+  // Settings (settings.firebaseConfig). Nothing is initialised until this provider is actually used
+  // — a generation request or "연결 테스트" — and only after the config validates. The SDK is bundled
+  // into this file (createFirebaseSdk at the end). Failures stay in `state` and only affect AI calls.
+  class FirebaseAIClient {
     constructor(getSettings) {
       this.getSettings = getSettings;
       this.instance = null;
@@ -1137,8 +1357,10 @@ ORIGINAL FANWORK:
       this.state = { phase: 'idle', error: null, appCheck: 'off', appCheckError: null, appCheckAt: null, lastTest: null };
     }
 
+    configCheck() { return validateFirebaseConfig(this.getSettings().firebaseConfig); }
+
     configKey(settings) {
-      return JSON.stringify([resolveFirebaseConfig(settings), settings.firebaseLocation, settings.appCheckMode, settings.appCheckSiteKey, settings.appCheckDebugToken]);
+      return JSON.stringify([normalizeFirebaseConfig(settings.firebaseConfig), settings.firebaseLocation, settings.appCheckMode, settings.appCheckSiteKey, settings.appCheckDebugToken]);
     }
 
     async appCheckToken(config, settings) {
@@ -1159,14 +1381,18 @@ ORIGINAL FANWORK:
       }
     }
 
-    // Lazily initialises (or re-initialises after a config change) the Firebase app, App Check and AI.
+    // Lazily initialises (or re-initialises after a config change) Firebase app, App Check and AI.
     ensure() {
       const settings = this.getSettings();
+      const check = validateFirebaseConfig(settings.firebaseConfig);
+      if (!check.ok) {
+        throw Object.assign(new Error(check.empty ? 'Firebase Web Config가 설정되지 않았습니다. Settings > AI > 연결 설정에서 입력하세요.' : `Firebase Web Config에 ${check.missingRequired.join(', ')} 값이 없습니다.`), { status: 'config' });
+      }
       const key = this.configKey(settings);
       if (this.instance && this.instanceKey === key) return this.instance;
       try {
         const sdk = getFirebaseSdk();
-        const config = resolveFirebaseConfig(settings);
+        const config = check.config;
         // A named app per configuration: no clash with any Firebase app the host page may run, and a
         // changed config gets a fresh app instead of a duplicate-app error.
         const app = sdk.initializeApp(config, `rp-fanverse-${Utils.hash(key)}`);
@@ -1191,7 +1417,7 @@ ORIGINAL FANWORK:
       }
     }
 
-    ready() { return this.state.phase !== 'error'; }
+    ready() { return this.configCheck().ok && this.state.phase !== 'error'; }
 
     model(generationConfig, systemInstruction) {
       const { sdk, ai } = this.ensure();
@@ -1208,12 +1434,12 @@ ORIGINAL FANWORK:
       const raw = String(error?.message || error).replace(/^AI: /, '').replace(/^Error fetching from \S+:\s+(\[[^\]]*\]\s*)?/, '').replace(/\s*\(AI\/[\w-]+\)\.?$/, '');
       let hint = '';
       if (!status && /Failed to fetch|network error|timeout/i.test(raw)) hint = '네트워크 연결을 확인하세요. Tampermonkey가 googleapis.com 도메인 접근 허용을 물으면 “항상 허용”을 선택하세요.';
-      else if (/App Check/i.test(raw)) hint = '이 모델/프로젝트는 Firebase App Check가 필요합니다. Settings > App Check를 설정하고 Firebase 콘솔에서 Firebase AI Logic의 App Check enforcement를 켜세요.';
+      else if (/App Check/i.test(raw)) hint = '이 모델/프로젝트는 Firebase App Check가 필요합니다. 연결 설정의 App Check를 설정하고 Firebase 콘솔에서 Firebase AI Logic의 App Check enforcement를 켜세요.';
       else if (error?.code === 'api-not-enabled' || /SERVICE_DISABLED|firebasevertexai.googleapis.com\W+to be enabled/i.test(raw)) hint = 'Firebase 콘솔의 AI Logic에서 Agent Platform Gemini API 설정(Get started)을 완료하세요.';
       else if (status === 429) hint = '요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.';
       else if (status === 404) hint = 'model ID 또는 location을 확인하세요.';
-      else if (status === 400 && /API key/i.test(raw)) hint = 'Firebase API key 제한(허용 API·HTTP referrer)을 확인하세요.';
-      const message = `Firebase AI Logic${status ? ` HTTP ${status}` : ''}: ${raw.slice(0, 400)}${hint ? `\n→ ${hint}` : ''}`;
+      else if ((status === 400 || status === 403) && /API key/i.test(raw)) hint = 'Firebase Web Config의 apiKey와 API key 제한(허용 API·HTTP referrer)을 확인하세요.';
+      const message = `Firebase AI${status ? ` HTTP ${status}` : ''}: ${raw.slice(0, 400)}${hint ? `\n→ ${hint}` : ''}`;
       return Object.assign(new Error(message), { status });
     }
 
@@ -1234,7 +1460,7 @@ ORIGINAL FANWORK:
           return parsed;
         } catch (error) {
           lastError = error;
-          if (!isRetryableStatus(error.status) || /Firebase 초기화 실패/.test(error.message)) break;
+          if (error.status === 'config' || !isRetryableStatus(error.status) || /Firebase 초기화 실패/.test(error.message)) break;
         }
       }
       throw lastError;
@@ -1274,7 +1500,8 @@ ORIGINAL FANWORK:
 
     status() {
       const settings = this.getSettings();
-      return { ...this.state, projectId: resolveFirebaseConfig(settings).projectId, location: settings.firebaseLocation, overridden: Boolean(settings.firebaseConfigOverride), appCheckMode: settings.appCheckMode };
+      const check = validateFirebaseConfig(settings.firebaseConfig);
+      return { ...this.state, configured: check.ok, empty: check.empty, missingRequired: check.missingRequired, missingRecommended: check.missingRecommended, projectId: check.config.projectId, location: settings.firebaseLocation, appCheckMode: settings.appCheckMode };
     }
   }
 
@@ -1284,17 +1511,23 @@ ORIGINAL FANWORK:
   class GeminiClient {
     constructor(getSettings) {
       this.getSettings = getSettings;
-      this.firebase = new FirebaseAILogicClient(getSettings);
       this.developer = new GeminiDeveloperClient(getSettings);
+      this.vertex = new VertexGeminiClient(getSettings);
+      this.firebase = new FirebaseAIClient(getSettings);
     }
 
-    client(provider = this.getSettings().provider) { return provider === 'developer' ? this.developer : this.firebase; }
+    client(provider = this.getSettings().provider) { return provider === 'vertex' ? this.vertex : provider === 'firebase' ? this.firebase : this.developer; }
     providerReady() { return this.client().ready(); }
     systemInstruction(useInstruction = true) { return useInstruction === false ? null : buildSystemInstruction(this.getSettings().globalGeminiInstruction); }
     generateJson(prompt, schema, options = {}) { return this.client().generateJson(prompt, schema, { ...options, systemInstruction: this.systemInstruction(options.useInstruction) }); }
     generateText(prompt, options = {}) { return this.client().generateText(prompt, { ...options, systemInstruction: this.systemInstruction(options.useInstruction) }); }
     generateTextStream(prompt, options = {}) { return this.generateText(prompt, { ...options, stream: true }); }
     testConnection(provider) { return this.client(provider).testConnection(); }
+    authorizeVertex() { return this.vertex.authorize(); }
+    useManualVertexToken(token) { return this.vertex.useManualToken(token); }
+    revokeVertex() { return this.vertex.revoke(); }
+    vertexStatus() { return this.vertex.status(); }
+    clearVertexToken() { return this.vertex.clearAccessToken(); }
     firebaseStatus() { return this.firebase.status(); }
   }
 
@@ -1423,7 +1656,8 @@ ORIGINAL FANWORK:
         // Turns are kept unprocessed, so the update simply runs once the provider is usable again.
         if (!this.warnedProviderUnready) {
           this.warnedProviderUnready = true;
-          this.notify('error', settings.provider === 'developer' ? 'Gemini Developer API key가 없어 자동 갱신을 보류했습니다. Settings를 확인하세요.' : 'Firebase AI Logic을 사용할 수 없어 자동 갱신을 보류했습니다. Settings에서 상태를 확인하세요.');
+          const reason = { developer: 'Gemini Developer API key가 없어', vertex: 'Vertex access token이 없거나 만료되어', firebase: 'Firebase AI 설정이 없거나 초기화에 실패해' }[settings.provider] || 'AI 연결을 사용할 수 없어';
+          this.notify('error', `${reason} 자동 갱신을 보류했습니다. Settings > AI에서 확인하세요.`);
         }
         return;
       }
@@ -2099,12 +2333,26 @@ details.st-details{margin:0 14px;background:#fff;border-radius:12px;overflow:hid
 details.st-details>summary{padding:12px 14px;cursor:pointer;font-size:14px;list-style:none;display:flex;justify-content:space-between}
 details.st-details>summary::-webkit-details-marker{display:none}
 details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
+.st-sub{padding:0 18px;color:#6d6d72;font-size:13px}
+.st-foot{margin:22px 18px 0;color:#8e8e93;font-size:12px;text-align:center}
+.st-section.danger{color:#ff3b30}
+.st-row{position:relative;display:flex;align-items:center;gap:12px;width:100%;min-height:46px;padding:8px 14px;border:0;background:#fff;color:#000;text-align:left;font-size:15px;cursor:pointer}
+.st-row+.st-row:before,.st-status+.st-row:before{content:"";position:absolute;left:14px;right:0;top:0;height:1px;background:#e5e5ea}
+.st-row:has(.st-ico)+.st-row:before{left:55px}
+.st-row:hover{background:#f7f7fa}
+.st-ico{flex:none;width:29px;height:29px;border-radius:7px;display:grid;place-items:center;color:#fff;background:var(--t,#8e8e93)}
+.st-row-label{flex:1;min-width:0;display:flex;flex-direction:column}
+.st-row-label small{color:#8e8e93;font-size:12px;line-height:16px}
+.st-row-value{display:flex;align-items:center;gap:6px;max-width:55%;color:#8a8a8e;font-size:15px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.st-chev{color:#c4c4c7}
+.st-check{color:#007aff}
+.st-mono{padding:10px 14px;border-bottom:1px solid #e5e5ea;font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;color:#3a3a3c;word-break:break-all}
+.st-mono:last-child{border-bottom:0}
+.st-result{margin:0 14px 10px;padding:8px 10px;border-radius:8px;font-size:12px;line-height:1.45;white-space:pre-line}
+.st-result[data-kind="error"]{background:#ffecec;color:#c41d1d}
 .st-steps{margin:0;padding:10px 14px 12px 30px;font-size:11.5px;line-height:1.6;color:#3a3a3c}
 
-.gi-head{padding:14px 18px 2px}
-.gi-head h2{margin:0;font:700 26px/1.2 -apple-system,system-ui,sans-serif}
-.gi-head p{margin:8px 0 0;color:#6d6d72;font-size:13px;line-height:1.55}
-.gi-text{display:block;width:calc(100% - 28px);min-height:380px;margin:14px 14px 0;padding:14px;border:0;border-radius:14px;background:#fff;color:#000;font:15px/1.6 -apple-system,"SF Pro Text",system-ui,"Noto Sans KR",sans-serif;resize:vertical;outline:none;box-shadow:0 0 0 .5px #0000001a}
+.gi-text{display:block;width:calc(100% - 28px);min-height:240px;margin:0 14px;padding:14px;border:0;border-radius:14px;background:#fff;color:#000;font:15px/1.6 -apple-system,"SF Pro Text",system-ui,"Noto Sans KR",sans-serif;resize:vertical;outline:none;box-shadow:0 0 0 .5px #0000001a}
 .gi-text:focus{box-shadow:0 0 0 2px #007aff66}
 .gi-meta{display:flex;justify-content:space-between;margin:8px 20px 0;color:#8a8a8e;font-size:12px}
 .gi-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 14px 0}
@@ -2533,7 +2781,6 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
         else if (this.view === 'home') html = await this.homeHtml();
         else if (this.view === 'reddit') html = await this.redditHtml();
         else if (this.view === 'pixiv') html = await this.pixivHtml();
-        else if (this.route?.type === 'instruction') html = this.instructionHtml();
         else html = this.settingsHtml();
       } catch (error) {
         html = `<div class="empty">${Utils.escapeHtml(error.message)}</div>`;
@@ -2959,57 +3206,159 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       return `<div class="reddit-shell">${this.rdHeaderHtml()}<div class="rd-detail-head"><button class="rd-iconbtn filled" data-act="rd-back" aria-label="뒤로">${icon('back', 18)}</button>${this.rdLogo(32)}<div class="col"><span><b>r/Fanverse</b> <span class="dot">•</span> <time>${Fmt.ago(post.createdAt)}</time></span><span>${this.esc(name)}</span></div><span class="grow"></span><button class="rd-iconbtn" data-act="rd-noop" aria-label="더보기">${icon('more', 18)}</button></div><h1 class="rd-detail-title">${this.esc(post.title)}</h1><div class="rd-detail-body"><div class="rd-flairs">${this.rdFlair(post.category)}${post.spoiler ? `<span class="rd-spoiler-badge">${icon('warning', 12)}스포일러</span>` : ''}</div>${this.rdBody(post)}<p class="rd-canon-note">RP canon turn ${post.turn} 시점의 반응${post.sourceCanonEventIds?.length ? ` · 관련 Canon event ${post.sourceCanonEventIds.length}개` : ''}</p></div><div class="rd-detail-actions"><div class="rd-actions">${this.rdVote(post.id, post.userVote, post.score)}<button class="rd-pill" data-act="rd-noop">${icon('comment', 18)}${Fmt.compact(Math.max(comments.length, post.estimatedCommentCount || 0))}</button><button class="rd-pill" data-act="rd-share" data-id="${post.id}">${icon('share', 18)}공유</button></div></div><div class="rd-composer" data-act="rd-compose">대화 참여하기</div><div class="rd-csort"><span>정렬 기준:</span><button class="rd-sortbtn" data-act="rd-csort-menu" aria-haspopup="menu">${csortLabels[csort]}${icon('chevronDown', 16)}</button>${menu}</div>${route.focus ? `<div style="padding:0 16px"><button class="rd-morec" style="margin:0" data-act="rd-unfocus">${icon('back', 16)}전체 댓글 보기</button></div>` : ''}<div class="rd-comments">${tree || '<div class="empty" style="padding:24px 0">아직 댓글이 없습니다.</div>'}${!route.focus && post.hasMoreComments ? `<button class="rd-morec" data-act="rd-more" data-id="${post.id}">${icon('plusCircle', 20)}댓글 더 보기${remaining ? ` (약 ${remaining}개)` : ''}</button>` : ''}</div></div>`;
     }
 
-    // ---------- settings ----------
+    // ---------- settings (iOS Settings-style navigation) ----------
+    // Root list → category pages (route { type: 'settings', page }). Setting keys are unchanged; this
+    // is presentation only. Each page shows one concern; provider-specific fields appear only on the
+    // connection page of the selected backend, and low-level details live under Advanced.
 
-    firebaseStatusLine() {
-      const status = this.engine.gemini.firebaseStatus();
-      const time = (at) => new Date(at).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
-      if (status.phase === 'error') return ['bad', `초기화 실패 — AI 생성만 비활성화됩니다\n${status.error}`];
-      if (status.lastTest?.ok) return ['ok', `연결됨 · ${time(status.lastTest.at)} 테스트 · ${status.lastTest.model}`];
-      if (status.lastTest) return ['bad', `연결 실패 (${time(status.lastTest.at)})\n${status.lastTest.message}`];
-      if (status.phase === 'ready') return ['warn', 'Firebase 초기화됨 · 아직 연결 테스트 전'];
-      return ['', '대기 중 · 첫 요청 때 초기화합니다'];
+    stRow({ act = 'st-page', attrs = '', color = '#8e8e93', glyph = '', label, value = '', chevron = true, cls = '' }) {
+      return `<button class="st-row ${cls}" data-act="${act}" ${attrs}>${glyph ? `<span class="st-ico" style="--t:${color}">${glyph}</span>` : ''}<span class="st-row-label">${label}</span>${value ? `<span class="st-row-value">${value}</span>` : ''}${chevron ? icon('chevronRight', 16, 'st-chev') : ''}</button>`;
     }
 
-    appCheckStatusLine(s) {
+    stHeader(title, subtitle = '') {
+      return `<div class="st-title">${this.esc(title)}</div>${subtitle ? `<div class="st-sub">${subtitle}</div>` : ''}`;
+    }
+
+    providerLabel(id) { return PROVIDERS.find((provider) => provider.id === id)?.label || id; }
+
+    // [dotClass, text] for the selected (or given) provider.
+    providerStatus(provider = this.getSettings().provider) {
+      const s = this.getSettings();
+      const time = (at) => new Date(at).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
+      if (provider === 'developer') return s.apiKey ? ['ok', 'API key 설정됨'] : ['bad', '설정 필요 — API key가 없습니다'];
+      if (provider === 'vertex') {
+        const vertex = this.engine.gemini.vertexStatus();
+        if (!s.vertexProjectId) return ['bad', '설정 필요 — Project ID가 없습니다'];
+        if (vertex.authenticated) return ['ok', `연결 가능 · access token 약 ${Math.ceil(vertex.expiresInSeconds / 60)}분 남음`];
+        return ['bad', vertex.hasToken ? 'access token 만료 — Google 재인증 필요' : '로그인 필요 — Google 로그인을 하세요'];
+      }
       const status = this.engine.gemini.firebaseStatus();
-      if (s.appCheckMode === 'off') return ['warn', 'App Check 사용 안 함 — enforcement가 꺼진 프로젝트에서만 동작합니다'];
+      if (status.empty) return ['', '설정 필요 — Firebase Web Config를 입력하세요'];
+      if (!status.configured) return ['bad', `설정 필요 — ${status.missingRequired.join(', ')} 값이 없습니다`];
+      if (status.phase === 'error') return ['bad', `초기화 실패\n${status.error}`];
+      if (status.lastTest?.ok) return ['ok', `Firebase 연결됨\nProject: ${status.projectId} · Model: ${modelLabel(s)} (${time(status.lastTest.at)})`];
+      if (status.lastTest) return ['bad', `연결 실패\n${status.lastTest.message}`];
+      return ['warn', `설정됨 · 연결 테스트 전\nProject: ${status.projectId}`];
+    }
+
+    statusRow([dot, text]) {
+      return `<div class="st-status"><span class="st-dot ${dot}"></span><span>${this.esc(text)}</span></div>`;
+    }
+
+    settingsHtml() {
+      const page = this.route?.type === 'settings' ? this.route.page : null;
+      const pages = {
+        ai: () => this.stAiHtml(),
+        'ai-backend': () => this.stBackendHtml(),
+        'ai-model': () => this.stModelHtml(),
+        'ai-connection': () => this.stConnectionHtml(),
+        generation: () => this.stGenerationHtml(),
+        fanwork: () => this.stFanworkHtml(),
+        data: () => this.stDataHtml(),
+        appearance: () => this.stAppearanceHtml(),
+        advanced: () => this.stAdvancedHtml(),
+      };
+      return (pages[page] || (() => this.stRootHtml()))();
+    }
+
+    stRootHtml() {
+      const s = this.getSettings();
+      const [dot] = this.providerStatus();
+      const row = (page, color, iconName, label, value = '') => this.stRow({ attrs: `data-page="${page}"`, color, glyph: icon(iconName, 17), label, value });
+      return `${this.stHeader('Settings')}<div class="st-card st-list">${row('ai', '#5e5ce6', 'sparkle', 'AI', `<span class="st-dot ${dot}"></span>${this.esc(this.providerLabel(s.provider))}`)}${row('generation', '#ff9500', 'pen', 'Generation', this.esc(s.activity))}${row('fanwork', '#0096fa', 'bookmark', 'Fanwork', this.esc(s.fanworkLanguage))}</div><div class="st-card st-list" style="margin-top:22px">${row('data', '#34c759', 'list', 'Data')}${row('appearance', '#007aff', 'textSize', 'Appearance')}${row('advanced', '#8e8e93', 'gear', 'Advanced')}</div><div class="st-foot">RP Fanverse ${APP_VERSION}</div>`;
+    }
+
+    stAiHtml() {
+      const s = this.getSettings();
+      const proNeedsAppCheck = s.provider === 'firebase' && s.modelPreset === 'gemini-3.1-pro-preview' && s.appCheckMode === 'off';
+      return `${this.stHeader('AI')}<div class="st-section">Backend</div><div class="st-card st-list">${this.stRow({ attrs: 'data-page="ai-backend"', label: 'Backend', value: this.esc(this.providerLabel(s.provider)) })}</div><div class="st-section">Model</div><div class="st-card st-list">${this.stRow({ attrs: 'data-page="ai-model"', label: 'Model', value: this.esc(modelLabel(s)) })}</div><div class="st-section">Connection</div><div class="st-card st-list">${this.statusRow(this.providerStatus())}${this.stRow({ attrs: 'data-page="ai-connection"', label: '연결 설정', value: this.esc(this.providerLabel(s.provider)) })}<button class="st-btn" data-action="test-provider">연결 테스트${icon('chevronRight', 16)}</button></div>${proNeedsAppCheck ? '<div class="st-note warn">Firebase AI에서 Gemini 3.1 Pro는 App Check enforcement가 켜진 프로젝트에서만 호출됩니다 (아니면 HTTP 403). 연결 설정의 App Check를 확인하세요.</div>' : ''}`;
+    }
+
+    stBackendHtml() {
+      const s = this.getSettings();
+      const notes = { developer: '직접 Gemini API key', vertex: 'Google Cloud 프로젝트 · OAuth 로그인', firebase: '내 Firebase Web Config · Firebase AI Logic' };
+      return `${this.stHeader('Backend')}<div class="st-card st-list">${PROVIDERS.map((provider) => `<button class="st-row st-pick" data-act="set-provider" data-provider="${provider.id}"><span class="st-row-label">${provider.label}<small>${notes[provider.id]}</small></span>${s.provider === provider.id ? icon('check', 18, 'st-check') : ''}</button>`).join('')}</div><div class="st-note">Backend를 바꿔도 각 provider의 저장된 설정은 그대로 유지됩니다.</div>`;
+    }
+
+    stModelHtml() {
+      const s = this.getSettings();
+      const options = [...MODEL_PRESETS.map((preset) => ({ id: preset.id, label: preset.label, sub: preset.id })), { id: 'custom', label: 'Custom model ID', sub: s.modelPreset === 'custom' ? resolveModelId(s) : '직접 입력' }];
+      return `${this.stHeader('Model')}<div class="st-card st-list">${options.map((option) => `<button class="st-row st-pick" data-act="set-model" data-model="${option.id}"><span class="st-row-label">${this.esc(option.label)}<small>${this.esc(option.sub)}</small></span>${s.modelPreset === option.id ? icon('check', 18, 'st-check') : ''}</button>`).join('')}</div>${s.modelPreset === 'custom' ? `<div class="st-section">Custom model ID</div><div class="st-card"><label class="st-field"><input data-setting="customModelId" value="${this.esc(s.customModelId)}" placeholder="예: gemini-3.7-flash" autocomplete="off"></label></div>` : ''}<div class="st-note">모든 Backend에 같은 모델 설정이 적용됩니다. 기본값은 Gemini 3.8 Flash입니다.</div>`;
+    }
+
+    stConnectionHtml() {
+      const s = this.getSettings();
+      const body = s.provider === 'vertex' ? this.stVertexHtml(s) : s.provider === 'firebase' ? this.stFirebaseHtml(s) : this.stDeveloperHtml(s);
+      return `${this.stHeader('연결 설정', this.esc(this.providerLabel(s.provider)))}${body}`;
+    }
+
+    stDeveloperHtml(s) {
+      return `<div class="st-card">${this.statusRow(this.providerStatus('developer'))}<label class="st-field"><span>Gemini API key · GM storage에만 저장, export 제외</span><input type="password" data-setting="apiKey" value="${this.esc(s.apiKey)}" autocomplete="off" placeholder="AIza…"></label><button class="st-btn" data-action="test-developer">Gemini API 연결 테스트${icon('chevronRight', 16)}</button></div>`;
+    }
+
+    stVertexHtml(s) {
+      const vertex = this.engine.gemini.vertexStatus();
+      return `<div class="st-card">${this.statusRow(this.providerStatus('vertex'))}<label class="st-field"><span>Google Cloud Project ID</span><input data-setting="vertexProjectId" value="${this.esc(s.vertexProjectId)}" placeholder="my-gcp-project" autocomplete="off"></label><label class="st-field"><span>Location · global 권장</span><input data-setting="vertexLocation" value="${this.esc(s.vertexLocation)}" list="rpf-vertex-locations" placeholder="global"><datalist id="rpf-vertex-locations"><option value="global"><option value="us"><option value="eu"><option value="us-central1"><option value="asia-northeast3"></datalist></label><label class="st-field"><span>OAuth 2.0 Client ID (웹 애플리케이션)</span><input data-setting="vertexOAuthClientId" value="${this.esc(s.vertexOAuthClientId)}" placeholder="…apps.googleusercontent.com" autocomplete="off"></label><button class="st-btn" data-action="vertex-auth">${vertex.hasToken ? 'Google 재인증' : 'Google 로그인'}${icon('chevronRight', 16)}</button><button class="st-btn" data-action="test-vertex">Vertex AI 연결 테스트${icon('chevronRight', 16)}</button><button class="st-btn danger" data-action="vertex-revoke" ${vertex.hasToken ? '' : 'disabled'}>토큰 폐기 (로그아웃)</button></div><details class="st-details" style="margin-top:12px"><summary>설정 방법 ${icon('chevronDown', 16)}</summary><ol class="st-steps"><li>Google Cloud 프로젝트에 결제 계정을 연결하고 Vertex AI API를 사용 설정합니다.</li><li>로그인할 계정에 Vertex AI User 역할을 부여합니다.</li><li>OAuth 동의 화면을 구성하고 “웹 애플리케이션” OAuth 클라이언트를 만든 뒤, 승인된 JavaScript 원본에 <code class="st-code">https://crack.wrtn.ai</code>를 추가합니다.</li><li>Client ID를 위에 입력 → Google 로그인 → 연결 테스트. 토큰은 약 1시간 뒤 만료됩니다.</li></ol></details><div class="st-note">API version · 수동 access token · endpoint는 Advanced에 있습니다.</div>`;
+    }
+
+    stFirebaseHtml(s) {
+      const check = validateFirebaseConfig(s.firebaseConfig);
+      const c = check.config;
+      const mask = (value) => (value ? `${'•'.repeat(8)}${this.esc(value.slice(-4))}` : '없음');
+      const summary = check.empty ? '<div class="st-kv"><span>Firebase Web Config</span><span>미설정</span></div>' : `<div class="st-kv"><span>Project</span><span>${this.esc(c.projectId || '없음')}</span></div><div class="st-kv"><span>App ID</span><span>${c.appId ? '설정됨' : '없음'}</span></div><div class="st-kv"><span>API Key</span><span>${mask(c.apiKey)}</span></div>`;
+      const fieldLabels = { apiKey: 'API Key', authDomain: 'Auth Domain', projectId: 'Project ID', storageBucket: 'Storage Bucket', messagingSenderId: 'Messaging Sender ID', appId: 'App ID' };
+      const [acDot, acText] = this.appCheckStatus(s);
+      return `<div class="st-card">${this.statusRow(this.providerStatus('firebase'))}${summary}<button class="st-btn" data-action="test-firebase" ${check.ok ? '' : 'disabled'}>연결 테스트${icon('chevronRight', 16)}</button></div>${check.ok && check.missingRecommended.length ? `<div class="st-note">권장 항목 미입력: ${check.missingRecommended.map((key) => fieldLabels[key]).join(', ')} (AI 호출에는 필수 아님)</div>` : ''}
+<div class="st-section">Firebase Web Config JSON</div><div class="st-card"><label class="st-field"><span>Firebase 콘솔 → 프로젝트 설정 → 내 앱(웹)의 config를 붙여넣으세요. JSON 또는 <code class="st-code">const firebaseConfig = {…}</code> 형식 모두 가능합니다.</span><textarea data-firebase-json spellcheck="false" placeholder='{\n  "apiKey": "…",\n  "authDomain": "…",\n  "projectId": "…",\n  "storageBucket": "…",\n  "messagingSenderId": "…",\n  "appId": "…"\n}'></textarea></label><div class="st-result" data-firebase-result hidden></div><button class="st-btn" data-action="firebase-apply-json">적용${icon('chevronRight', 16)}</button></div>
+<details class="st-details" style="margin-top:12px"><summary>개별 필드 편집 ${icon('chevronDown', 16)}</summary>${FIREBASE_CONFIG_FIELDS.map((key) => `<label class="st-field"><span>${fieldLabels[key]}${FIREBASE_REQUIRED_FIELDS.includes(key) ? ' · 필수' : ''}</span><input ${key === 'apiKey' ? 'type="password"' : ''} data-firebase-field="${key}" value="${this.esc(c[key])}" autocomplete="off" spellcheck="false"></label>`).join('')}</details>
+<details class="st-details" style="margin-top:12px"><summary>App Check (선택) ${icon('chevronDown', 16)}</summary><label class="st-field"><span>Provider</span><select data-setting="appCheckMode"><option value="off" ${s.appCheckMode === 'off' ? 'selected' : ''}>사용 안 함</option><option value="recaptcha-enterprise" ${s.appCheckMode === 'recaptcha-enterprise' ? 'selected' : ''}>reCAPTCHA Enterprise (권장)</option><option value="debug" ${s.appCheckMode === 'debug' ? 'selected' : ''}>디버그 토큰 (개인 기기 전용)</option></select></label>${s.appCheckMode === 'recaptcha-enterprise' ? `<label class="st-field"><span>reCAPTCHA Enterprise site key</span><input data-setting="appCheckSiteKey" value="${this.esc(s.appCheckSiteKey)}" placeholder="6L…" autocomplete="off"></label>` : ''}${s.appCheckMode === 'debug' ? `<label class="st-field"><span>디버그 토큰 · GM storage에만 저장 · 공유 금지</span><input type="password" data-setting="appCheckDebugToken" value="${this.esc(s.appCheckDebugToken)}" autocomplete="off"></label>` : ''}${this.statusRow([acDot, acText])}<div class="st-note" style="padding:8px 14px 12px">Firebase AI Logic은 2026-11-02부터 App Check enforcement가 필수이며, 일부 모델(Gemini 3.1 Pro 등)은 지금도 필요합니다. reCAPTCHA Enterprise 키의 허용 도메인에 <code class="st-code">crack.wrtn.ai</code>를 추가하고 Firebase 콘솔 App Check에 등록한 뒤 enforcement를 켜세요.</div></details>
+<div class="st-card" style="margin-top:22px"><button class="st-btn danger" data-action="firebase-clear" ${check.empty ? 'disabled' : ''}>Firebase 설정 지우기</button></div>`;
+    }
+
+    appCheckStatus(s) {
+      const status = this.engine.gemini.firebaseStatus();
+      if (s.appCheckMode === 'off') return ['', 'App Check 사용 안 함'];
       if (status.appCheck === 'ok') return ['ok', `App Check 토큰 정상 · ${new Date(status.appCheckAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })}`];
       if (status.appCheck === 'error') return ['bad', `App Check 실패\n${status.appCheckError}`];
       return ['', '설정됨 · 첫 AI 요청 때 토큰을 발급합니다'];
     }
 
-    developerFieldsHtml(s) {
-      return `<label class="st-field"><span>Gemini Developer API key (직접 호출용 · GM storage에만 저장, export 제외)</span><input type="password" data-setting="apiKey" value="${this.esc(s.apiKey)}" autocomplete="off" placeholder="AIza…"></label><button class="st-btn" data-action="test-developer">Gemini API 연결 테스트${icon('chevronRight', 18)}</button>`;
+    stGenerationHtml() {
+      const s = this.getSettings();
+      const text = this.instructionDraft ? this.instructionDraft.text : s.globalGeminiInstruction;
+      return `${this.stHeader('Generation')}<div class="st-section">Gemini 공통 지침</div><textarea class="gi-text" data-instruction-text spellcheck="false" placeholder="예: 일본 팬덤 말투를 자연스럽게 / 캐릭터 OOC 금지 / CP를 승패처럼 다루지 않기 / Reddit은 의견이 갈리게 …">${this.esc(text)}</textarea><div class="gi-meta"><span data-instruction-count>${Fmt.int(text.trim().length)}자</span><span data-instruction-state>${this.instructionDraft?.dirty ? '저장되지 않음' : '저장됨'}</span></div><div class="gi-actions"><button class="primary" data-action="save-instruction">저장</button><button data-action="reset-instruction">기본값 복원</button></div><details class="st-details" style="margin-top:12px"><summary>어떻게 적용되나요 ${icon('chevronDown', 16)}</summary><div class="st-note" style="padding:10px 14px 12px">내부 작업 지시(출력 형식, Canon 규칙)는 그대로 두고, 이 지침을 systemInstruction으로 함께 보냅니다. 적용: Canon 추출 · 팬덤 갱신 · Reddit 글/댓글 · Pixiv metadata · 팬픽 전문 · 장편 개요/섹션 · 연속성 수정. 제외: Continuity 검사(기계적 검증). 비워 두면 지침 없이 호출합니다.</div></details>
+<div class="st-section">Fandom</div><div class="st-card"><label class="st-field"><span>Fandom activity</span><select data-setting="activity">${['Quiet', 'Normal', 'Active', 'Chaos'].map((value) => `<option ${s.activity === value ? 'selected' : ''}>${value}</option>`).join('')}</select></label><label class="st-field"><span>Turns per update</span><input type="number" min="1" max="100" data-setting="turnsPerUpdate" value="${s.turnsPerUpdate}"></label><label class="st-inline"><span>Automatic update</span><input type="checkbox" data-setting="autoUpdate" ${s.autoUpdate ? 'checked' : ''}></label><button class="st-btn" data-action="update-now">처리 대기 turns 지금 갱신${icon('chevronRight', 16)}</button></div>`;
     }
 
-    settingsHtml() {
+    stFanworkHtml() {
+      const s = this.getSettings();
+      const reader = s.pixivReader;
+      const select = (key, options) => `<select data-reader-setting="${key}">${options.map(([value, label]) => `<option value="${value}" ${reader[key] === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`;
+      return `${this.stHeader('Fanwork')}<div class="st-section">생성</div><div class="st-card"><label class="st-field"><span>Language</span><input data-setting="fanworkLanguage" value="${this.esc(s.fanworkLanguage)}"></label><label class="st-field"><span>Target length (characters) · 8,000 초과 시 개요 → 3섹션 → continuity check</span><input type="number" min="500" max="30000" data-setting="fanworkTargetLength" value="${s.fanworkTargetLength}"></label><label class="st-inline"><span>Streaming</span><input type="checkbox" data-setting="streaming" ${s.streaming ? 'checked' : ''}></label></div><div class="st-section">Reader</div><div class="st-card"><label class="st-field"><span>글자 크기</span>${select('size', [['s', '작게'], ['m', '보통'], ['l', '크게']])}</label><label class="st-field"><span>글꼴</span>${select('font', [['gothic', '고딕'], ['mincho', '명조']])}</label><label class="st-field"><span>배경</span>${select('theme', [['light', '화이트'], ['sepia', '세피아'], ['dark', '다크']])}</label></div>`;
+    }
+
+    stDataHtml() {
+      return `${this.stHeader('Data')}<div class="st-section">현재 RP</div><div class="st-card st-list"><button class="st-btn" data-action="sync-now">지금 API 동기화${icon('chevronRight', 16)}</button><button class="st-btn" data-action="import-history">기존 로그를 원작으로 가져오기${icon('chevronRight', 16)}</button><button class="st-btn" data-action="export-world">현재 world 내보내기${icon('chevronRight', 16)}</button></div><div class="st-section danger">Danger Zone</div><div class="st-card st-list"><button class="st-btn" data-action="rebuild-canon">Canon rebuild (팬덤 보존)${icon('chevronRight', 16)}</button><button class="st-btn" data-action="export-all">모든 worlds 내보내기${icon('chevronRight', 16)}</button><button class="st-btn" data-action="import-data">데이터 가져오기 (JSON)${icon('chevronRight', 16)}</button><input type="file" accept="application/json" data-import-file hidden><button class="st-btn danger" data-action="reset-world">현재 Fanverse 전체 초기화</button></div><div class="st-note">Canon rebuild는 Canon을 다시 분석하므로 AI 사용량이 발생합니다. 전체 초기화는 현재 world의 Canon·팬덤·Pixiv·Reddit 데이터를 지우며 되돌릴 수 없습니다.</div>`;
+    }
+
+    stAppearanceHtml() {
+      const s = this.getSettings();
+      return `${this.stHeader('Appearance')}<div class="st-card"><label class="st-field"><span>UI scale (0.75–1.25)</span><input type="number" min="0.75" max="1.25" step="0.05" data-setting="uiScale" value="${s.uiScale}"></label></div>`;
+    }
+
+    stAdvancedHtml() {
       const s = this.getSettings();
       const world = this.engine.world;
-      const firebase = s.provider !== 'developer';
-      const presets = [...MODEL_PRESETS.map((preset) => `<option value="${preset.id}" ${s.modelPreset === preset.id ? 'selected' : ''}>${preset.label}</option>`), `<option value="custom" ${s.modelPreset === 'custom' ? 'selected' : ''}>Custom model ID…</option>`].join('');
-      const config = resolveFirebaseConfig(s);
-      const [dot, statusText] = firebase ? this.firebaseStatusLine() : [s.apiKey ? 'ok' : 'bad', s.apiKey ? 'Gemini Developer API key 설정됨' : 'Gemini Developer API key 없음 — 고급 설정에서 입력'];
-      const [acDot, acText] = this.appCheckStatusLine(s);
-      const instructionLength = s.globalGeminiInstruction.trim().length;
-      const proNeedsAppCheck = firebase && s.modelPreset === 'gemini-3.1-pro-preview' && s.appCheckMode === 'off';
-      return `<div class="st-title">Settings</div>
-<div class="st-section">AI Backend</div><div class="st-card"><div class="st-kv"><span>AI Backend</span><span>${firebase ? 'Firebase AI Logic' : 'Gemini Developer API (직접)'}</span></div>${firebase ? `<div class="st-kv"><span>Project</span><span>${this.esc(config.projectId)}${s.firebaseConfigOverride ? ' (사용자 config)' : ''}</span></div><div class="st-kv"><span>Backend</span><span>Agent Platform · ${this.esc(s.firebaseLocation)}</span></div>` : ''}<label class="st-field"><span>Model</span><select data-setting="modelPreset">${presets}</select></label>${s.modelPreset === 'custom' ? `<label class="st-field"><span>Custom model ID</span><input data-setting="customModelId" value="${this.esc(s.customModelId)}" placeholder="예: gemini-3.7-flash" autocomplete="off"></label>` : ''}<div class="st-status"><span class="st-dot ${dot}"></span>${this.esc(statusText)}</div><button class="st-btn" data-action="${firebase ? 'test-firebase' : 'test-developer'}">연결 테스트 · ${this.esc(resolveModelId(s))}${icon('chevronRight', 18)}</button></div>${proNeedsAppCheck ? '<div class="st-note warn">Gemini 3.1 Pro는 Firebase App Check enforcement가 켜진 프로젝트에서만 호출됩니다 (아니면 HTTP 403). 아래 App Check를 설정하세요.</div>' : ''}
-${firebase ? `<div class="st-section">App Check</div><div class="st-card"><label class="st-field"><span>App Check provider</span><select data-setting="appCheckMode"><option value="off" ${s.appCheckMode === 'off' ? 'selected' : ''}>사용 안 함</option><option value="recaptcha-enterprise" ${s.appCheckMode === 'recaptcha-enterprise' ? 'selected' : ''}>reCAPTCHA Enterprise (권장)</option><option value="debug" ${s.appCheckMode === 'debug' ? 'selected' : ''}>디버그 토큰 (개인 기기 전용)</option></select></label>${s.appCheckMode === 'recaptcha-enterprise' ? `<label class="st-field"><span>reCAPTCHA Enterprise site key</span><input data-setting="appCheckSiteKey" value="${this.esc(s.appCheckSiteKey)}" placeholder="6L…" autocomplete="off"></label>` : ''}${s.appCheckMode === 'debug' ? `<label class="st-field"><span>App Check 디버그 토큰 · GM storage에만 저장, export 제외 · 공유 금지</span><input type="password" data-setting="appCheckDebugToken" value="${this.esc(s.appCheckDebugToken)}" placeholder="xxxxxxxx-xxxx-…" autocomplete="off"></label>` : ''}<div class="st-status"><span class="st-dot ${acDot}"></span>${this.esc(acText)}</div></div><div class="st-note">Firebase AI Logic은 2026-11-02부터 App Check enforcement가 필수입니다. 현재도 일부 모델(Gemini 3.1 Pro 등)은 enforcement가 켜져 있어야 호출됩니다.</div><details class="st-details" style="margin-top:8px"><summary>App Check 설정 방법 ${icon('chevronDown', 18)}</summary><ol class="st-steps"><li>Google Cloud 콘솔 → reCAPTCHA Enterprise에서 웹 키를 만들고 허용 도메인에 <code class="st-code">crack.wrtn.ai</code>를 추가합니다.</li><li>Firebase 콘솔 → App Check → 웹 앱에 reCAPTCHA Enterprise provider로 그 site key를 등록합니다.</li><li>위에서 “reCAPTCHA Enterprise”를 고르고 site key를 입력한 뒤 연결 테스트로 토큰 발급을 확인합니다.</li><li>Firebase 콘솔 → App Check → APIs → Firebase AI Logic에서 enforcement를 켭니다.</li><li>개인 기기에서만 쓸 때는 Firebase 콘솔에서 디버그 토큰을 만들어 “디버그 토큰” 모드에 입력할 수도 있습니다. 디버그 토큰은 App Check를 우회하는 비밀값이므로 다른 사람과 공유하지 마세요.</li></ol></details>` : ''}
-<div class="st-section">Gemini 공통 지침</div><div class="st-card"><button class="st-btn" data-act="open-instruction">Gemini 공통 지침 편집<span class="st-badge ${instructionLength ? 'on' : ''}">${instructionLength ? `${Fmt.int(instructionLength)}자` : '비어 있음'}</span></button></div>
-<div class="st-section">Update</div><div class="st-card"><label class="st-field"><span>Turns per update</span><input type="number" min="1" max="100" data-setting="turnsPerUpdate" value="${s.turnsPerUpdate}"></label><label class="st-field"><span>Fandom activity</span><select data-setting="activity">${['Quiet', 'Normal', 'Active', 'Chaos'].map((value) => `<option ${s.activity === value ? 'selected' : ''}>${value}</option>`).join('')}</select></label><label class="st-inline"><span>Automatic fandom updates</span><input type="checkbox" data-setting="autoUpdate" ${s.autoUpdate ? 'checked' : ''}></label><button class="st-btn" data-action="update-now">처리 대기 turns 지금 갱신${icon('chevronRight', 18)}</button></div>
-<div class="st-section">Fanwork</div><div class="st-card"><label class="st-field"><span>Language</span><input data-setting="fanworkLanguage" value="${this.esc(s.fanworkLanguage)}"></label><label class="st-field"><span>Target length (characters) · 8,000 초과 시 개요 → 3섹션 → continuity check</span><input type="number" min="500" max="30000" data-setting="fanworkTargetLength" value="${s.fanworkTargetLength}"></label><label class="st-inline"><span>Streaming</span><input type="checkbox" data-setting="streaming" ${s.streaming ? 'checked' : ''}></label><label class="st-field"><span>UI scale</span><input type="number" min="0.75" max="1.25" step="0.05" data-setting="uiScale" value="${s.uiScale}"></label></div>
-<div class="st-section">World data</div><div class="st-card"><button class="st-btn" data-action="sync-now">지금 API 동기화${icon('chevronRight', 18)}</button><button class="st-btn" data-action="import-history">현재 RP를 원작으로 가져오기${icon('chevronRight', 18)}</button><button class="st-btn" data-action="rebuild-canon">Canon rebuild (팬덤 보존)${icon('chevronRight', 18)}</button><button class="st-btn" data-action="export-world">현재 world 내보내기${icon('chevronRight', 18)}</button><button class="st-btn" data-action="export-all">모든 worlds 내보내기${icon('chevronRight', 18)}</button><button class="st-btn" data-action="import-data">데이터 가져오기${icon('chevronRight', 18)}</button><input type="file" accept="application/json" data-import-file hidden><button class="st-btn danger" data-action="reset-world">현재 Fanverse 전체 초기화</button></div>
-<div class="st-section">고급 설정</div><details class="st-details"><summary>AI provider · Firebase config ${icon('chevronDown', 18)}</summary><label class="st-field"><span>AI provider</span><select data-setting="provider"><option value="firebase" ${firebase ? 'selected' : ''}>Firebase AI Logic (기본)</option><option value="developer" ${!firebase ? 'selected' : ''}>Gemini Developer API (직접 API key)</option></select></label>${this.developerFieldsHtml(s)}<label class="st-field"><span>Firebase AI Logic location (Agent Platform)</span><input data-setting="firebaseLocation" value="${this.esc(s.firebaseLocation)}" placeholder="global"></label><label class="st-field"><span>Firebase Web App config (JSON) · 비워 두거나 기본값이면 내장 config 사용</span><textarea data-firebase-config spellcheck="false">${this.esc(JSON.stringify(config, null, 2))}</textarea></label><button class="st-btn" data-action="firebase-config-save">Firebase config 저장${icon('chevronRight', 18)}</button><button class="st-btn" data-action="firebase-config-reset" ${s.firebaseConfigOverride ? '' : 'disabled'}>내장 config로 되돌리기</button></details>
-<div class="st-note">${world ? `world: ${this.esc(world.id)}<br>schema ${DB_VERSION} · app ${APP_VERSION} · sync ${this.esc(world.sync.status)}${world.sync.error ? ` · ${this.esc(world.sync.error)}` : ''}` : `world 미연결 · app ${APP_VERSION}`}${this.startupIssues?.length ? `<br>startup: ${this.startupIssues.map((issue) => this.esc(issue)).join(' / ')}` : ''}</div>`;
-    }
-
-    // ---------- Gemini 공통 지침 ----------
-
-    instructionHtml() {
-      const saved = this.getSettings().globalGeminiInstruction;
-      const text = this.instructionDraft ? this.instructionDraft.text : saved;
-      return `<div class="gi-head"><h2>Gemini 공통 지침</h2><p>Fanverse가 Gemini에 요청할 때마다 함께 전달되는 취향·문체 지침입니다. 내부 작업 지시(출력 형식, Canon 규칙)는 그대로 유지되고, 이 지침은 systemInstruction으로 그 위에 더해집니다. 비워 두면 지침 없이 호출합니다.</p></div><textarea class="gi-text" data-instruction-text spellcheck="false" placeholder="예: 일본 팬덤 말투를 자연스럽게 / 캐릭터 OOC 금지 / CP를 승패처럼 다루지 않기 / Reddit은 의견이 갈리게 …">${this.esc(text)}</textarea><div class="gi-meta"><span data-instruction-count>${Fmt.int(text.trim().length)}자</span><span data-instruction-state>${this.instructionDraft?.dirty ? '저장되지 않음' : '저장됨'}</span></div><div class="gi-actions"><button class="primary" data-action="save-instruction">저장</button><button data-action="reset-instruction">기본값 복원</button></div><div class="st-note">적용: Canon 추출 · 팬덤 갱신 · Reddit 글/댓글 · Pixiv metadata · 팬픽 전문 · 장편 개요/섹션 · 연속성 수정. 제외: Continuity 검사(기계적 검증이라 정확도를 위해 지침 없이 호출).</div>`;
+      const vertex = this.engine.gemini.vertexStatus();
+      const firebase = this.engine.gemini.firebaseStatus();
+      const devEndpoint = `${GEMINI_BASE}/${resolveModelId(s)}:generateContent`;
+      const vertexEndpoint = s.vertexProjectId ? buildVertexEndpoint(s, false) : '(Project ID 미설정)';
+      const firebaseEndpoint = firebase.projectId ? `https://firebasevertexai.googleapis.com/v1beta/projects/${firebase.projectId}/locations/${s.firebaseLocation}/publishers/google/models/${resolveModelId(s)}:generateContent` : '(Firebase config 미설정)';
+      const kv = (key, value) => `<div class="st-kv"><span>${key}</span><span>${value}</span></div>`;
+      return `${this.stHeader('Advanced')}<div class="st-section">Vertex AI</div><div class="st-card"><label class="st-field"><span>API version</span><select data-setting="vertexApiVersion"><option value="v1" ${s.vertexApiVersion === 'v1' ? 'selected' : ''}>v1 (권장)</option><option value="v1beta1" ${s.vertexApiVersion === 'v1beta1' ? 'selected' : ''}>v1beta1</option></select></label><label class="st-field"><span>수동 access token · <code class="st-code">gcloud auth print-access-token</code> 결과, 약 1시간 유효</span><input type="password" data-vertex-manual-token autocomplete="off" placeholder="ya29.…"></label><button class="st-btn" data-action="vertex-manual-token">토큰 확인 후 적용${icon('chevronRight', 16)}</button>${kv('Token', vertex.hasToken ? `${vertex.source === 'manual' ? '수동' : 'OAuth'} · ${vertex.authenticated ? `${Math.ceil(vertex.expiresInSeconds / 60)}분 남음` : '만료'}` : '없음')}</div>
+<div class="st-section">Firebase AI</div><div class="st-card"><label class="st-field"><span>Location (Agent Platform)</span><input data-setting="firebaseLocation" value="${this.esc(s.firebaseLocation)}" placeholder="global"></label>${kv('SDK 상태', this.esc({ idle: '미초기화 (사용 시 초기화)', ready: '초기화됨', error: '오류' }[firebase.phase] || firebase.phase))}</div>
+<div class="st-section">Endpoint</div><div class="st-card"><div class="st-mono">Developer · ${this.esc(devEndpoint)}</div><div class="st-mono">Vertex · ${this.esc(vertexEndpoint)}</div><div class="st-mono">Firebase · ${this.esc(firebaseEndpoint)}</div></div>
+<div class="st-section">진단</div><div class="st-card">${kv('App', APP_VERSION)}${kv('DB schema', DB_VERSION)}${kv('World', world ? this.esc(world.id) : '미연결')}${world ? kv('Sync', `${this.esc(world.sync.adapter)} · ${this.esc(world.sync.status)}`) : ''}${world?.sync.error ? `<div class="st-status"><span class="st-dot bad"></span><span>${this.esc(world.sync.error)}</span></div>` : ''}${(this.startupIssues || []).map((issue) => `<div class="st-status"><span class="st-dot bad"></span><span>${this.esc(issue)}</span></div>`).join('')}${kv('이전 Prompt override', '보존됨 · 사용 안 함')}</div>`;
     }
 
     // ---------- events ----------
@@ -3039,7 +3388,25 @@ ${firebase ? `<div class="st-section">App Check</div><div class="st-card"><label
           case 'sf-clear': return this.replace({ ...route, q: '' });
           case 'sf-pixiv': return this.push({ type: 'pixiv-work', id }, 'pixiv');
           case 'sf-reddit': return this.push({ type: 'reddit-post', id }, 'reddit');
-          case 'open-instruction': this.instructionDraft = null; return this.push({ type: 'instruction' }, 'settings');
+          case 'open-instruction': this.instructionDraft = null; return this.push({ type: 'settings', page: 'generation' }, 'settings');
+          // settings navigation
+          case 'st-page': return this.push({ type: 'settings', page: target.dataset.page }, 'settings');
+          case 'set-provider': {
+            const settings = this.getSettings();
+            settings.provider = target.dataset.provider;
+            await this.saveSettings(settings);
+            this.engine.warnedProviderUnready = false;
+            this.notify('success', `Backend: ${this.providerLabel(settings.provider)}`);
+            return this.back();
+          }
+          case 'set-model': {
+            const settings = this.getSettings();
+            settings.modelPreset = target.dataset.model;
+            await this.saveSettings(settings);
+            if (settings.modelPreset === 'custom') return this.render({ keepScroll: true });
+            this.notify('success', `Model: ${modelLabel(this.getSettings())}`);
+            return this.back();
+          }
           // pixiv
           case 'px-home': return this.go('pixiv');
           case 'px-search-toggle': return this.replace({ ...route, searchOpen: !route.searchOpen }, { keepScroll: true });
@@ -3138,7 +3505,7 @@ ${firebase ? `<div class="st-section">App Check</div><div class="st-card"><label
     }
 
     async testProvider(provider, button) {
-      const label = provider === 'developer' ? 'Gemini Developer API' : 'Firebase AI Logic';
+      const label = this.providerLabel(provider);
       this.notify('sync', `${label} 연결 테스트 중… (${resolveModelId(this.getSettings())})`);
       try {
         const reply = await this.withButton(button, '테스트 중…', () => this.engine.gemini.testConnection(provider));
@@ -3174,28 +3541,56 @@ ${firebase ? `<div class="st-section">App Check</div><div class="st-card"><label
           await this.render({ keepScroll: true });
           return;
         }
+        if (action === 'test-provider') { await this.testProvider(this.getSettings().provider, target); return; }
         if (action === 'test-firebase') { await this.testProvider('firebase', target); return; }
         if (action === 'test-developer') { await this.testProvider('developer', target); return; }
-        if (action === 'firebase-config-save') {
-          const raw = this.root.querySelector('[data-firebase-config]').value.trim();
-          let parsed = null;
-          if (raw) {
-            try { parsed = JSON.parse(raw.replace(/^[^{]*?(\{)/s, '$1').replace(/;\s*$/, '')); } catch (error) { throw new Error(`Firebase config JSON을 읽지 못했습니다: ${error.message}`); }
+        if (action === 'test-vertex') { await this.testProvider('vertex', target); return; }
+        if (action === 'vertex-auth') {
+          this.notify('sync', 'Google 로그인 창을 여는 중…');
+          await this.engine.gemini.authorizeVertex();
+          this.engine.warnedProviderUnready = false;
+          this.notify('success', 'Vertex AI access token을 받았습니다.'); await this.render({ keepScroll: true });
+          this.engine.maybeUpdate().catch((error) => this.notify('error', error.message));
+          return;
+        }
+        if (action === 'vertex-manual-token') {
+          const input = this.root.querySelector('[data-vertex-manual-token]');
+          await this.withButton(target, '확인 중…', () => this.engine.gemini.useManualVertexToken(input?.value));
+          if (input) input.value = '';
+          this.notify('success', '수동 access token을 확인하고 적용했습니다.'); await this.render({ keepScroll: true });
+          return;
+        }
+        if (action === 'vertex-revoke') {
+          await this.engine.gemini.revokeVertex();
+          this.notify('success', 'Vertex access token을 폐기했습니다.'); await this.render({ keepScroll: true });
+          return;
+        }
+        if (action === 'firebase-apply-json') {
+          const box = this.root.querySelector('[data-firebase-result]');
+          const show = (kind, text) => { if (box) { box.hidden = false; box.dataset.kind = kind; box.textContent = text; } };
+          let config;
+          // The pasted text is never logged; messages only name fields.
+          try { config = parseFirebaseConfigInput(this.root.querySelector('[data-firebase-json]').value); } catch (error) { show('error', error.message); this.notify('error', error.message); return; }
+          const check = validateFirebaseConfig(config);
+          if (!check.ok) {
+            const message = `저장하지 않았습니다. 필수 값이 없습니다: ${check.missingRequired.join(', ')}`;
+            show('error', message); this.notify('error', message); return;
           }
-          const config = parsed ? normalizeFirebaseConfig(parsed) : null;
-          if (parsed && !config) throw new Error('Firebase config에는 apiKey, projectId, appId가 필요합니다.');
           const settings = this.getSettings();
-          settings.firebaseConfigOverride = config && JSON.stringify(config) !== JSON.stringify(normalizeFirebaseConfig(DEFAULT_FIREBASE_CONFIG)) ? config : null;
+          settings.firebaseConfig = check.config;
           await this.saveSettings(settings);
-          this.notify('success', settings.firebaseConfigOverride ? '사용자 Firebase config를 저장했습니다. 다음 요청부터 사용합니다.' : '내장 Firebase config를 사용합니다.');
+          this.engine.gemini.firebase.state.lastTest = null;
+          this.notify('success', `Firebase config를 저장했습니다 · Project: ${check.config.projectId}${check.missingRecommended.length ? `\n권장 항목 미입력: ${check.missingRecommended.join(', ')}` : ''}`);
           await this.render({ keepScroll: true });
           return;
         }
-        if (action === 'firebase-config-reset') {
+        if (action === 'firebase-clear') {
+          if (!confirm('저장된 Firebase Web Config를 지울까요? (Fanverse 데이터에는 영향 없음)')) return;
           const settings = this.getSettings();
-          settings.firebaseConfigOverride = null;
+          settings.firebaseConfig = { ...EMPTY_FIREBASE_CONFIG };
           await this.saveSettings(settings);
-          this.notify('success', '내장 Firebase config로 되돌렸습니다.');
+          this.engine.gemini.firebase.state.lastTest = null;
+          this.notify('success', 'Firebase 설정을 지웠습니다.');
           await this.render({ keepScroll: true });
           return;
         }
@@ -3261,15 +3656,34 @@ ${firebase ? `<div class="st-section">App Check</div><div class="st-card"><label
     async handleChange(event) {
       const input = event.target;
       try {
+        if (input.dataset.readerSetting) {
+          const settings = this.getSettings();
+          settings.pixivReader = { ...settings.pixivReader, [input.dataset.readerSetting]: input.value };
+          await this.saveSettings(settings);
+          this.notify('success', '설정을 저장했습니다.');
+          return;
+        }
+        if (input.dataset.firebaseField) {
+          const settings = this.getSettings();
+          settings.firebaseConfig = { ...settings.firebaseConfig, [input.dataset.firebaseField]: input.value };
+          await this.saveSettings(settings);
+          this.engine.gemini.firebase.state.lastTest = null;
+          const check = validateFirebaseConfig(this.getSettings().firebaseConfig);
+          if (check.ok || check.empty) this.notify('success', '저장했습니다.');
+          else this.notify('error', `저장했습니다. 필수 값이 없습니다: ${check.missingRequired.join(', ')}`);
+          await this.render({ keepScroll: true });
+          return;
+        }
         if (input.dataset.setting) {
           const settings = this.getSettings();
           let value = input.type === 'checkbox' ? input.checked : input.value;
           if (input.type === 'number') value = Number(value);
           settings[input.dataset.setting] = value;
+          if (input.dataset.setting === 'vertexOAuthClientId') await this.engine.gemini.clearVertexToken();
           await this.saveSettings(settings);
           if (input.dataset.setting === 'uiScale') this.host.style.setProperty('--ui-scale', String(this.getSettings().uiScale));
           this.notify('success', '설정을 저장했습니다.');
-          if (['provider', 'modelPreset', 'customModelId', 'apiKey', 'appCheckMode', 'appCheckSiteKey', 'appCheckDebugToken', 'firebaseLocation'].includes(input.dataset.setting)) await this.render({ keepScroll: true });
+          if (['customModelId', 'apiKey', 'appCheckMode', 'appCheckSiteKey', 'appCheckDebugToken', 'firebaseLocation', 'vertexProjectId', 'vertexLocation', 'vertexApiVersion', 'vertexOAuthClientId'].includes(input.dataset.setting)) await this.render({ keepScroll: true });
           return;
         }
         if (input.matches('[data-import-file]') && input.files?.[0]) {
@@ -3302,7 +3716,7 @@ ${firebase ? `<div class="st-section">App Check</div><div class="st-card"><label
     // Startup is ordered so the launcher appears before anything optional runs, and every step is
     // isolated: a failing step is logged and surfaced in the UI, never allowed to abort the rest.
     // Required: settings (falls back to defaults) → IndexedDB → launcher. Optional after the launcher:
-    // Firebase AI Logic init, world attach + sync.
+    // Vertex token restore, world attach + sync.
     async step(name, task) {
       try {
         return await task();
@@ -3318,10 +3732,8 @@ ${firebase ? `<div class="st-section">App Check</div><div class="st-card"><label
       this.ui.startupIssues = this.startupIssues;
       if (!GMStore.available()) this.startupIssues.push('GM storage: Tampermonkey GM_* 권한을 사용할 수 없어 설정이 이 페이지에서만 유지됩니다 (userscript header 확인)');
       await this.step('settings', async () => {
+        // Legacy per-prompt overrides (LEGACY_PROMPTS_KEY) are left untouched and not read.
         await this.persistSettings(await GMStore.get(SETTINGS_KEY, {}));
-        // The direct-Vertex OAuth access token is obsolete; drop it. Legacy per-prompt overrides
-        // (LEGACY_PROMPTS_KEY) are left untouched but no longer read: internal prompts are code now.
-        await GMStore.remove(LEGACY_VERTEX_TOKEN_KEY);
       });
       await this.step('database', () => withTimeout(this.db.open(), 10000, 'IndexedDB를 열지 못했습니다 (10초 초과)'));
       try {
@@ -3331,11 +3743,9 @@ ${firebase ? `<div class="st-section">App Check</div><div class="st-card"><label
         return; // nothing below is reachable for the user without the launcher
       }
       if (this.startupIssues.length) this.ui.notify('error', `Fanverse 일부 초기화 실패 — Settings에서 확인하세요.\n${this.startupIssues.join('\n')}`);
-      if (this.settings.provider === 'firebase') {
-        // Evaluates the bundled SDK and initialises Firebase/App Check/AI. A failure only disables AI
-        // generation; the state is shown in Settings and retried on the next AI request.
-        await this.step('firebase', () => this.gemini.firebase.ensure());
-      }
+      await this.step('vertex token', () => this.gemini.vertex.restore());
+      // Firebase AI is not initialised here: FirebaseAIClient validates the saved config and loads the
+      // bundled SDK only when the Firebase backend is actually used (a request or 연결 테스트).
       await this.step('world', () => this.routeChanged());
       setInterval(() => { this.routeChanged().catch((error) => console.warn('[RP Fanverse] route check failed', error)); }, 2000);
       setInterval(() => { if (this.engine.worldInfo && !document.hidden && !this.engine.syncing) this.engine.sync().catch((error) => this.ui.notify('error', error.message)); }, Math.max(15, this.settings.pollSeconds) * 1000);
