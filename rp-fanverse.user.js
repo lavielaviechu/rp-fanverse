@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RP Fanverse
 // @namespace    https://crack.wrtn.ai/
-// @version      0.12.6
+// @version      0.12.7
 // @description  Treats a Crack RP episode as canon and grows a persistent virtual Pixiv/Reddit fandom around it.
 // @author       Personal userscript
 // @match        https://crack.wrtn.ai/stories/*/episodes/*
@@ -25,7 +25,7 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '0.12.6';
+  const APP_VERSION = '0.12.7';
   const DB_NAME = 'rp-fanverse';
   const DB_VERSION = 1;
   const SETTINGS_KEY = 'rp-fanverse:settings:v1';
@@ -33,7 +33,7 @@
   // the internal prompts are code, and the only user-editable text is globalGeminiInstruction.
   const LEGACY_PROMPTS_KEY = 'rp-fanverse:prompt-overrides:v1';
   const VERTEX_TOKEN_KEY = 'rp-fanverse:vertex-token:v1';
-  const SETTINGS_VERSION = 4;
+  const SETTINGS_VERSION = 5;
   const WORLD_RE = /^\/stories\/([^/]+)\/episodes\/([^/?#]+)/;
   const API_BASE = 'https://crack-api.wrtn.ai/crack-gen/v3';
   const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
@@ -77,7 +77,10 @@
     turnsPerUpdate: 5,
     activity: 'Normal',
     fanworkLanguage: '日本語',
-    fanworkTargetLength: 4000,
+    fanworkTargetLength: 2000,
+    // 'auto': each Pixiv work uses the length its metadata planned (mostly short one-shots);
+    // 'custom': every work uses fanworkTargetLength, as set by the user.
+    fanworkLengthMode: 'auto',
     streaming: true,
     autoUpdate: true,
     pollSeconds: 30,
@@ -176,6 +179,13 @@
     // An empty string is a deliberate "no common instruction"; only a missing value gets the default.
     result.globalGeminiInstruction = typeof source.globalGeminiInstruction === 'string' ? source.globalGeminiInstruction : DEFAULT_GLOBAL_INSTRUCTION;
     result.turnsPerUpdate = Math.round(clampNumber(result.turnsPerUpdate, 1, 100, DEFAULT_SETTINGS.turnsPerUpdate));
+    // 0.12.7: fanworks are short by default. A saved length equal to the old default (4000) was never
+    // chosen by the user, so it follows the new default; any other saved length is kept as the user's choice.
+    if (!['auto', 'custom'].includes(source.fanworkLengthMode)) {
+      const saved = Number(source.fanworkTargetLength);
+      result.fanworkLengthMode = source.fanworkTargetLength != null && Number.isFinite(saved) && saved !== 4000 ? 'custom' : 'auto';
+      if (result.fanworkLengthMode === 'auto') result.fanworkTargetLength = DEFAULT_SETTINGS.fanworkTargetLength;
+    }
     result.fanworkTargetLength = Math.round(clampNumber(result.fanworkTargetLength, 500, 30000, DEFAULT_SETTINGS.fanworkTargetLength));
     result.uiScale = clampNumber(result.uiScale, 0.75, 1.25, 1);
     const reader = result.pixivReader && typeof result.pixivReader === 'object' ? result.pixivReader : {};
@@ -385,7 +395,19 @@ CANON:
 
 FANDOM STATE:
 {{FANDOM_STATE}}`,
-    pixivMetadataGenerator: `Create metadata only for virtual Japanese Pixiv-like fanworks based on the supplied fandom reaction input. Do NOT write the full work. Use only persistent author persona IDs provided. Mix 原作軸, 幕間, IF, AU, future fabrication, multi-person relationships, and character-centric works as appropriate. Titles/captions/tags should feel natural in Japanese. Source canon IDs must be retained in sourceCanonEventIds only.
+    pixivMetadataGenerator: `Create metadata only for virtual Japanese Pixiv-like fanworks based on the supplied fandom reaction input. Do NOT write the full work. Use only persistent author persona IDs provided. Titles/captions/tags should feel natural in Japanese. Source canon IDs must be retained in sourceCanonEventIds only.
+
+LENGTH (fictionalCharacterCount is the planned length of the work and is used when it is written):
+- Most works are complete one-shot short pieces of about 800–2500 characters; shorter drabbles (300–800) are welcome.
+- 3000–5000 characters only occasionally.
+- Above 8000 characters (a long work) only rarely, and only when the premise is a big fandom trend, the author persona leans toward long works, the premise is strong enough to carry a long story, or the work continues a series (seriesTitle).
+- Prefer several short works with clearly different premises and moods over one long work.
+
+VARIETY:
+- A short work shows one scene, one feeling or one idea well (a single scene, a dialogue piece, a missing scene, a short IF, one AU scene, a character study, one relationship moment, a gag piece, an alternate or bad ending fragment, a small future fabrication, slice of life). It is never a plot summary and does not force a full arc.
+- Mix sources and settings across the batch: 原作軸, 幕間, missing scene, canon divergence, IF, future fabrication, modern AU, school AU, workplace/profession AU, fantasy, magic/superpowers, SF, space, zombie apocalypse, post-apocalypse, cyberpunk, steampunk, historical, myth/fairy-tale motifs, time loop, amnesia, role reversal, fake relationship, roommates, crack, character study, rare pairings, multi-person relationships.
+- An AU is not just a new backdrop: reinterpret the characters' personalities and relationships under that world's rules.
+- Do not repeat an AU, premise or emotional pattern already used in REACTION INPUT.recentPixivWorks or elsewhere in the same batch; vary tone (sweet, painful, funny, eerie, quiet) and workType.
 
 ${FAN_REFERENCE_RULES}
 
@@ -396,7 +418,7 @@ REACTION INPUT:
 {{REACTIONS}}
 
 ACTIVITY: {{ACTIVITY}}`,
-    fanwork: `You are writing a virtual fanwork based on an RP treated as official canon. This is FANWORK, not canon. Respect the metadata, author persona, relevant canon facts, and chosen divergence type. Write naturally in {{LANGUAGE}}. Target approximately {{TARGET_LENGTH}} characters. Do not add meta commentary before or after the work. The prose never contains internal IDs or "Canon" labels; use the episode/scene aliases only to locate the moment in the story.
+    fanwork: `You are writing a virtual fanwork based on an RP treated as official canon. This is FANWORK, not canon. Respect the metadata, author persona, relevant canon facts, and chosen divergence type. Write naturally in {{LANGUAGE}}. Target approximately {{TARGET_LENGTH}} characters. A short target means a complete one-shot that shows one scene, one feeling or one idea fully (not a summary, no forced full arc). Do not add meta commentary before or after the work. The prose never contains internal IDs or "Canon" labels; use the episode/scene aliases only to locate the moment in the story.
 
 WORK METADATA:
 {{WORK_METADATA}}
@@ -1208,20 +1230,61 @@ ${chapterItems.map((item, index) => `<navPoint id="np${index + 1}" playOrder="${
     return [...parts, ...central, new Uint8Array(end.buffer)];
   }
 
-  // Placeholder cover (SVG): title on a calm gradient. Used when a canvas PNG cannot be drawn.
+  // Neutral fallback cover (SVG), used only when neither the room thumbnail nor a canvas cover is available.
   function coverSvg(title, subtitle = 'Crack 캐릭터채팅') {
     const chars = Array.from(String(title || ''));
     const lines = []; for (let i = 0; i < chars.length && lines.length < 6; i += 9) lines.push(chars.slice(i, i + 9).join(''));
-    const palette = [['#24364f', '#5b7aa6'], ['#3d2a4f', '#8a6aa8'], ['#2f4a3e', '#6f9a80'], ['#4f2e2a', '#a8705f'], ['#2c3e50', '#7f8c8d']][parseInt(stableUuid(title).slice(0, 2), 16) % 5];
     return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1800" viewBox="0 0 1200 1800">
-<defs><linearGradient id="g" x1="0" y1="0" x2="0.4" y2="1"><stop offset="0" stop-color="${palette[1]}"/><stop offset="1" stop-color="${palette[0]}"/></linearGradient></defs>
-<rect width="1200" height="1800" fill="url(#g)"/>
-<rect x="90" y="90" width="1020" height="1620" fill="none" stroke="#ffffff" stroke-opacity=".35" stroke-width="4"/>
-${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family="serif" font-size="104" font-weight="700" fill="#fff" text-anchor="middle">${xmlEscape(line)}</text>`).join('\n')}
-<text x="600" y="1560" font-family="sans-serif" font-size="44" fill="#fff" fill-opacity=".8" text-anchor="middle">${xmlEscape(subtitle)}</text>
+<rect width="1200" height="1800" fill="#f2f2f2"/>
+<rect x="90" y="90" width="1020" height="1620" fill="none" stroke="#dddddd" stroke-width="4"/>
+${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family="sans-serif" font-size="96" font-weight="700" fill="#333333" text-anchor="middle">${xmlEscape(line)}</text>`).join('\n')}
+<text x="600" y="1560" font-family="sans-serif" font-size="44" fill="#999999" text-anchor="middle">${xmlEscape(subtitle)}</text>
 </svg>
 `;
+  }
+
+  // ---------- chat room thumbnail (world.chatCover) ----------
+  // Crack image objects are { origin, w600, w200, gif? } (sometimes a plain URL). The static image is used.
+  function crackImageUrl(image) {
+    const ok = (value) => typeof value === 'string' && /^https?:\/\//i.test(value.trim());
+    if (ok(image)) return image.trim();
+    if (!image || typeof image !== 'object') return null;
+    for (const key of ['origin', 'w600', 'w200', 'url']) if (ok(image[key])) return image[key].trim();
+    return null;
+  }
+
+  // The room thumbnail exactly as Crack's own chat list draws it next to the room title:
+  // story.portraitImage (2:3 cover) || story.profileImage. Same GET /v3/chats/{chatId} object as the title.
+  function extractChatRoomCover(chat) {
+    if (!chat || typeof chat !== 'object') return null;
+    const candidates = [['api:story.portraitImage', chat.story?.portraitImage], ['api:story.profileImage', chat.story?.profileImage], ['api:character.portraitImage', chat.character?.portraitImage], ['api:character.profileImage', chat.character?.profileImage]];
+    for (const [source, image] of candidates) {
+      const url = crackImageUrl(image);
+      if (url) return { url, source };
+    }
+    return null;
+  }
+
+  // Room metadata Books shows next to the cover: original story name, its description, the user's chat profile name.
+  function extractChatRoomMeta(chat) {
+    const text = (value, max) => (typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : null);
+    return {
+      cover: extractChatRoomCover(chat),
+      storyName: text(chat?.story?.name, 100),
+      description: text(chat?.story?.simpleDescription, 2000) || text(chat?.story?.description, 2000),
+      profileName: text(chat?.chatProfile?.name, 30),
+    };
+  }
+
+  // <img> src as rendered by Next.js (/_next/image?url=…) → the original image URL.
+  function unwrapImageSource(src, base = 'https://crack.wrtn.ai') {
+    try {
+      const url = new URL(src, base);
+      if (url.protocol === 'data:') return null;
+      if (url.pathname.endsWith('/_next/image') && url.searchParams.get('url')) return new URL(url.searchParams.get('url'), url.origin).href;
+      return /^https?:$/.test(url.protocol) ? url.href : null;
+    } catch (_) { return null; }
   }
 
   function readingMinutes(characters) {
@@ -1255,6 +1318,10 @@ ${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family
       readingMinutes,
       isValidChatTitle,
       extractChatRoomTitle,
+      crackImageUrl,
+      extractChatRoomCover,
+      extractChatRoomMeta,
+      unwrapImageSource,
       parseHudLine,
       cleanRpMessage,
       removeParenDirectives,
@@ -1633,11 +1700,14 @@ ${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family
       return extractChatRoomTitle(json?.data, [info.storyId, info.episodeId]);
     }
 
-    // Same room object, for Books: the user's chat profile (persona) name, when Crack provides one.
-    async fetchChatProfileName(info) {
+    // Same room object, for Books: thumbnail, original story name/description, chat profile name.
+    async fetchChatRoomMeta(info) {
       const json = await this.request(`${API_BASE}/chats/${encodeURIComponent(info.episodeId)}`);
-      const name = json?.data?.chatProfile?.name;
-      return typeof name === 'string' && name.trim() && name.trim().length <= 30 ? name.trim() : null;
+      return extractChatRoomMeta(json?.data);
+    }
+
+    async fetchChatProfileName(info) {
+      return (await this.fetchChatRoomMeta(info)).profileName;
     }
   }
 
@@ -1718,6 +1788,23 @@ ${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family
         const candidates = [link.getAttribute('title'), link.getAttribute('aria-label'), ...texts];
         const title = candidates.find((value) => isValidChatTitle(value, ids));
         if (title) return { title: title.trim(), source: 'dom:room-link' };
+      }
+      return null;
+    }
+
+    // DOM fallback for the room thumbnail: the image inside a link to exactly this room (Crack's chat
+    // list entry), never a page-wide image or a CSS class. srcset/Next.js image URLs are unwrapped.
+    readChatRoomCover(info) {
+      const path = `/stories/${info.storyId}/episodes/${info.episodeId}`;
+      for (const link of document.querySelectorAll('a[href]')) {
+        let pathname = '';
+        try { pathname = new URL(link.getAttribute('href'), location.origin).pathname.replace(/\/$/, ''); } catch (_) { continue; }
+        if (pathname !== path || link.closest('#rp-fanverse-host')) continue;
+        for (const img of link.querySelectorAll('img')) {
+          const raw = img.currentSrc || img.getAttribute('src') || (img.getAttribute('srcset') || '').split(/\s+/)[0];
+          const url = raw && unwrapImageSource(raw, location.origin);
+          if (url) return { url, source: 'dom:room-link' };
+        }
       }
       return null;
     }
@@ -2289,6 +2376,7 @@ ${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family
       // Worlds saved before 0.12.5 have no chatTitle; it is filled in by the next refreshChatTitle().
       if (this.world.chatTitle === undefined) this.world.chatTitle = null;
       this.chatTitleCheckedAt = 0;
+      this.roomMetaCheckedAt = 0;
       await this.db.put(STORES.worlds, this.world);
       return this.world;
     }
@@ -2310,6 +2398,29 @@ ${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family
       this.world.chatTitleUpdatedAt = new Date().toISOString();
       await this.saveWorld();
       return true;
+    }
+
+    // Books metadata of the open room, from the same Crack room object as the title: world.chatCover
+    // ({ url, source, updatedAt }), world.storyName, world.storyDescription. API first, then the
+    // room-link image in the DOM. Throttled; never throws (Books then shows a neutral placeholder).
+    async refreshRoomMeta({ force = false } = {}) {
+      if (!this.world || !this.worldInfo) return false;
+      if (!force && this.roomMetaCheckedAt && Date.now() - this.roomMetaCheckedAt < 5 * 60 * 1000) return false;
+      this.roomMetaCheckedAt = Date.now();
+      let meta = null;
+      try { meta = await this.api.fetchChatRoomMeta(this.worldInfo); } catch (error) { console.warn('[RP Fanverse] room metadata via API unavailable:', error.message); }
+      let cover = meta?.cover || null;
+      if (!cover) { try { cover = this.dom.readChatRoomCover(this.worldInfo); } catch (error) { console.warn('[RP Fanverse] room thumbnail via DOM unavailable:', error.message); } }
+      let changed = false;
+      if (cover && (cover.url !== this.world.chatCover?.url || cover.source !== this.world.chatCover?.source)) {
+        this.world.chatCover = { url: cover.url, source: cover.source, updatedAt: new Date().toISOString() };
+        changed = true;
+      }
+      for (const [key, value] of [['storyName', meta?.storyName], ['storyDescription', meta?.description]]) {
+        if (value && value !== this.world[key]) { this.world[key] = value; changed = true; }
+      }
+      if (changed) await this.saveWorld();
+      return changed;
     }
 
     async saveWorld() {
@@ -2654,7 +2765,7 @@ ${this.world.sync.error}`);
     }
 
     activityLimit(kind) {
-      const table = { Quiet: { reddit: 1, pixiv: 1 }, Normal: { reddit: 2, pixiv: 2 }, Active: { reddit: 4, pixiv: 3 }, Chaos: { reddit: 6, pixiv: 5 } };
+      const table = { Quiet: { reddit: 1, pixiv: 2 }, Normal: { reddit: 2, pixiv: 3 }, Active: { reddit: 4, pixiv: 5 }, Chaos: { reddit: 6, pixiv: 7 } };
       return table[this.getSettings().activity]?.[kind] || 2;
     }
 
@@ -2781,14 +2892,16 @@ ${this.world.sync.error}`);
 
     async generatePixiv(reactions, currentTurn, sourcePendingEventIds = []) {
       const fan = await this.fanReferenceIndex().catch(() => null);
-      const result = await this.gemini.generateJson(PromptLibrary.pixivMetadataGenerator({ personas: this.world.personas.pixiv, reactions: this.withFanReferences(reactions, fan), activity: this.getSettings().activity }), Schemas.pixiv, { retries: 1, temperature: 0.9 });
+      const existing = await this.db.getAllByWorld(STORES.pixivWorks, this.world.id);
+      // What is already on the list, so new works pick different premises, settings and moods.
+      const recentPixivWorks = existing.slice().sort((a, b) => (b.publishOrder || 0) - (a.publishOrder || 0)).slice(0, 12).map((work) => ({ title: work.title, workType: work.workType, tone: work.tone, ship: work.ship, tags: (work.tags || []).slice(0, 6), length: work.fictionalCharacterCount }));
+      const result = await this.gemini.generateJson(PromptLibrary.pixivMetadataGenerator({ personas: this.world.personas.pixiv, reactions: this.withFanReferences({ ...reactions, recentPixivWorks }, fan), activity: this.getSettings().activity }), Schemas.pixiv, { retries: 1, temperature: 0.95 });
       for (const work of result.works || []) {
         for (const key of ['title', 'caption', 'summary', 'seriesTitle']) work[key] = this.fanText(work[key]);
         work.tags = (work.tags || []).map((tag) => this.fanText(tag)).filter(Boolean);
       }
       const personaIds = new Set(this.world.personas.pixiv.map((persona) => persona.id));
       const eventKey = [...sourcePendingEventIds].sort().join(',');
-      const existing = await this.db.getAllByWorld(STORES.pixivWorks, this.world.id);
       const existingById = new Map(existing.map((work) => [work.id, work]));
       const works = (result.works || []).slice(0, this.activityLimit('pixiv')).map((work, index) => ({
         ...work, id: `pixiv_${Utils.hash(`${this.world.id}:${eventKey}:${index}`)}`, worldId: this.world.id, turn: currentTurn, publishOrder: Date.now() + index,
@@ -2797,6 +2910,7 @@ ${this.world.sync.error}`);
         userBookmarked: existingById.get(`pixiv_${Utils.hash(`${this.world.id}:${eventKey}:${index}`)}`)?.userBookmarked || false,
         sourcePendingEventIds: [...sourcePendingEventIds],
         authorId: personaIds.has(work.authorId) ? work.authorId : this.world.personas.pixiv[0].id,
+        lengthPlanned: true, // fictionalCharacterCount is this work's planned length (fanworkTarget)
       }));
       if (!works.length) throw new Error('Gemini returned no Pixiv works for due events');
       await this.db.bulkPut(STORES.pixivWorks, works);
@@ -2815,6 +2929,15 @@ ${this.world.sync.error}`);
       return works;
     }
 
+    // Length of one fanwork. 'custom' mode: the user's fixed length. 'auto': the length the work's own
+    // metadata planned (works from 0.12.7 on; mostly short one-shots), else the default. Above 8,000
+    // characters the long pipeline (outline → sections → continuity → revision) still runs.
+    fanworkTarget(work, settings = this.getSettings()) {
+      if (settings.fanworkLengthMode === 'custom') return settings.fanworkTargetLength;
+      const planned = Number(work?.fictionalCharacterCount);
+      return work?.lengthPlanned && Number.isFinite(planned) && planned > 0 ? Math.round(clampNumber(planned, 300, 30000, settings.fanworkTargetLength)) : settings.fanworkTargetLength;
+    }
+
     async generateFanwork(work, onChunk) {
       const cached = await this.db.get(STORES.fanworks, work.id);
       if (cached) return cached;
@@ -2823,8 +2946,8 @@ ${this.world.sync.error}`);
       const canonContext = await this.buildCanonContext(work.sourceCanonEventIds || [], [work.title, work.ship, work.summary, ...(work.tags || [])]);
       let text; let outline = null; let continuity = null; let initialContinuity = null; let revisionApplied = false;
       const fan = await this.fanReferenceIndex().catch(() => null);
-      const input = { work: this.withFanReferences(work, fan), author, canon: this.withFanReferences(canonContext, fan), fandom: this.fandomSnapshot(), language: settings.fanworkLanguage, targetLength: settings.fanworkTargetLength };
-      if (settings.fanworkTargetLength > 8000) {
+      const input = { work: this.withFanReferences(work, fan), author, canon: this.withFanReferences(canonContext, fan), fandom: this.fandomSnapshot(), language: settings.fanworkLanguage, targetLength: this.fanworkTarget(work, settings) };
+      if (input.targetLength > 8000) {
         outline = await this.gemini.generateJson(PromptLibrary.fanworkOutline(input), Schemas.outline, { retries: 1, temperature: 0.65 });
         const sections = [];
         for (let i = 0; i < outline.sections.slice(0, 3).length; i += 1) {
@@ -2954,51 +3077,67 @@ ${this.world.sync.error}`);
     });
   }
 
-  // EPUB core image types are kept as-is; other images (AVIF, BMP, …) are re-encoded to PNG when the
-  // browser can decode them, otherwise skipped.
+  // EPUB core image types are kept; WEBP (core only since EPUB 3.3) and other decodable images (AVIF,
+  // BMP, …) are re-encoded so older readers can show them: JPEG on white for WEBP, PNG otherwise.
+  // When re-encoding is impossible, WEBP is kept and other types are skipped.
   async function toEpubImage(bytes, headerType) {
     if (!bytes?.length || bytes.length > 25 * 1024 * 1024) return null;
     const type = sniffImageType(bytes) || String(headerType || '').toLowerCase();
-    if (EPUB_IMAGE_TYPES[type]) return { data: bytes, mediaType: type };
-    if (!/^image\//.test(type) || typeof createImageBitmap !== 'function') return null;
+    if (EPUB_IMAGE_TYPES[type] && type !== 'image/webp') return { data: bytes, mediaType: type };
+    const keep = type === 'image/webp' ? { data: bytes, mediaType: type } : null;
+    if (!/^image\//.test(type) || typeof createImageBitmap !== 'function') return keep;
     try {
       const bitmap = await createImageBitmap(new Blob([bytes], { type }));
       const canvas = document.createElement('canvas');
       canvas.width = bitmap.width; canvas.height = bitmap.height;
-      canvas.getContext('2d').drawImage(bitmap, 0, 0);
-      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
-      return blob ? { data: new Uint8Array(await blob.arrayBuffer()), mediaType: 'image/png' } : null;
-    } catch (_) { return null; }
+      const ctx = canvas.getContext('2d');
+      const jpeg = type === 'image/webp';
+      if (jpeg) { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height); }
+      ctx.drawImage(bitmap, 0, 0);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, jpeg ? 'image/jpeg' : 'image/png', 0.92));
+      return blob ? { data: new Uint8Array(await blob.arrayBuffer()), mediaType: jpeg ? 'image/jpeg' : 'image/png' } : keep;
+    } catch (_) { return keep; }
   }
 
-  // Generated cover (no AI): the room title on a calm gradient. PNG via canvas, SVG if that fails.
+  // Neutral placeholder cover (no AI, no artwork): the room title on light gray. Used only when the
+  // room thumbnail cannot be fetched. JPEG via canvas, SVG if canvas is unavailable.
   async function drawCover(title) {
     try {
       const canvas = document.createElement('canvas');
       canvas.width = 1200; canvas.height = 1800;
       const ctx = canvas.getContext('2d');
-      const palette = [['#5b7aa6', '#24364f'], ['#8a6aa8', '#3d2a4f'], ['#6f9a80', '#2f4a3e'], ['#a8705f', '#4f2e2a'], ['#7f8c8d', '#2c3e50']][parseInt(stableUuid(title).slice(0, 2), 16) % 5];
-      const gradient = ctx.createLinearGradient(0, 0, 500, 1800);
-      gradient.addColorStop(0, palette[0]); gradient.addColorStop(1, palette[1]);
-      ctx.fillStyle = gradient; ctx.fillRect(0, 0, 1200, 1800);
-      ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 4; ctx.strokeRect(90, 90, 1020, 1620);
-      ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.font = '700 100px "Noto Serif KR","Apple SD Gothic Neo","Malgun Gothic",serif';
+      ctx.fillStyle = '#f2f2f2'; ctx.fillRect(0, 0, 1200, 1800);
+      ctx.strokeStyle = '#dddddd'; ctx.lineWidth = 4; ctx.strokeRect(90, 90, 1020, 1620);
+      ctx.fillStyle = '#333333'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = '700 92px "Pretendard","Apple SD Gothic Neo","Malgun Gothic",sans-serif';
       const lines = []; let line = '';
       for (const ch of Array.from(title)) {
-        if (ctx.measureText(line + ch).width > 900 && line) { lines.push(line); line = ''; }
+        if (ctx.measureText(line + ch).width > 880 && line) { lines.push(line); line = ''; }
         line += ch;
       }
       if (line) lines.push(line);
       const shown = lines.slice(0, 6);
-      shown.forEach((text, index) => ctx.fillText(text, 600, 700 - (shown.length - 1) * 65 + index * 130));
-      ctx.font = '400 44px "Apple SD Gothic Neo","Malgun Gothic",sans-serif'; ctx.fillStyle = 'rgba(255,255,255,.8)';
+      shown.forEach((text, index) => ctx.fillText(text, 600, 760 - (shown.length - 1) * 62 + index * 124));
+      ctx.font = '400 42px "Pretendard","Apple SD Gothic Neo","Malgun Gothic",sans-serif'; ctx.fillStyle = '#999999';
       ctx.fillText('Crack 캐릭터채팅', 600, 1560);
-      // JPEG keeps the generated cover small (a gradient PNG at this size is ~1.5 MB).
       const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.9));
       if (blob) return { data: new Uint8Array(await blob.arrayBuffer()), mediaType: 'image/jpeg' };
     } catch (_) { /* canvas unavailable: SVG below */ }
     return { data: new TextEncoder().encode(coverSvg(title)), mediaType: 'image/svg+xml' };
+  }
+
+  // EPUB cover = the same room thumbnail the Books page shows (world.chatCover), downloaded and
+  // embedded; the neutral placeholder only when it cannot be fetched or decoded.
+  async function epubCover(world, title) {
+    const url = world?.chatCover?.url;
+    if (url) {
+      try {
+        const { bytes, type } = await fetchBinary(url);
+        const image = await toEpubImage(bytes, type);
+        if (image) return { ...image, fromThumbnail: true };
+      } catch (error) { console.warn('[RP Fanverse] room thumbnail could not be embedded:', error.message); }
+    }
+    return { ...(await drawCover(title)), fromThumbnail: false };
   }
 
   class BookExporter {
@@ -3029,6 +3168,7 @@ ${this.world.sync.error}`);
       if (!title) throw new Error('현재 채팅방 제목을 확인하지 못했습니다. 잠시 후 다시 시도하세요.');
 
       onStep('fetch', '');
+      await this.engine.refreshRoomMeta({ force: true });
       const { messages, warning } = await this.loadActiveMessages(onStep);
       let userName = String(options.userName || '').trim();
       if (!userName && options.unifyDialogue) userName = await api.fetchChatProfileName(worldInfo).catch(() => null) || '';
@@ -3063,17 +3203,18 @@ ${this.world.sync.error}`);
 
       onStep('package', '');
       await yieldToUi();
+      const cover = await epubCover(world, title);
       const modified = new Date();
       const files = buildEpubFiles({
         title, language: 'ko', identifier: `urn:uuid:${stableUuid(`rp-fanverse:${world.id}`)}`, modified,
         description: `「${title}」 Crack 캐릭터채팅 로그를 웹소설 형식으로 정리한 개인 소장용 EPUB (RP Fanverse ${APP_VERSION}).`,
         source: `https://crack.wrtn.ai/stories/${worldInfo.storyId}/episodes/${worldInfo.episodeId}`,
-        chapters, cover: await drawCover(title),
+        chapters, cover,
       }, images);
       const parts = await createZip(files, { date: modified, onEntry: (index, total) => { onStep('package', `${index} / ${total}`); return index % 8 ? null : yieldToUi(); } });
       const fileName = epubFileName(title);
       Utils.download(fileName, new Blob(parts, { type: 'application/epub+zip' }), 'application/epub+zip');
-      return { fileName, chapters: chapters.length, messages: messages.length, images: { embedded: images.size, failed }, warning };
+      return { fileName, chapters: chapters.length, messages: messages.length, images: { embedded: images.size, failed }, coverFromThumbnail: cover.fromThumbnail, warning };
     }
   }
 
@@ -3320,64 +3461,68 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
 @media (prefers-reduced-motion:reduce){.sh-steps li.active .sh-dot{animation:none}.launcher{transition:none}}
 `;
 
-  // Books (Korean e-book store detail page: RIDI-like layout and tokens, own drawing, no brand assets).
+  // Books: modeled on the current RIDI mobile e-book detail page (ridibooks.com/books/…, measured
+  // 2026-10 at 375px): 110px cover left with the info column at x=142, 13px/600 #555 breadcrumb,
+  // 22px/700 title on 26px lines, 13px #555 meta lines, a gray-label table in place of the price table,
+  // 4px #e6e8eb section divider, 18px/700 section heading, two tabs under a 2px #787878 rule, 15px/23px
+  // #555 intro text, and the fixed dark bottom bar (rgba(62,62,62,.9)) with 40×42 gray-blue icon
+  // squares and the #1e9eff 42px main button. Store-only parts (price, cash/points, rating, reviews,
+  // events, recommendations, wishlist/cart/gift, DRM) are left out. No brand assets.
   const BOOKS_CSS = `
-.screen-books{--bk-blue:#1f8ce6;--bk-t1:#303538;--bk-t2:#636c73;--bk-t3:#9ea7ad;--bk-line:#e6e8eb;--bk-bg2:#f2f4f5;background:#fff;color:var(--bk-t1);font-family:-apple-system,"Apple SD Gothic Neo","Noto Sans KR",sans-serif;font-size:14px;line-height:1.4}
-.bk-top{position:sticky;top:0;z-index:5;display:grid;grid-template-columns:44px 1fr 44px;align-items:center;height:48px;padding:0 4px;background:#fff;border-bottom:1px solid var(--bk-line)}
-.bk-top h1{margin:0;text-align:center;font-size:16px;font-weight:700}
-.bk-iconbtn{width:40px;height:40px;border:0;border-radius:50%;background:transparent;color:var(--bk-t1);display:grid;place-items:center;cursor:pointer}
-.bk-tabs{display:flex;gap:20px;padding:0 16px;border-bottom:1px solid var(--bk-line)}
-.bk-tabs span{padding:12px 0 10px;color:var(--bk-t3);font-size:15px;font-weight:700}
-.bk-tabs span.on{color:var(--bk-t1);box-shadow:inset 0 -2px 0 var(--bk-t1)}
-.bk-shelf{display:grid;grid-template-columns:repeat(3,1fr);gap:20px 12px;padding:20px 16px 8px}
-.bk-book{display:flex;flex-direction:column;gap:6px;min-width:0;padding:0;border:0;background:transparent;color:var(--bk-t1);text-align:left;cursor:pointer}
-.bk-book:active .bk-cover{transform:scale(.97)}
-.bk-book b{font-size:13px;line-height:18px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:keep-all}
-.bk-book small{color:var(--bk-t3);font-size:11px}
-.bk-badge{align-self:flex-start;padding:1px 5px;border:1px solid var(--bk-blue);border-radius:3px;color:var(--bk-blue);font-size:10px;font-weight:700}
-.bk-cover{position:relative;display:flex;flex-direction:column;justify-content:space-between;border-radius:3px 5px 5px 3px;color:#fff;background:linear-gradient(170deg,var(--c1),var(--c2));box-shadow:0 2px 10px #0000002e,inset 4px 0 0 #ffffff24;overflow:hidden;transition:transform .12s}
-.bk-cover:after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,#0000001f,transparent 6%)}
-.bk-cover-t{position:relative;font-family:"Noto Serif KR","Apple SD Gothic Neo",serif;font-weight:700;word-break:keep-all;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}
-.bk-cover-s{position:relative;opacity:.82;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.bk-cover.m{width:100%;aspect-ratio:2/3;padding:16% 11%}
-.bk-cover.m .bk-cover-t{font-size:12px;line-height:17px;-webkit-line-clamp:5}
-.bk-cover.m .bk-cover-s{font-size:8px}
-.bk-cover.l{width:148px;height:222px;padding:24px 16px}
-.bk-cover.l .bk-cover-t{font-size:18px;line-height:26px;-webkit-line-clamp:6}
-.bk-cover.l .bk-cover-s{font-size:10px}
-.bk-hero{display:flex;justify-content:center;padding:28px 0 22px;background:var(--bk-bg2)}
-.bk-head{padding:18px 20px 4px;text-align:center}
-.bk-kicker{color:var(--bk-blue);font-size:12px;font-weight:700}
-.bk-title{margin:6px 0;font-size:21px;line-height:28px;font-weight:800;word-break:keep-all}
-.bk-author{color:var(--bk-t2);font-size:13px}
-.bk-meta{margin-top:8px;color:var(--bk-t3);font-size:12px}
-.bk-cta{padding:16px 20px 18px;border-bottom:8px solid var(--bk-bg2)}
-.bk-primary{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;height:50px;border:0;border-radius:6px;background:var(--bk-blue);color:#fff;font-size:16px;font-weight:700;cursor:pointer;transition:transform .12s,filter .12s}
-.bk-primary:active,.bk-primary.pressed{transform:scale(.97);filter:brightness(.9)}
-.bk-primary:disabled{cursor:default;filter:grayscale(.3) brightness(.95)}
-.bk-cta-note{margin-top:8px;color:var(--bk-t3);font-size:11px;text-align:center}
-.bk-section{padding:20px 20px 22px;border-bottom:8px solid var(--bk-bg2)}
-.bk-section:last-child{border-bottom:0}
-.bk-section h2{display:flex;align-items:baseline;gap:6px;margin:0 0 12px;font-size:16px;font-weight:800}
-.bk-section h2 small{color:var(--bk-blue);font-size:13px}
-.bk-info{display:grid;grid-template-columns:68px 1fr;gap:9px 10px;margin:0;font-size:13px}
-.bk-info dt{color:var(--bk-t3)}
-.bk-info dd{margin:0;color:var(--bk-t1);word-break:break-word}
-.bk-intro{margin:0;color:var(--bk-t2);font-size:14px;line-height:22px;word-break:keep-all}
-.bk-field{display:block;margin:0 0 6px}
-.bk-field span{display:block;margin-bottom:6px;color:var(--bk-t2);font-size:12px;font-weight:600}
-.bk-field input{width:100%;height:40px;padding:0 12px;border:1px solid var(--bk-line);border-radius:6px;color:var(--bk-t1);font:14px -apple-system,"Noto Sans KR",sans-serif;outline:0}
-.bk-field input:focus{border-color:var(--bk-blue)}
-.bk-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 0;border-top:1px solid var(--bk-line);font-size:14px}
-.bk-toggle input{flex:none;width:20px;height:20px;accent-color:var(--bk-blue)}
-.bk-hint{margin:4px 0 10px;color:var(--bk-t3);font-size:11px;line-height:16px}
-.bk-toc{list-style:none;margin:0;padding:0}
-.bk-toc li{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:8px;align-items:center;padding:11px 0;border-top:1px solid var(--bk-line);font-size:13px}
-.bk-toc li:first-child{border-top:0}
-.bk-toc span{color:var(--bk-t2);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-.bk-toc em{color:var(--bk-t3);font-size:11px;font-style:normal}
-.bk-more{width:100%;height:40px;margin-top:8px;border:1px solid var(--bk-line);border-radius:6px;background:#fff;color:var(--bk-t2);font-size:13px;cursor:pointer}
-.bk-note{margin:8px 16px 24px;padding:12px 14px;border-radius:8px;background:var(--bk-bg2);color:var(--bk-t2);font-size:12px;line-height:18px}
+.screen-books{--bk-blue:#1e9eff;--bk-t1:#141414;--bk-t2:#555;--bk-t3:#a5a5a5;--bk-line:#e6e6e6;background:#fff;color:var(--bk-t1);font-family:"Pretendard Variable",Pretendard,-apple-system,"Apple SD Gothic Neo","Noto Sans KR",sans-serif;font-size:14px;line-height:1.4}
+.bk-page{display:flex;flex-direction:column;min-height:100%}
+.bk-grow{flex:1}
+.bk-top{display:flex;align-items:center;height:47px;padding:0 4px;background:#fff}
+.bk-top h1{margin:0 0 0 12px;font-size:18px;font-weight:700}
+.bk-iconbtn{width:40px;height:40px;border:0;background:transparent;color:var(--bk-t1);display:grid;place-items:center;cursor:pointer}
+.bk-head{display:flex;gap:16px;padding:17px 16px 24px}
+.bk-cover{position:relative;flex:none;width:110px;align-self:flex-start;border-radius:4px;overflow:hidden;background:#f5f5f5;box-shadow:0 0 0 1px #0000000d}
+.bk-cover img{display:block;width:100%;height:auto}
+.bk-ph{display:flex;align-items:center;justify-content:center;aspect-ratio:2/3;padding:10px;background:#f2f2f2;color:var(--bk-t2,#555);font-size:12px;font-weight:600;line-height:1.35;text-align:center;word-break:keep-all;overflow:hidden}
+.bk-info{flex:1;min-width:0}
+.bk-crumb{color:var(--bk-t2);font-size:13px;font-weight:600;line-height:16px}
+.bk-crumb span{margin:0 3px;color:#bbb;font-weight:400}
+.bk-title{margin:10px 0 4px;font-size:22px;font-weight:700;line-height:26px;letter-spacing:-.3px;word-break:keep-all;overflow-wrap:anywhere}
+.bk-line{margin-top:8px;color:var(--bk-t2);font-size:13px;line-height:17px}
+.bk-line b{font-weight:600}
+.bk-line i{font-style:normal;color:var(--bk-t3)}
+.bk-table{display:grid;grid-template-columns:68px 1fr;margin:0 16px;border-top:1px solid var(--bk-line);border-bottom:1px solid var(--bk-line)}
+.bk-table-k{display:flex;align-items:center;justify-content:center;background:#fafafa;border-right:1px solid var(--bk-line);font-size:14px;font-weight:600}
+.bk-table-rows>div{display:flex;align-items:center;justify-content:space-between;min-height:44px;padding-left:14px;color:var(--bk-t2);font-size:13px}
+.bk-table-rows>div+div{border-top:1px solid var(--bk-line)}
+.bk-table-rows b{color:var(--bk-t1);font-size:14px;font-weight:600}
+.bk-sep{margin-top:24px;border-top:4px solid #e6e8eb}
+.bk-sec{padding:20px 16px 28px}
+.bk-sec h2{margin:0;padding:4px 0 10px;font-size:18px;font-weight:700;line-height:22px}
+.bk-tabs{display:flex;border-top:2px solid #787878}
+.bk-tabs button{flex:1;padding:11px 0 13px;border:0;background:#fff;color:var(--bk-t3);font-family:inherit;font-size:15px;font-weight:700;line-height:18px;cursor:pointer}
+.bk-tabs button.on{color:var(--bk-t1)}
+.bk-intro{margin:14px 0 0;color:var(--bk-t2);font-size:15px;line-height:23px;white-space:pre-line;word-break:keep-all;overflow-wrap:anywhere}
+.bk-intro.clamp{display:-webkit-box;-webkit-line-clamp:8;-webkit-box-orient:vertical;overflow:hidden}
+.bk-more{display:block;width:100%;margin-top:14px;padding:10px 0;border:1px solid var(--bk-line);border-radius:4px;background:#fff;color:var(--bk-t2);font-family:inherit;font-size:13px;font-weight:600;cursor:pointer}
+.bk-toc{list-style:none;margin:6px 0 0;padding:0}
+.bk-toc li{display:flex;align-items:baseline;gap:10px;padding:13px 0;border-bottom:1px solid #f0f0f0;font-size:14px;line-height:18px}
+.bk-toc b{flex:none;width:40px;font-weight:600}
+.bk-toc span{flex:1;min-width:0;color:var(--bk-t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bk-toc i{flex:none;color:var(--bk-t3);font-size:12px;font-style:normal}
+.bk-empty{margin:14px 0 0;color:var(--bk-t3);font-size:14px}
+.bk-bar{position:sticky;bottom:0;z-index:5;display:flex;gap:3px;padding:5px;background:#3e3e3ee6}
+.bk-barbtn{flex:none;width:40px;height:42px;border:0;border-radius:4px;background:#7d8e9e;color:#fff;display:grid;place-items:center;cursor:pointer}
+.bk-buy{flex:1;height:42px;border:0;border-radius:4px;background:var(--bk-blue);color:#fff;font-family:inherit;font-size:16px;font-weight:700;cursor:pointer;transition:filter .12s,transform .12s}
+.bk-buy:active,.bk-buy.pressed{filter:brightness(.9);transform:scale(.98)}
+.bk-buy:disabled{background:#a5a5a5;cursor:default;transform:none}
+.bk-shelf{display:grid;grid-template-columns:repeat(3,1fr);gap:22px 12px;padding:8px 16px 24px}
+.bk-book{display:flex;flex-direction:column;gap:7px;min-width:0;padding:0;border:0;background:transparent;color:var(--bk-t1);font-family:inherit;text-align:left;cursor:pointer}
+.bk-book .bk-cover{width:100%}
+.bk-book:active .bk-cover{opacity:.85}
+.bk-book b{font-size:13px;font-weight:600;line-height:17px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:keep-all}
+.bk-book small{color:var(--bk-t3);font-size:12px}
+.bk-sfield{display:block;margin:16px 0 4px}
+.bk-sfield span{display:block;margin-bottom:6px;color:#555;font-size:13px;font-weight:600}
+.bk-sfield input{width:100%;height:42px;padding:0 12px;border:1px solid #e6e6e6;border-radius:4px;color:#141414;font:15px -apple-system,"Apple SD Gothic Neo","Noto Sans KR",sans-serif;outline:0}
+.bk-sfield input:focus{border-color:#1e9eff}
+.bk-stoggle{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0;border-bottom:1px solid #f0f0f0;font-size:14px}
+.bk-stoggle input{flex:none;width:20px;height:20px;accent-color:#1e9eff}
 `;
 
   // Pixiv (mobile web, measured from pixiv.net novel tag/detail/user pages).
@@ -3697,6 +3842,15 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
       main.addEventListener('change', (event) => this.handleChange(event));
       main.addEventListener('input', (event) => this.handleInput(event));
       main.addEventListener('keydown', (event) => this.handleKeydown(event));
+      // A room thumbnail that fails to load becomes the neutral title placeholder ('error' does not bubble).
+      this.root.addEventListener('error', (event) => {
+        const img = event.target;
+        if (!img?.matches?.('img[data-cover-fallback]')) return;
+        const placeholder = document.createElement('div');
+        placeholder.className = 'bk-ph';
+        placeholder.textContent = img.dataset.coverFallback;
+        img.replaceWith(placeholder);
+      }, true);
     }
 
     show() {
@@ -3853,6 +4007,7 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
         layer.querySelector('.sheet-dim').animate([{ opacity: 0 }, { opacity: 1 }], { duration: 260, easing: 'ease-out' });
         layer.querySelector('.sheet').animate([{ transform: 'translateY(100%)' }, { transform: 'translateY(0)' }], { duration: 340, easing: 'cubic-bezier(0.32, 0.72, 0, 1)' });
       }
+      layer.addEventListener('change', (event) => this.handleChange(event));
       layer.addEventListener('click', (event) => {
         if (event.target.closest('[data-sheet-close]') || (layer.dataset.dismissible === '1' && event.target.classList.contains('sheet-dim'))) this.closeSheet();
       });
@@ -4197,7 +4352,7 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
         pageCount = body.pages;
         readerHtml = `<div ${attr}>${body.html}<div class="px-pagecount">${pageCount} / ${pageCount} 페이지</div></div>`;
       } else {
-        readerHtml = `<div class="px-generate"><button class="px-pill wide" data-act="px-generate" data-id="${work.id}">본문 생성하여 읽기</button><p>목표 ${Fmt.int(this.getSettings().fanworkTargetLength)}자 · ${this.esc(this.getSettings().fanworkLanguage)}<br>생성한 전문은 IndexedDB에 저장되어 다음부터 바로 열립니다.</p></div><div id="fanwork-stream" ${attr}></div>`;
+        readerHtml = `<div class="px-generate"><button class="px-pill wide" data-act="px-generate" data-id="${work.id}">본문 생성하여 읽기</button><p>목표 ${Fmt.int(this.engine.fanworkTarget(work))}자 · ${this.esc(this.getSettings().fanworkLanguage)}<br>생성한 전문은 IndexedDB에 저장되어 다음부터 바로 열립니다.</p></div><div id="fanwork-stream" ${attr}></div>`;
       }
       const panel = this.route?.readerPanel ? `<div class="px-readerpanel"><div><span>글자 크기</span>${[['s', '작게'], ['m', '보통'], ['l', '크게']].map(([value, label]) => `<button class="${reader.size === value ? 'on' : ''}" data-act="px-reader-set" data-key="size" data-value="${value}">${label}</button>`).join('')}</div><div><span>글꼴</span>${[['gothic', '고딕'], ['mincho', '명조']].map(([value, label]) => `<button class="${reader.font === value ? 'on' : ''}" data-act="px-reader-set" data-key="font" data-value="${value}">${label}</button>`).join('')}</div><div><span>배경</span>${[['light', '화이트'], ['sepia', '세피아'], ['dark', '다크']].map(([value, label]) => `<button class="${reader.theme === value ? 'on' : ''}" data-act="px-reader-set" data-key="theme" data-value="${value}">${label}</button>`).join('')}</div></div>` : '';
       const seriesBox = work.seriesTitle ? `<div class="px-seriesbox"><div class="px-seriesbox-label">시리즈</div><button class="px-seriesbox-title" data-act="px-series" data-title="${this.esc(work.seriesTitle)}">${this.esc(work.seriesTitle)}</button><div class="px-nav">${next ? `<button data-act="px-work" data-id="${next.id}" data-replace="1">다음 화 #${series.number + 1}</button>` : '<button disabled>최신화입니다</button>'}${prev ? `<button data-act="px-work" data-id="${prev.id}" data-replace="1">이전 화 #${series.number - 1}</button>` : ''}</div></div>` : '';
@@ -4361,19 +4516,21 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
       return `<div class="reddit-shell">${this.rdHeaderHtml()}<div class="rd-detail-head"><button class="rd-iconbtn filled" data-act="rd-back" aria-label="뒤로">${icon('back', 18)}</button>${this.rdLogo(32)}<div class="col"><span><b>${this.esc(this.communityName())}</b> <span class="dot">•</span> <time>${Fmt.ago(post.createdAt)}</time></span><span>${this.esc(name)}</span></div><span class="grow"></span><button class="rd-iconbtn" data-act="rd-noop" aria-label="더보기">${icon('more', 18)}</button></div><h1 class="rd-detail-title">${this.esc(post.title)}</h1><div class="rd-detail-body"><div class="rd-flairs">${this.rdFlair(post.category)}${post.spoiler ? `<span class="rd-spoiler-badge">${icon('warning', 12)}스포일러</span>` : ''}</div>${this.rdBody(post)}<p class="rd-canon-note">${this.episodeAt(post.turn) ? `본편 ${this.esc(this.episodeAt(post.turn))} 시점의 반응` : '본편 진행 중의 반응'}</p></div><div class="rd-detail-actions"><div class="rd-actions">${this.rdVote(post.id, post.userVote, post.score)}<button class="rd-pill" data-act="rd-noop">${icon('comment', 18)}${Fmt.compact(Math.max(comments.length, post.estimatedCommentCount || 0))}</button><button class="rd-pill" data-act="rd-share" data-id="${post.id}">${icon('share', 18)}공유</button></div></div><div class="rd-composer" data-act="rd-compose">대화 참여하기</div><div class="rd-csort"><span>정렬 기준:</span><button class="rd-sortbtn" data-act="rd-csort-menu" aria-haspopup="menu">${csortLabels[csort]}${icon('chevronDown', 16)}</button>${menu}</div>${route.focus ? `<div style="padding:0 16px"><button class="rd-morec" style="margin:0" data-act="rd-unfocus">${icon('back', 16)}전체 댓글 보기</button></div>` : ''}<div class="rd-comments">${tree || '<div class="empty" style="padding:24px 0">아직 댓글이 없습니다.</div>'}${!route.focus && post.hasMoreComments ? `<button class="rd-morec" data-act="rd-more" data-id="${post.id}">${icon('plusCircle', 20)}댓글 더 보기${remaining ? ` (약 ${remaining}개)` : ''}</button>` : ''}</div></div>`;
     }
 
-    // ---------- books (RIDI-like library + detail; EPUB export only, no in-app reader) ----------
+    // ---------- books (RIDI mobile detail layout; EPUB export only, no in-app reader) ----------
 
     bookOptions() {
       return { userName: '', unifyDialogue: true, sceneMarkers: true, includeImages: true, ...(this.engine.world?.books || {}) };
     }
 
-    bkCover(title, size = 'm') {
-      const palette = [['#5b7aa6', '#24364f'], ['#8a6aa8', '#3d2a4f'], ['#6f9a80', '#2f4a3e'], ['#a8705f', '#4f2e2a'], ['#7f8c8d', '#2c3e50']][parseInt(stableUuid(title || 'book').slice(0, 2), 16) % 5];
-      return `<div class="bk-cover ${size}" style="--c1:${palette[0]};--c2:${palette[1]}"><span class="bk-cover-t">${this.esc(title || '제목 확인 중')}</span><span class="bk-cover-s">Crack 캐릭터채팅</span></div>`;
+    // The open room's own thumbnail (world.chatCover, from Crack); a neutral title placeholder only
+    // when there is none or it fails to load (see the error listener in bind()).
+    bkCoverHtml(title) {
+      const url = this.engine.world?.chatCover?.url;
+      const label = this.esc(title || '');
+      return `<div class="bk-cover">${url ? `<img src="${this.esc(url)}" alt="${label}" data-cover-fallback="${label}">` : `<div class="bk-ph">${label}</div>`}</div>`;
     }
 
-    // Local summary of the active branch for the detail page (stored messages only; the export
-    // itself re-reads the full log from the Crack API).
+    // Local summary of the synced active branch (the export itself re-reads the full log).
     async bookSummary() {
       const turns = await this.engine.allActiveTurns();
       await this.engine.fanReferenceIndex().catch(() => null);
@@ -4387,33 +4544,42 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
         if (!entry.place && scenes[index]?.place) entry.place = scenes[index].place;
         if (!entry.time && scenes[index]?.time) entry.time = scenes[index].time;
       });
-      const characters = turns.reduce((sum, turn) => sum + String(turn.user || '').length + String(turn.assistant || '').length, 0);
-      return { turns: turns.length, episodes: toc.length, toc, characters };
+      return { turns: turns.length, episodes: toc.length, toc };
     }
 
     async booksHtml() {
+      // Thumbnail/story metadata are refreshed in the background; a change re-renders this screen.
+      this.engine.refreshRoomMeta().then((changed) => { if (changed && this.open && this.view === 'books') this.render({ keepScroll: true }); }).catch(() => {});
       const world = this.engine.world;
       const title = this.storyTitle();
       const route = this.route || {};
-      if (route.type === 'book') return this.bookDetailHtml(world, title, route);
       const summary = await this.bookSummary();
-      return `<div class="bk-top"><span></span><h1>내 서재</h1><span></span></div><div class="bk-tabs"><span class="on">전체</span><span>캐릭터채팅</span></div><div class="bk-shelf"><button class="bk-book" data-act="bk-open">${this.bkCover(title, 'm')}<b>${this.esc(title || '채팅방 제목 확인 중')}</b><small>총 ${Fmt.int(summary.episodes)}화 · ${Fmt.int(summary.turns)}턴</small><span class="bk-badge">EPUB</span></button></div><div class="bk-note">지금 열려 있는 Crack 캐릭터채팅 방이 한 권의 책으로 꽂혀 있습니다. 작품을 누르면 상세 페이지에서 전체 로그를 웹소설 형식의 EPUB으로 받을 수 있습니다. 본문은 외부 전자책 앱에서 읽으세요.</div>`;
+      if (route.type === 'book') return this.bookDetailHtml(world, title, route, summary);
+      return `<div class="bk-page"><div class="bk-top"><h1>내 서재</h1></div><div class="bk-shelf"><button class="bk-book" data-act="bk-open">${this.bkCoverHtml(title)}<b>${this.esc(title || '제목 확인 중')}</b><small>${Fmt.int(summary.turns)}턴</small></button></div></div>`;
     }
 
-    async bookDetailHtml(world, title, route) {
-      const summary = await this.bookSummary();
+    bookDetailHtml(world, title, route, summary) {
+      const description = world.storyDescription || '';
+      const tab = route.tab || (description ? 'intro' : 'toc');
+      const updated = world.sync?.lastAt ? new Date(world.sync.lastAt).toLocaleDateString('ko-KR', { year: 'numeric', month: '2-digit', day: '2-digit' }) : '-';
+      const original = world.storyName && world.storyName !== title ? `<div class="bk-line"><b>${this.esc(world.storyName)}</b> <i>원작</i></div>` : '';
+      const tocItems = route.tocAll ? summary.toc : summary.toc.slice(0, 10);
+      const toc = summary.toc.length
+        ? `<ol class="bk-toc">${tocItems.map((entry) => `<li><b>${entry.number}화</b><span>${this.esc([entry.place, entry.time].filter(Boolean).join(' · '))}</span><i>${entry.from === entry.to ? `${entry.from}턴` : `${entry.from}–${entry.to}턴`}</i></li>`).join('')}</ol>${summary.toc.length > tocItems.length ? `<button class="bk-more" data-act="bk-toc-all">${summary.toc.length - tocItems.length}개 더보기</button>` : ''}`
+        : '<p class="bk-empty">-</p>';
+      const intro = `<p class="bk-intro ${route.introAll ? '' : 'clamp'}">${this.esc(description)}</p>${!route.introAll && description.length > 260 ? '<button class="bk-more" data-act="bk-intro-all">더보기</button>' : ''}`;
+      const tabs = description ? `<div class="bk-tabs"><button class="${tab === 'intro' ? 'on' : ''}" data-act="bk-tab" data-tab="intro">작품 소개</button><button class="${tab === 'toc' ? 'on' : ''}" data-act="bk-tab" data-tab="toc">목차</button></div>` : '<div class="bk-tabs"><button class="on" disabled>목차</button></div>';
+      return `<div class="bk-page"><div class="bk-top"><button class="bk-iconbtn" data-act="bk-back" aria-label="뒤로">${icon('back', 22)}</button></div>
+<div class="bk-head">${this.bkCoverHtml(title)}<div class="bk-info"><div class="bk-crumb">캐릭터채팅<span>›</span>웹소설</div><h1 class="bk-title">${this.esc(title || '제목 확인 중')}</h1>${original}<div class="bk-line">총 ${Fmt.int(summary.episodes)}화 · ${Fmt.int(summary.turns)}턴</div></div></div>
+<div class="bk-table"><div class="bk-table-k">EPUB</div><div class="bk-table-rows"><div><span>분량</span><b>${Fmt.int(summary.turns)}턴</b></div><div><span>회차</span><b>총 ${Fmt.int(summary.episodes)}화</b></div><div><span>업데이트</span><b>${this.esc(updated)}</b></div></div></div>
+<div class="bk-sep"></div><section class="bk-sec"><h2>작품 정보</h2>${tabs}${tab === 'intro' && description ? intro : toc}</section><div class="bk-grow"></div>
+<div class="bk-bar"><button class="bk-barbtn" data-act="bk-options" aria-label="EPUB 설정">${icon('gear', 22)}</button><button class="bk-buy" data-act="bk-export" ${title ? '' : 'disabled'}>EPUB 다운로드</button></div></div>`;
+    }
+
+    openBookOptions() {
       const options = this.bookOptions();
-      const updated = world.sync?.lastAt ? new Date(world.sync.lastAt).toLocaleString('ko-KR', { year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '동기화 전';
-      const tocItems = route.tocAll ? summary.toc : summary.toc.slice(0, 8);
-      const toc = summary.toc.length ? `<ol class="bk-toc">${tocItems.map((entry) => `<li><b>${entry.number}화</b><span>${this.esc([entry.place, entry.time].filter(Boolean).join(' · ') || '장면 정보 없음')}</span><em>${entry.from === entry.to ? `${entry.from}턴` : `${entry.from}–${entry.to}턴`}</em></li>`).join('')}</ol>${summary.toc.length > tocItems.length ? `<button class="bk-more" data-act="bk-toc-all">${summary.toc.length - tocItems.length}개 회차 더 보기</button>` : ''}` : '<p class="bk-intro">아직 동기화된 턴이 없습니다.</p>';
-      return `<div class="bk-top"><button class="bk-iconbtn" data-act="bk-back" aria-label="뒤로">${icon('back', 20)}</button><h1>작품 상세</h1><span></span></div>
-<div class="bk-hero">${this.bkCover(title, 'l')}</div>
-<div class="bk-head"><div class="bk-kicker">캐릭터채팅 · 웹소설형 EPUB</div><h1 class="bk-title">${this.esc(title || '채팅방 제목 확인 중')}</h1><div class="bk-author">Crack 캐릭터채팅 기록</div><div class="bk-meta">총 ${Fmt.int(summary.episodes)}화 · ${Fmt.int(summary.turns)}턴 · 약 ${Fmt.int(summary.characters)}자</div></div>
-<div class="bk-cta"><button class="bk-primary" data-act="bk-export" ${title ? '' : 'disabled'}>${icon('download', 20)}EPUB 다운로드</button><div class="bk-cta-note">${title ? 'EPUB 3 · 전체 활성 분기 로그 · 외부 전자책 앱에서 읽기' : '채팅방 제목을 확인한 뒤 다운로드할 수 있습니다'}</div></div>
-<div class="bk-section"><h2>작품 정보</h2><dl class="bk-info"><dt>회차</dt><dd>총 ${Fmt.int(summary.episodes)}화 · 장소/날짜 변화 기준 자동 구분</dd><dt>분량</dt><dd>동기화된 ${Fmt.int(summary.turns)}턴 · 약 ${Fmt.int(summary.characters)}자 (정리 전) · EPUB은 다운로드할 때 Crack에서 전체 로그를 다시 받아 만듭니다</dd><dt>업데이트</dt><dd>${this.esc(updated)}</dd><dt>원본</dt><dd>Crack 캐릭터채팅 · 현재 활성 분기</dd><dt>형식</dt><dd>EPUB 3 · 이미지 포함 가능</dd></dl></div>
-<div class="bk-section"><h2>작품 소개</h2><p class="bk-intro">「${this.esc(title || '제목 확인 중')}」 캐릭터채팅의 전체 로그를 채팅 UI 흔적 없이 하나의 웹소설 본문으로 이은 개인 소장용 EPUB입니다. 본문은 원문 그대로이며, 상태창·단축 명령·로어 컨텍스트만 걷어 내고 시간과 장소가 바뀌는 곳에만 장면 구분을 넣습니다.</p></div>
-<div class="bk-section"><h2>내보내기 설정</h2><label class="bk-field"><span>내 캐릭터 이름 (대사 형식 통일용 · 비우면 Crack 프로필 이름 사용)</span><input data-book-setting="userName" value="${this.esc(options.userName)}" placeholder="예: 유진" autocomplete="off"></label><p class="bk-hint">이름을 확인할 수 없으면 사용자 대사는 원문 형식 그대로 둡니다.</p><label class="bk-toggle"><span>사용자 대사를 「이름 | "대사"」 형식으로 통일</span><input type="checkbox" data-book-setting="unifyDialogue" ${options.unifyDialogue ? 'checked' : ''}></label><label class="bk-toggle"><span>시간·장소가 바뀔 때 장면 구분 표시</span><input type="checkbox" data-book-setting="sceneMarkers" ${options.sceneMarkers ? 'checked' : ''}></label><label class="bk-toggle"><span>로그 속 이미지를 EPUB에 포함</span><input type="checkbox" data-book-setting="includeImages" ${options.includeImages ? 'checked' : ''}></label></div>
-<div class="bk-section"><h2>목차 <small>${Fmt.int(summary.episodes)}화</small></h2>${toc}<p class="bk-hint">동기화된 로그 기준 미리보기입니다.</p></div>`;
+      const toggle = (key, label) => `<label class="bk-stoggle"><span>${label}</span><input type="checkbox" data-book-setting="${key}" ${options[key] ? 'checked' : ''}></label>`;
+      this.openSheet(`<div class="sh-grab"></div><h2 class="sh-title">EPUB 설정</h2><label class="bk-sfield"><span>내 캐릭터 이름</span><input data-book-setting="userName" value="${this.esc(options.userName)}" placeholder="Crack 프로필 이름 사용" autocomplete="off"></label>${toggle('unifyDialogue', '내 대사를 「이름 | "대사"」로 통일')}${toggle('sceneMarkers', '시간·장소 구분 표시')}${toggle('includeImages', '이미지 포함')}<button class="sh-btn" data-sheet-close>완료</button>`, { dismissible: true });
     }
 
     async startEpubExport(button) {
@@ -4440,7 +4606,7 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
         this.bookExporter ||= new BookExporter(this.engine);
         const done = await this.bookExporter.export(this.bookOptions(), (id, detail) => setStep(id, detail));
         setStep('done', '');
-        const notes = [`${done.fileName}`, `${done.chapters}화 · ${Fmt.int(done.messages)}개 메시지 · 이미지 ${done.images.embedded}개 포함${done.images.failed ? ` · ${done.images.failed}개는 받지 못해 제외` : ''}`];
+        const notes = [`${done.fileName}`, `${done.chapters}화 · 이미지 ${done.images.embedded}개${done.images.failed ? ` · ${done.images.failed}개 제외` : ''} · 표지 ${done.coverFromThumbnail ? '채팅방 썸네일' : '기본 표지'}`];
         if (done.warning) notes.push(done.warning);
         result.hidden = false; result.dataset.kind = 'ok'; result.textContent = notes.join('\n');
         close.hidden = false;
@@ -4583,7 +4749,7 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
       const s = this.getSettings();
       const reader = s.pixivReader;
       const select = (key, options) => `<select data-reader-setting="${key}">${options.map(([value, label]) => `<option value="${value}" ${reader[key] === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`;
-      return `${this.stHeader('Fanwork')}<div class="st-section">생성</div><div class="st-card"><label class="st-field"><span>Language</span><input data-setting="fanworkLanguage" value="${this.esc(s.fanworkLanguage)}"></label><label class="st-field"><span>Target length (characters) · 8,000 초과 시 개요 → 3섹션 → continuity check</span><input type="number" min="500" max="30000" data-setting="fanworkTargetLength" value="${s.fanworkTargetLength}"></label><label class="st-inline"><span>Streaming</span><input type="checkbox" data-setting="streaming" ${s.streaming ? 'checked' : ''}></label></div><div class="st-section">Reader</div><div class="st-card"><label class="st-field"><span>글자 크기</span>${select('size', [['s', '작게'], ['m', '보통'], ['l', '크게']])}</label><label class="st-field"><span>글꼴</span>${select('font', [['gothic', '고딕'], ['mincho', '명조']])}</label><label class="st-field"><span>배경</span>${select('theme', [['light', '화이트'], ['sepia', '세피아'], ['dark', '다크']])}</label></div>`;
+      return `${this.stHeader('Fanwork')}<div class="st-section">생성</div><div class="st-card"><label class="st-field"><span>Language</span><input data-setting="fanworkLanguage" value="${this.esc(s.fanworkLanguage)}"></label><label class="st-field"><span>본문 길이</span><select data-setting="fanworkLengthMode"><option value="auto" ${s.fanworkLengthMode === 'auto' ? 'selected' : ''}>작품마다 자동 (단편 중심)</option><option value="custom" ${s.fanworkLengthMode === 'custom' ? 'selected' : ''}>직접 지정</option></select></label>${s.fanworkLengthMode === 'custom' ? `<label class="st-field"><span>Target length (characters) · 8,000 초과 시 개요 → 3섹션 → continuity check</span><input type="number" min="500" max="30000" data-setting="fanworkTargetLength" value="${s.fanworkTargetLength}"></label>` : ''}<label class="st-inline"><span>Streaming</span><input type="checkbox" data-setting="streaming" ${s.streaming ? 'checked' : ''}></label></div><div class="st-section">Reader</div><div class="st-card"><label class="st-field"><span>글자 크기</span>${select('size', [['s', '작게'], ['m', '보통'], ['l', '크게']])}</label><label class="st-field"><span>글꼴</span>${select('font', [['gothic', '고딕'], ['mincho', '명조']])}</label><label class="st-field"><span>배경</span>${select('theme', [['light', '화이트'], ['sepia', '세피아'], ['dark', '다크']])}</label></div>`;
     }
 
     stDataHtml() {
@@ -4741,6 +4907,9 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
           case 'bk-open': return this.push({ type: 'book' }, 'books');
           case 'bk-back': return this.back();
           case 'bk-toc-all': return this.replace({ ...route, tocAll: true }, { keepScroll: true });
+          case 'bk-intro-all': return this.replace({ ...route, introAll: true }, { keepScroll: true });
+          case 'bk-tab': return this.replace({ ...route, tab: target.dataset.tab }, { keepScroll: true });
+          case 'bk-options': return this.openBookOptions();
           case 'bk-export': return this.startEpubExport(target);
           default: return;
         }
@@ -4940,10 +5109,11 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
           if (input.type === 'number') value = Number(value);
           settings[input.dataset.setting] = value;
           if (input.dataset.setting === 'vertexOAuthClientId') await this.engine.gemini.clearVertexToken();
+          if (input.dataset.setting === 'fanworkTargetLength') settings.fanworkLengthMode = 'custom'; // typing a length is a deliberate choice
           await this.saveSettings(settings);
           if (input.dataset.setting === 'uiScale') this.host.style.setProperty('--ui-scale', String(this.getSettings().uiScale));
           this.notify('success', '설정을 저장했습니다.');
-          if (['customModelId', 'apiKey', 'appCheckMode', 'appCheckSiteKey', 'appCheckDebugToken', 'firebaseLocation', 'vertexProjectId', 'vertexLocation', 'vertexApiVersion', 'vertexOAuthClientId'].includes(input.dataset.setting)) await this.render({ keepScroll: true });
+          if (['customModelId', 'apiKey', 'appCheckMode', 'appCheckSiteKey', 'appCheckDebugToken', 'firebaseLocation', 'vertexProjectId', 'vertexLocation', 'vertexApiVersion', 'vertexOAuthClientId', 'fanworkLengthMode', 'fanworkTargetLength'].includes(input.dataset.setting)) await this.render({ keepScroll: true });
           return;
         }
         if (input.matches('[data-import-file]') && input.files?.[0]) {
