@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RP Fanverse
 // @namespace    https://crack.wrtn.ai/
-// @version      0.12.7
+// @version      0.12.8
 // @description  Treats a Crack RP episode as canon and grows a persistent virtual Pixiv/Reddit fandom around it.
 // @author       Personal userscript
 // @match        https://crack.wrtn.ai/stories/*/episodes/*
@@ -25,7 +25,7 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '0.12.7';
+  const APP_VERSION = '0.12.8';
   const DB_NAME = 'rp-fanverse';
   const DB_VERSION = 1;
   const SETTINGS_KEY = 'rp-fanverse:settings:v1';
@@ -33,7 +33,7 @@
   // the internal prompts are code, and the only user-editable text is globalGeminiInstruction.
   const LEGACY_PROMPTS_KEY = 'rp-fanverse:prompt-overrides:v1';
   const VERTEX_TOKEN_KEY = 'rp-fanverse:vertex-token:v1';
-  const SETTINGS_VERSION = 5;
+  const SETTINGS_VERSION = 6;
   const WORLD_RE = /^\/stories\/([^/]+)\/episodes\/([^/?#]+)/;
   const API_BASE = 'https://crack-api.wrtn.ai/crack-gen/v3';
   const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
@@ -74,7 +74,8 @@
     appCheckSiteKey: '',
     appCheckDebugToken: '',
     globalGeminiInstruction: DEFAULT_GLOBAL_INSTRUCTION,
-    turnsPerUpdate: 5,
+    // 0.12.8: the fandom updates after every completed RP turn.
+    turnsPerUpdate: 1,
     activity: 'Normal',
     fanworkLanguage: '日本語',
     fanworkTargetLength: 2000,
@@ -178,6 +179,9 @@
     result.appCheckDebugToken = String(result.appCheckDebugToken || '').trim();
     // An empty string is a deliberate "no common instruction"; only a missing value gets the default.
     result.globalGeminiInstruction = typeof source.globalGeminiInstruction === 'string' ? source.globalGeminiInstruction : DEFAULT_GLOBAL_INSTRUCTION;
+    // 0.12.8: per-turn updates. Settings saved before version 6 that still hold the old default (5)
+    // follow the new default; any other saved value was chosen by the user and is kept.
+    if ((Number(source.settingsVersion) || 0) < 6 && Number(source.turnsPerUpdate) === 5) result.turnsPerUpdate = DEFAULT_SETTINGS.turnsPerUpdate;
     result.turnsPerUpdate = Math.round(clampNumber(result.turnsPerUpdate, 1, 100, DEFAULT_SETTINGS.turnsPerUpdate));
     // 0.12.7: fanworks are short by default. A saved length equal to the old default (4000) was never
     // chosen by the user, so it follows the new default; any other saved length is kept as the user's choice.
@@ -1345,8 +1349,8 @@ ${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family
       promptDefinitions: PROMPT_DEFINITIONS,
       defaultPromptTemplates: DEFAULT_PROMPT_TEMPLATES,
     };
-    return;
   }
+  const NODE_TEST_MODE = typeof window === 'undefined' || !window.document;
 
   // GM storage that never takes startup down. If the GM_* grants are unavailable (for example a
   // damaged metadata block), values live in memory for this page view only; they are deliberately
@@ -2358,35 +2362,194 @@ ${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family
     };
   }
 
+  // ---------- world-scoped async operations (0.12.8) ----------
+  // FanverseEngine is one object whose `world`/`worldInfo` are replaced when the user opens another
+  // room, while syncs and Gemini calls for the previous room may still be awaiting. Each async world
+  // operation therefore captures its world when it starts (worldId, storyId, episodeId, the attach
+  // generation and the world object) and runs on a scoped view of the engine in which `world`,
+  // `worldInfo`, `db` and `notify` are bound to that capture. Every write through the scoped db first
+  // checks that the capture is still the attached world (else StaleWorldError: the result is dropped)
+  // and that each row belongs to the captured world (else the write is refused and logged).
+  class StaleWorldError extends Error {
+    constructor(context, detail = '') {
+      super(`Fanverse operation for ${context?.worldId || 'an earlier room'} is stale${detail ? ` (${detail})` : ''}`);
+      this.name = 'StaleWorldError'; this.stale = true; this.worldId = context?.worldId || null;
+    }
+  }
+  const isStaleWorldError = (error) => Boolean(error && (error.stale === true || error.name === 'StaleWorldError'));
+
+  // Turns processed per sync call at most; a longer backlog continues on the next poll.
+  const MAX_TURN_UPDATES_PER_SYNC = 3;
+  // A first sync with more turns than this asks for a history import instead of per-turn updates
+  // (the 0.12.7 threshold was turnsPerUpdate × 2 with the old default 5).
+  const IMPORT_PROMPT_TURNS = 10;
+  const SHIP_HISTORY_LIMIT = 300;
+  const SHIP_HISTORY_TAGS = 40;
+
+  function scopedDatabase(db, engine, context) {
+    const owner = (storeName, row) => (storeName === STORES.worlds ? row?.id : row?.worldId);
+    const assertWritable = (storeName, rows, action) => {
+      if (!engine.isCurrentWorld(context)) throw new StaleWorldError(context, `${action} ${storeName}`);
+      for (const row of rows) {
+        const rowWorld = owner(storeName, row);
+        if (rowWorld !== context.worldId) {
+          console.error('[RP Fanverse] refused cross-world write', { store: storeName, action, expectedWorldId: context.worldId, rowWorldId: rowWorld ?? null });
+          throw new Error(`다른 방의 ${storeName} 기록 저장을 거부했습니다 (Fanverse world 불일치).`);
+        }
+      }
+    };
+    // Store keys are global, so a row whose key already belongs to another room would replace it.
+    // Message keys contain the worldId; every other world-scoped store is checked row by row.
+    const assertNoForeignKey = async (storeName, rows, action) => {
+      assertWritable(storeName, rows, action);
+      if (storeName === STORES.worlds || storeName === STORES.messages) return;
+      for (const row of rows) {
+        const existing = await db.get(storeName, row.id);
+        if (existing && existing.worldId !== context.worldId) {
+          console.error('[RP Fanverse] refused overwrite of another room\'s row', { store: storeName, action, key: row.id, expectedWorldId: context.worldId, existingWorldId: existing.worldId ?? null });
+          throw new Error(`다른 방의 ${storeName} 기록을 덮어쓰지 않았습니다 (Fanverse key 충돌).`);
+        }
+      }
+      assertWritable(storeName, rows, action); // the reads above awaited: check the room again
+    };
+    const assertWorldId = (worldId, action) => {
+      if (worldId === context.worldId) return;
+      console.error('[RP Fanverse] refused cross-world access', { action, expectedWorldId: context.worldId, worldId });
+      throw new Error('다른 방의 Fanverse 데이터 접근을 거부했습니다.');
+    };
+    return {
+      open: () => db.open(),
+      get: (storeName, key) => db.get(storeName, key),
+      getAll: (storeName) => db.getAll(storeName),
+      async getAllByWorld(storeName, worldId) { assertWorldId(worldId, `read ${storeName}`); return db.getAllByWorld(storeName, worldId); },
+      async put(storeName, value) { await assertNoForeignKey(storeName, [value], 'put'); return db.put(storeName, value); },
+      async bulkPut(storeName, values) { await assertNoForeignKey(storeName, values || [], 'bulkPut'); return db.bulkPut(storeName, values); },
+      async deleteWhereWorld(storeName, worldId, predicate) { assertWorldId(worldId, `delete ${storeName}`); assertWritable(storeName, [], 'delete'); return db.deleteWhereWorld(storeName, worldId, predicate); },
+      async deleteWorld(worldId, options) { assertWorldId(worldId, 'delete world'); assertWritable(STORES.worlds, [], 'delete world'); return db.deleteWorld(worldId, options); },
+    };
+  }
+
+  // Rollback without replacing the object, so the attached world keeps its identity.
+  function restoreWorldInPlace(target, snapshot) {
+    for (const key of Object.keys(target)) if (!(key in snapshot)) delete target[key];
+    Object.assign(target, snapshot);
+  }
+
   class FanverseEngine {
     constructor(db, api, dom, gemini, getSettings, notify) {
       this.db = db; this.api = api; this.dom = dom; this.gemini = gemini;
       this.getSettings = getSettings; this.notify = notify;
-      this.worldInfo = null; this.world = null; this.syncing = false; this.updating = false;
+      this.worldInfo = null; this.world = null;
+      this.generation = 0; // bumped by attach(): operations captured before it are stale
+      this.locks = { sync: new Map(), update: new Map() }; // worldId -> { generation }
+      this.checkedAt = { title: new Map(), meta: new Map() }; // worldId -> last check (ms)
+      this.onFanContent = null; // (summary) => void · only for the attached world
+    }
+
+    // True while the attached world has a sync of the current attach running. A sync left over from an
+    // earlier visit does not count (and does not block a new one).
+    get syncing() { const root = this.__engine || this; const holder = this.world && root.locks.sync.get(this.world.id); return Boolean(holder && holder.generation === root.generation); }
+    // True while any fandom update for this world runs (including one being dropped as stale).
+    get updating() { const root = this.__engine || this; return Boolean(this.world && root.locks.update.get(this.world.id)); }
+
+    captureWorld() {
+      if (!this.world || !this.worldInfo || this.world.id !== this.worldInfo.id) return null;
+      return Object.freeze({ worldId: this.world.id, storyId: this.worldInfo.storyId, episodeId: this.worldInfo.episodeId, generation: this.generation, world: this.world, info: this.worldInfo, produced: { reddit: 0, pixiv: 0, trends: 0 } });
+    }
+
+    isCurrentWorld(context) {
+      const root = this.__engine || this;
+      return Boolean(context) && context.generation === root.generation && root.world === context.world && root.worldInfo === context.info && root.world?.id === context.worldId;
+    }
+
+    scoped(context) {
+      const view = Object.create(this);
+      Object.defineProperties(view, {
+        __engine: { value: this }, __context: { value: context },
+        world: { value: context.world }, worldInfo: { value: context.info },
+        db: { value: scopedDatabase(this.db, this, context) },
+        notify: { value: (kind, message) => { if (this.isCurrentWorld(context)) this.notify(kind, message); } },
+      });
+      return view;
+    }
+
+    // Runs task(view) for the attached world. Nested calls reuse the caller's capture. A stale
+    // operation resolves to null (its result is not applied); other errors propagate.
+    async inWorld(name, task) {
+      if (this.__context) return task(this);
+      const context = this.captureWorld();
+      if (!context) return null;
+      try {
+        return await task(this.scoped(context));
+      } catch (error) {
+        if (!isStaleWorldError(error)) throw error;
+        console.info(`[RP Fanverse] ${name}: result for ${context.worldId} discarded (room changed)`);
+        return null;
+      }
+    }
+
+    acquire(kind, context) {
+      const root = this.__engine || this;
+      const holder = root.locks[kind].get(context.worldId);
+      // A sync from an earlier attach no longer blocks; an update of this world always finishes (or is dropped) first.
+      if (holder && (kind === 'update' || holder.generation === root.generation)) return null;
+      const token = { generation: context.generation };
+      root.locks[kind].set(context.worldId, token);
+      return token;
+    }
+
+    release(kind, context, token) {
+      const root = this.__engine || this;
+      if (root.locks[kind].get(context.worldId) === token) root.locks[kind].delete(context.worldId);
+    }
+
+    // Unread markers of the attached world (opening Reddit/Pixiv/CP Trends clears its own one only).
+    clearUnread(kind) {
+      const badges = this.world?.badges;
+      if (!badges || !badges[kind]) return false;
+      badges[kind] = 0;
+      badges.phone = (badges.reddit || 0) + (badges.pixiv || 0);
+      this.saveWorld().catch((error) => console.warn('[RP Fanverse] unread state not saved', error));
+      return true;
+    }
+
+    announceFanContent(context, before) {
+      const root = this.__engine || this;
+      const summary = { reddit: context.produced.reddit - before.reddit, pixiv: context.produced.pixiv - before.pixiv, trends: context.produced.trends - before.trends };
+      if (!summary.reddit && !summary.pixiv && !summary.trends) return;
+      if (!root.isCurrentWorld(context)) return; // stale: never touch the current room's UI
+      try { root.onFanContent?.({ ...summary, worldId: context.worldId }); } catch (error) { console.warn('[RP Fanverse] fan content refresh failed', error); }
     }
 
     async attach(info) {
-      this.worldInfo = info;
-      this.world = await this.db.get(STORES.worlds, info.id) || createWorld(info);
-      this.world.canonRevision = Number(this.world.canonRevision) || 1;
-      this.world.fandom ||= { interpretations: [], ships: [], tags: [], history: [] };
-      this.world.fandom.recentPlatformSignals ||= [];
-      this.world.fandom.history ||= [];
-      this.world.badges ||= { phone: 0, reddit: 0, pixiv: 0 };
+      const generation = ++this.generation; // every operation captured before this point is now stale
+      const world = await this.db.get(STORES.worlds, info.id) || createWorld(info);
+      if (generation !== this.generation) return this.world; // a newer attach() superseded this one
+      world.canonRevision = Number(world.canonRevision) || 1;
+      world.fandom ||= { interpretations: [], ships: [], tags: [], history: [] };
+      world.fandom.recentPlatformSignals ||= [];
+      world.fandom.history ||= [];
+      world.fandom.shipHistory ||= [];
+      world.badges ||= { phone: 0, reddit: 0, pixiv: 0 };
+      world.badges.trends ||= 0;
       // Worlds saved before 0.12.5 have no chatTitle; it is filled in by the next refreshChatTitle().
-      if (this.world.chatTitle === undefined) this.world.chatTitle = null;
-      this.chatTitleCheckedAt = 0;
-      this.roomMetaCheckedAt = 0;
-      await this.db.put(STORES.worlds, this.world);
-      return this.world;
+      if (world.chatTitle === undefined) world.chatTitle = null;
+      this.worldInfo = info; this.world = world;
+      this.checkedAt.title.delete(info.id);
+      this.checkedAt.meta.delete(info.id);
+      await this.db.put(STORES.worlds, world);
+      return world;
     }
 
     // Reads the open room's title from Crack (API first, then the room-link DOM fallback) and stores it
     // as world.chatTitle when it is new or changed. Never throws: a missing title must not affect sync.
-    async refreshChatTitle({ force = false } = {}) {
+    refreshChatTitle(options = {}) { return this.inWorld('chat title', (engine) => engine.refreshChatTitleInWorld(options)); }
+
+    async refreshChatTitleInWorld({ force = false } = {}) {
       if (!this.world || !this.worldInfo) return false;
-      if (!force && this.world.chatTitle && Date.now() - this.chatTitleCheckedAt < 5 * 60 * 1000) return false;
-      this.chatTitleCheckedAt = Date.now();
+      const checked = (this.__engine || this).checkedAt.title;
+      if (!force && this.world.chatTitle && Date.now() - (checked.get(this.world.id) || 0) < 5 * 60 * 1000) return false;
+      checked.set(this.world.id, Date.now());
       let found = null;
       try { found = await this.api.fetchChatRoomTitle(this.worldInfo); } catch (error) { console.warn('[RP Fanverse] chat title via API unavailable:', error.message); }
       if (!found) {
@@ -2403,10 +2566,13 @@ ${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family
     // Books metadata of the open room, from the same Crack room object as the title: world.chatCover
     // ({ url, source, updatedAt }), world.storyName, world.storyDescription. API first, then the
     // room-link image in the DOM. Throttled; never throws (Books then shows a neutral placeholder).
-    async refreshRoomMeta({ force = false } = {}) {
+    refreshRoomMeta(options = {}) { return this.inWorld('room meta', (engine) => engine.refreshRoomMetaInWorld(options)); }
+
+    async refreshRoomMetaInWorld({ force = false } = {}) {
       if (!this.world || !this.worldInfo) return false;
-      if (!force && this.roomMetaCheckedAt && Date.now() - this.roomMetaCheckedAt < 5 * 60 * 1000) return false;
-      this.roomMetaCheckedAt = Date.now();
+      const checked = (this.__engine || this).checkedAt.meta;
+      if (!force && checked.get(this.world.id) && Date.now() - checked.get(this.world.id) < 5 * 60 * 1000) return false;
+      checked.set(this.world.id, Date.now());
       let meta = null;
       try { meta = await this.api.fetchChatRoomMeta(this.worldInfo); } catch (error) { console.warn('[RP Fanverse] room metadata via API unavailable:', error.message); }
       let cover = meta?.cover || null;
@@ -2453,9 +2619,15 @@ ${lines.map((line, index) => `<text x="600" y="${620 + index * 130}" font-family
 
     // silent: automatic/background syncs (polling, page entry). They show no progress/success toast;
     // abnormal states (DOM fallback, branch change) and errors are still reported.
-    async sync({ full = false, onProgress = null, allowUpdate = true, silent = false } = {}) {
-      if (this.syncing || !this.worldInfo) return null;
-      this.syncing = true;
+    sync(options = {}) { return this.inWorld('sync', (engine) => engine.syncInWorld(options)); }
+
+    // Runs on the scoped view: this.worldInfo/this.world are the room the sync started in, so the
+    // request (episodeId) and every stored row (worldId, pk) refer to that same room.
+    async syncInWorld({ full = false, onProgress = null, allowUpdate = true, silent = false } = {}) {
+      const context = this.__context;
+      if (!this.worldInfo) return null;
+      const lock = this.acquire('sync', context);
+      if (!lock) return null;
       const wasNeverSynced = this.world.sync.status === 'new';
       const previousAdapter = this.world.sync.adapter;
       if (!silent) this.notify('sync', '원작 로그 동기화 중…');
@@ -2496,12 +2668,12 @@ ${this.world.sync.error}`);
           this.notify('sync', `API 동기화 완료 · ${turns.length} turns`);
         }
         await this.refreshChatTitle();
-        if (wasNeverSynced && turns.length > this.getSettings().turnsPerUpdate * 2) this.world.needsImport = true;
+        if (wasNeverSynced && turns.length > Math.max(IMPORT_PROMPT_TURNS, this.getSettings().turnsPerUpdate * 2)) this.world.needsImport = true;
         await this.saveWorld();
         if (allowUpdate && !this.world.needsImport && !this.world.needsCanonRebuild) await this.maybeUpdate(turns);
         return { messages: active, turns };
       } finally {
-        this.syncing = false;
+        this.release('sync', context, lock);
       }
     }
 
@@ -2514,24 +2686,32 @@ ${this.world.sync.error}`);
       return buildTurns(active);
     }
 
-    async maybeUpdate(turns = null) {
+    maybeUpdate(turns = null) { return this.inWorld('auto update', (engine) => engine.maybeUpdateInWorld(turns)); }
+
+    // Each completed turn gets its own update (turnsPerUpdate, default 1), oldest first. A backlog is
+    // worked off MAX_TURN_UPDATES_PER_SYNC updates per call; the next sync continues it.
+    async maybeUpdateInWorld(turns = null) {
       const settings = this.getSettings();
       if (!settings.autoUpdate || this.updating) return;
+      const root = this.__engine || this;
       const activeTurns = turns || await this.allActiveTurns();
-      const processed = new Set(this.world.processedTurnIds);
-      const unprocessed = activeTurns.filter((turn) => !processed.has(turn.id));
-      if (unprocessed.length < settings.turnsPerUpdate) return;
-      if (!this.gemini.providerReady()) {
-        // Turns are kept unprocessed, so the update simply runs once the provider is usable again.
-        if (!this.warnedProviderUnready) {
-          this.warnedProviderUnready = true;
-          const reason = { developer: 'Gemini Developer API key가 없어', vertex: 'Vertex access token이 없거나 만료되어', firebase: 'Firebase AI 설정이 없거나 초기화에 실패해' }[settings.provider] || 'AI 연결을 사용할 수 없어';
-          this.notify('error', `${reason} 자동 갱신을 보류했습니다. Settings > AI에서 확인하세요.`);
+      for (let round = 0; round < MAX_TURN_UPDATES_PER_SYNC; round += 1) {
+        const processed = new Set(this.world.processedTurnIds);
+        const unprocessed = activeTurns.filter((turn) => !processed.has(turn.id));
+        if (unprocessed.length < settings.turnsPerUpdate) return;
+        if (!this.gemini.providerReady()) {
+          // Turns are kept unprocessed, so the update simply runs once the provider is usable again.
+          if (!root.warnedProviderUnready) {
+            root.warnedProviderUnready = true;
+            const reason = { developer: 'Gemini Developer API key가 없어', vertex: 'Vertex access token이 없거나 만료되어', firebase: 'Firebase AI 설정이 없거나 초기화에 실패해' }[settings.provider] || 'AI 연결을 사용할 수 없어';
+            this.notify('error', `${reason} 자동 갱신을 보류했습니다. Settings > AI에서 확인하세요.`);
+          }
+          return;
         }
-        return;
+        root.warnedProviderUnready = false;
+        const done = await this.runFandomUpdate(unprocessed.slice(0, settings.turnsPerUpdate));
+        if (done !== true) return;
       }
-      this.warnedProviderUnready = false;
-      await this.runFandomUpdate(unprocessed.slice(0, settings.turnsPerUpdate));
     }
 
     canonSnapshot() {
@@ -2619,7 +2799,7 @@ ${this.world.sync.error}`);
       this.world.canon.facts.push(...facts.filter((item) => !known.has(item.id)));
       for (const update of result.characterUpdates || []) this.world.canon.characters.push({ ...update, id: Utils.uid('character'), addedTurn: currentTurn });
       for (const update of result.relationshipUpdates || []) this.world.canon.relationships.push({ ...update, id: Utils.uid('relationship'), addedTurn: currentTurn });
-      const events = (result.newCanonEvents || []).map((event) => ({ ...event, id: `canon_${Utils.hash(`${event.title}:${event.sourceTurnIds?.join(',')}`)}`, worldId: this.world.id, turn: currentTurn, createdAt: new Date().toISOString() }));
+      const events = (result.newCanonEvents || []).map((event) => ({ ...event, id: `canon_${Utils.hash(`${this.world.id}:${event.title}:${event.sourceTurnIds?.join(',')}`)}`, worldId: this.world.id, turn: currentTurn, createdAt: new Date().toISOString() }));
       await this.db.bulkPut(STORES.canonEvents, events);
       this.world.canon.recentEventIds = [...this.world.canon.recentEventIds, ...events.map((event) => event.id)].slice(-80);
       return events;
@@ -2633,7 +2813,12 @@ ${this.world.sync.error}`);
       }), Schemas.fandom, { retries: 1, temperature: 0.65 });
       const interpretations = (fandomResult.interpretations || []).map((item) => ({ ...item, id: Utils.uid('interpretation'), addedTurn: currentTurn }));
       this.world.fandom.interpretations.push(...interpretations);
+      const shipsBefore = new Map(this.world.fandom.ships.map((ship) => [ship.tag, Number(ship.momentum) || 0]));
       this.world.fandom.ships = this.mergeMomentum(this.world.fandom.ships, fandomResult.shipDeltas, currentTurn);
+      if (this.recordShipHistory(shipsBefore, fandomResult.shipDeltas, currentTurn, fan)) {
+        this.world.badges.trends = (Number(this.world.badges.trends) || 0) + 1;
+        if (this.__context) this.__context.produced.trends += 1;
+      }
       this.world.fandom.tags = this.mergeMomentum(this.world.fandom.tags, fandomResult.tagDeltas, currentTurn);
       const pending = (fandomResult.pendingEvents || []).map((event) => {
         const kind = ['reddit', 'pixiv', 'cross'].includes(event.kind) ? event.kind : 'reddit';
@@ -2644,6 +2829,19 @@ ${this.world.sync.error}`);
         return { ...event, id, kind, dueTurn, expiryTurn, sourceCanonEventIds, worldId: this.world.id, createdTurn: currentTurn, branchRevision: this.world.canonRevision, status: 'pending', generated: false, generatedPlatforms: { reddit: false, pixiv: false } };
       });
       const existingPending = new Map((await this.db.getAllByWorld(STORES.pendingEvents, this.world.id)).map((event) => [event.id, event]));
+      // A new RP turn always gets fresh Reddit and Pixiv content: when nothing (this update's events or
+      // older delayed ones) is due for a platform now, one immediate event for that platform is added.
+      // Its id is fixed per world/revision/platform/turn, so a retried turn never doubles it.
+      if (!canonUpdate?.backfill) {
+        const merged = new Map(existingPending);
+        for (const event of pending) merged.set(event.id, merged.get(event.id) || event);
+        const due = planPendingExecution([...merged.values()], currentTurn, this.world.canonRevision);
+        for (const kind of ['reddit', 'pixiv']) {
+          if (due[kind].length) continue;
+          const immediate = this.immediateTurnEvent(kind, currentTurn, fandomResult.reactionPoints, canonEvents);
+          if (!existingPending.has(immediate.id) && !pending.some((event) => event.id === immediate.id)) pending.push(immediate);
+        }
+      }
       const dedupedPending = pending.map((event) => {
         const existing = existingPending.get(event.id);
         if (!existing) return event;
@@ -2653,6 +2851,43 @@ ${this.world.sync.error}`);
       await this.executePendingEvents(currentTurn, { immediate: fandomResult.reactionPoints || [], canonEvents, interpretations });
       this.world.fandom.history.push({ turn: currentTurn, at: new Date().toISOString(), canonEventIds: canonEvents.map((event) => event.id), interpretationIds: interpretations.map((item) => item.id) });
       return { fandomResult, interpretations };
+    }
+
+    // Same shape as a Gemini pendingEvent, due now, from this turn's reaction points (or its new scenes).
+    immediateTurnEvent(kind, currentTurn, reactionPoints = [], canonEvents = []) {
+      const points = (reactionPoints || []).slice().sort((a, b) => (Number(b.heat) || 0) - (Number(a.heat) || 0));
+      const sourceCanonEventIds = [...new Set([...points.flatMap((point) => point.sourceCanonEventIds || []), ...canonEvents.map((event) => event.id)])].filter(Boolean).slice(0, 12);
+      const summary = points.slice(0, 3).map((point) => point.summary).filter(Boolean).join(' / ')
+        || canonEvents.map((event) => event.title || event.summary).filter(Boolean).slice(0, 3).join(' / ')
+        || '이번 RP 장면';
+      return {
+        kind, dueTurn: currentTurn, expiryTurn: currentTurn + 20, payload: `즉각 반응: ${summary}`, sourceCanonEventIds,
+        id: `pending_${Utils.hash(`${this.world.id}:${this.world.canonRevision}:immediate:${kind}:${currentTurn}`)}`,
+        worldId: this.world.id, createdTurn: currentTurn, branchRevision: this.world.canonRevision, status: 'pending', generated: false,
+        generatedPlatforms: { reddit: false, pixiv: false }, immediate: true,
+      };
+    }
+
+    // One CP Trends point per fandom update: the merged momentum of the tracked ships plus this
+    // update's shipDeltas (value, reason, fan-facing scene). Only Gemini's existing output is stored.
+    // Returns true when a ship's momentum actually changed.
+    recordShipHistory(before, deltas, currentTurn, fan) {
+      const history = (this.world.fandom.shipHistory ||= []);
+      const ships = {}; const details = {}; const deltaMap = {};
+      for (const ship of this.world.fandom.ships.slice(0, SHIP_HISTORY_TAGS)) ships[ship.tag] = Number(ship.momentum) || 0;
+      let changed = false;
+      for (const delta of deltas || []) {
+        if (!delta?.tag) continue;
+        const after = Number(this.world.fandom.ships.find((ship) => ship.tag === delta.tag)?.momentum) || 0;
+        const ref = (delta.sourceCanonEventIds || []).map((id) => fan?.byEvent?.get(id)).find(Boolean);
+        ships[delta.tag] = after;
+        deltaMap[delta.tag] = Number(delta.momentumDelta) || 0;
+        details[delta.tag] = { change: after - (before.get(delta.tag) || 0), reason: this.fanText(String(delta.reason || '')).slice(0, 240), sceneLabel: ref?.sceneLabel || null, sceneEpisodeLabel: ref?.episodeLabel || null };
+        if (after !== (before.get(delta.tag) || 0)) changed = true;
+      }
+      history.push({ turn: currentTurn, episodeLabel: fan?.episodeLabelForTurnCount?.(currentTurn) || null, at: new Date().toISOString(), ships, deltas: deltaMap, details });
+      if (history.length > SHIP_HISTORY_LIMIT) history.splice(0, history.length - SHIP_HISTORY_LIMIT);
+      return changed;
     }
 
     async suspendPendingForBranchChange() {
@@ -2691,6 +2926,7 @@ ${this.world.sync.error}`);
           }
           return posts;
         } catch (error) {
+          if (isStaleWorldError(error)) throw error;
           for (const event of events) { event.status = 'failed'; event.lastError = `reddit: ${error.message}`; await this.db.put(STORES.pendingEvents, event); }
           this.notify('error', `Reddit pending event retry scheduled: ${error.message}`);
           return [];
@@ -2711,6 +2947,7 @@ ${this.world.sync.error}`);
           }
           return works;
         } catch (error) {
+          if (isStaleWorldError(error)) throw error;
           for (const event of events) { event.status = 'failed'; event.lastError = `pixiv: ${error.message}`; await this.db.put(STORES.pendingEvents, event); }
           this.notify('error', `Pixiv pending event retry scheduled: ${error.message}`);
           return [];
@@ -2735,11 +2972,18 @@ ${this.world.sync.error}`);
       return plan;
     }
 
-    async runFandomUpdate(turns) {
-      if (this.updating) return;
-      this.updating = true;
+    runFandomUpdate(turns) { return this.inWorld('fandom update', (engine) => engine.runFandomUpdateInWorld(turns)); }
+
+    // Resolves true when the update was applied, false when another update of this world is running.
+    async runFandomUpdateInWorld(turns) {
+      const context = this.__context;
+      const active = new Set(this.world.activeMessageIds || []);
+      if (!turns?.length || turns.some((turn) => !active.has(turn.userMessageId) || !active.has(turn.assistantMessageId))) throw new StaleWorldError(context, 'turns are not part of this room');
+      const lock = this.acquire('update', context);
+      if (!lock) return false;
       const currentTurn = this.world.lastProcessedTurn + turns.length;
       const worldBeforeUpdate = Utils.clone(this.world);
+      const producedBefore = { ...context.produced };
       try {
         this.notify('update', `Canon 분석 중 · ${turns.length} turns`);
         const canonResult = await this.extractCanon(turns);
@@ -2750,18 +2994,30 @@ ${this.world.sync.error}`);
         this.world.lastProcessedTurn = currentTurn;
         await this.saveWorld();
         this.notify('update', `Fanverse 갱신 완료 · turn ${currentTurn}`);
+        this.announceFanContent(context, producedBefore);
+        return true;
       } catch (error) {
-        await Promise.all([
-          this.db.deleteWhereWorld(STORES.canonEvents, this.world.id, (row) => row.turn === currentTurn),
-          this.db.deleteWhereWorld(STORES.redditPosts, this.world.id, (row) => row.turn === currentTurn),
-          this.db.deleteWhereWorld(STORES.pixivWorks, this.world.id, (row) => row.turn === currentTurn),
-          this.db.deleteWhereWorld(STORES.pendingEvents, this.world.id, (row) => row.createdTurn === currentTurn),
-        ]);
-        this.world = worldBeforeUpdate;
-        await this.saveWorld();
-        this.notify('error', `Fanverse update failed: ${error.message}`);
+        // Rows of this turn are removed from the room the update started in (context.worldId), never
+        // from whichever room is attached now. A stale update uses the raw store for that; the update
+        // lock of that room is still held, so no newer update of it can be affected.
+        const rollbackDb = isStaleWorldError(error) ? (this.__engine || this).db : this.db;
+        try {
+          await Promise.all([
+            rollbackDb.deleteWhereWorld(STORES.canonEvents, context.worldId, (row) => row.turn === currentTurn),
+            rollbackDb.deleteWhereWorld(STORES.redditPosts, context.worldId, (row) => row.turn === currentTurn),
+            rollbackDb.deleteWhereWorld(STORES.pixivWorks, context.worldId, (row) => row.turn === currentTurn),
+            rollbackDb.deleteWhereWorld(STORES.pendingEvents, context.worldId, (row) => row.createdTurn === currentTurn),
+          ]);
+          if (!isStaleWorldError(error)) {
+            restoreWorldInPlace(this.world, worldBeforeUpdate);
+            await this.saveWorld();
+          }
+        } catch (rollbackError) {
+          if (!isStaleWorldError(rollbackError)) console.warn('[RP Fanverse] update rollback incomplete', rollbackError);
+        }
+        if (!isStaleWorldError(error)) this.notify('error', `Fanverse update failed: ${error.message}`);
         throw error;
-      } finally { this.updating = false; }
+      } finally { this.release('update', context, lock); }
     }
 
     activityLimit(kind) {
@@ -2808,11 +3064,15 @@ ${this.world.sync.error}`);
       }
       this.world.fandom.recentPlatformSignals = [...(this.world.fandom.recentPlatformSignals || []), ...posts.filter((post) => post.score >= 100).map((post) => ({ kind: 'reddit', turn: currentTurn, summary: `Reddit 화제: ${post.title}`, score: post.score, sourceCanonEventIds: post.sourceCanonEventIds }))].slice(-30);
       this.world.badges.reddit += posts.length; this.world.badges.phone += posts.length;
+      if (this.__context) this.__context.produced.reddit += posts.length;
       return posts;
     }
 
-    async loadMoreRedditComments(post) {
+    loadMoreRedditComments(post) { return this.inWorld('more comments', (engine) => engine.loadMoreRedditCommentsInWorld(post)); }
+
+    async loadMoreRedditCommentsInWorld(post) {
       if (!post?.hasMoreComments) return post;
+      if (post.worldId !== this.world.id) throw new StaleWorldError(this.__context, 'post is from another room');
       const context = await this.buildCanonContext(post.sourceCanonEventIds || [], [post.title, post.body, ...(post.continuationTopics || [])]);
       const fan = await this.fanReferenceIndex().catch(() => null);
       const result = await this.gemini.generateJson(PromptLibrary.redditMoreComments({
@@ -2926,6 +3186,7 @@ ${this.world.sync.error}`);
       }
       this.world.fandom.recentPlatformSignals = [...(this.world.fandom.recentPlatformSignals || []), ...works.filter((work) => work.bookmarks >= 500).map((work) => ({ kind: 'pixiv', turn: currentTurn, summary: `Pixiv 인기작: ${work.title}`, bookmarks: work.bookmarks, tags: work.tags, sourceCanonEventIds: work.sourceCanonEventIds }))].slice(-30);
       this.world.badges.pixiv += works.length; this.world.badges.phone += works.length;
+      if (this.__context) this.__context.produced.pixiv += works.length;
       return works;
     }
 
@@ -2938,7 +3199,10 @@ ${this.world.sync.error}`);
       return work?.lengthPlanned && Number.isFinite(planned) && planned > 0 ? Math.round(clampNumber(planned, 300, 30000, settings.fanworkTargetLength)) : settings.fanworkTargetLength;
     }
 
-    async generateFanwork(work, onChunk) {
+    generateFanwork(work, onChunk) { return this.inWorld('fanwork', (engine) => engine.generateFanworkInWorld(work, onChunk)); }
+
+    async generateFanworkInWorld(work, onChunk) {
+      if (work?.worldId !== this.world.id) throw new StaleWorldError(this.__context, 'work is from another room');
       const cached = await this.db.get(STORES.fanworks, work.id);
       if (cached) return cached;
       const settings = this.getSettings();
@@ -2976,11 +3240,14 @@ ${this.world.sync.error}`);
       return record;
     }
 
-    async importHistory(onProgress) {
+    importHistory(onProgress) { return this.inWorld('history import', (engine) => engine.importHistoryInWorld(onProgress)); }
+
+    async importHistoryInWorld(onProgress) {
       if (this.world.needsCanonRebuild) throw new Error('재생성/삭제된 원작 분기가 있습니다. Canon rebuild를 먼저 실행하세요.');
       if (!this.world.importJob || this.world.importJob.mode !== 'history') this.world.importJob = { mode: 'history', status: 'fetching', nextIndex: 0, total: 0, fandomMilestone: 0 };
       await this.saveWorld();
       const synced = await this.sync({ full: true, allowUpdate: false, onProgress: (info) => onProgress?.(`원작 불러오는 중 · ${info.messages} messages`) });
+      if (!synced) throw new Error('원작 로그 동기화가 이미 진행 중입니다. 잠시 후 다시 시도하세요.');
       const turns = synced.turns;
       this.world.importJob.total = turns.length;
       this.world.importJob.status = 'analyzing';
@@ -3014,7 +3281,9 @@ ${this.world.sync.error}`);
       return turns.length;
     }
 
-    async rebuildCanon(onProgress) {
+    rebuildCanon(onProgress) { return this.inWorld('canon rebuild', (engine) => engine.rebuildCanonInWorld(onProgress)); }
+
+    async rebuildCanonInWorld(onProgress) {
       const oldPending = await this.db.getAllByWorld(STORES.pendingEvents, this.world.id);
       for (const event of oldPending) {
         if (!['generated', 'expired', 'superseded'].includes(event.status)) {
@@ -3346,6 +3615,20 @@ main.screen::-webkit-scrollbar{width:0;height:0}
 .sf-tile.letter{background:var(--t,#e5e5ea);color:#fff;font:600 24px/1 -apple-system,system-ui,sans-serif}
 .sf-label{width:100%;color:#3c3c43;font-size:12px;line-height:15px;text-align:center;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all}
 .sf-fav .app-badge{right:6px;top:-6px}
+.launcher-badge.dot{min-width:0;width:12px;height:12px;padding:0;right:-1px;top:-1px;border-radius:6px}
+.phone nav .app-badge.dot{min-width:0;width:8px;height:8px;padding:0;right:calc(50% - 16px);top:6px;border-radius:4px}
+.cp-new{display:inline-block;width:8px;height:8px;margin-left:6px;border-radius:4px;background:#ff3b30;vertical-align:middle}
+.cp-rank{flex:none;width:24px;color:#8a8a8e;font:600 15px/20px -apple-system,system-ui,sans-serif;text-align:center}
+.cp-delta{flex:none;min-width:44px;font:600 13px/18px -apple-system,system-ui,sans-serif;text-align:right;color:#8a8a8e}
+.cp-delta.up{color:#34c759}.cp-delta.down{color:#ff3b30}
+.cp-riser{margin:8px 16px 0;padding:10px 14px;border-radius:12px;background:#fff;color:#3a3a3c;font-size:13px;line-height:18px;box-shadow:0 0 0 .5px #0000000f}
+.cp-chart{margin:0 16px;padding:12px 8px 6px;border-radius:14px;background:#fff;box-shadow:0 0 0 .5px #0000000f}
+.cp-chart svg{display:block;width:100%;height:auto;overflow:visible}
+.cp-chart text{font:10px -apple-system,system-ui,sans-serif;fill:#8a8a8e}
+.cp-legend{display:flex;flex-wrap:wrap;gap:6px 12px;margin:10px 8px 4px;font-size:12px;color:#3a3a3c}
+.cp-legend i{display:inline-block;width:10px;height:3px;margin-right:5px;border-radius:2px;vertical-align:middle;background:var(--c)}
+.cp-point{margin:10px 16px 0;padding:12px 14px;border-radius:12px;background:#fff;font-size:13px;line-height:19px;color:#3a3a3c;box-shadow:0 0 0 .5px #0000000f}
+.cp-point b{color:#000}.cp-point small{display:block;color:#8a8a8e;font-size:12px}
 .sf-pages{display:grid;grid-auto-flow:column;grid-auto-columns:calc(100% - 44px);gap:10px;overflow-x:auto;padding:0 16px 2px;scroll-snap-type:x mandatory;scroll-padding:0 16px;scrollbar-width:none}
 .sf-pages::-webkit-scrollbar{display:none}
 .sf-page{display:grid;gap:10px;align-content:start;scroll-snap-align:start}
@@ -4037,19 +4320,42 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
       if (back) back.hidden = this.view === 'home' && !this.route && !this.history.length;
     }
 
+    // Launcher: a small red dot while Reddit, Pixiv or CP Trends of the open room has anything unread.
+    // Inside the phone, Pixiv/Reddit keep their counts and Home shows a dot for CP Trends.
     refreshBadges() {
       if (!this.root || !this.engine.world) return;
       const badges = this.engine.world.badges;
-      const count = badges.phone || 0;
+      const unread = ['reddit', 'pixiv', 'trends'].some((kind) => (Number(badges[kind]) || 0) > 0);
       const badge = this.root.querySelector('.launcher-badge');
-      badge.textContent = count > 99 ? '99+' : String(count || '');
-      badge.hidden = !count;
+      badge.textContent = '';
+      badge.classList.add('dot');
+      badge.hidden = !unread;
+      badge.setAttribute('aria-label', unread ? '새 Fanverse 소식' : '');
       for (const kind of ['pixiv', 'reddit']) {
         const button = this.root.querySelector(`nav [data-view="${kind}"]`);
         let dot = button?.querySelector('.app-badge');
         if (badges[kind] && !dot) { dot = document.createElement('span'); dot.className = 'app-badge'; button.appendChild(dot); }
         if (dot) { dot.textContent = badges[kind] > 99 ? '99+' : String(badges[kind] || ''); dot.hidden = !badges[kind]; }
       }
+      const home = this.root.querySelector('nav [data-view="home"]');
+      let homeDot = home?.querySelector('.app-badge');
+      if (badges.trends && !homeDot && home) { homeDot = document.createElement('span'); homeDot.className = 'app-badge dot'; home.appendChild(homeDot); }
+      if (homeDot) homeDot.hidden = !badges.trends;
+    }
+
+    // Fan content generated in the background for the open room (never called for a stale room):
+    // unread markers update; a list screen re-renders in place (scroll kept). Detail pages, Books,
+    // Settings, open sheets, running transitions and focused inputs are left untouched.
+    fanContentArrived() {
+      this.refreshBadges();
+      if (!this.open || this.sheet || this.navTransition) return;
+      const active = this.root.activeElement;
+      if (active && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) return;
+      const route = this.route || {};
+      const list = (this.view === 'home' && (!route.type || route.type === 'cp-trends') && !String(route.q || '').trim())
+        || (this.view === 'reddit' && route.type !== 'reddit-post')
+        || (this.view === 'pixiv' && !['pixiv-work', 'author', 'series'].includes(route.type));
+      if (list) this.render({ keepScroll: true }).catch((error) => console.warn('[RP Fanverse] live refresh failed', error));
     }
 
     async render({ keepScroll = false, restoreScroll = null, transition = null } = {}) {
@@ -4172,6 +4478,7 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
     }
 
     async homeHtml() {
+      if (this.route?.type === 'cp-trends') return this.cpTrendsHtml();
       const world = this.engine.world;
       const settings = this.getSettings();
       const q = String(this.route?.q || '');
@@ -4204,7 +4511,80 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
         activity.push(this.sfRow({ act: 'sf-open', attrs: 'data-view="reddit"', color: '#5e5ce6', glyph: icon('sparkle', 18), title: `${this.episodeAt(entry.turn) || '본편'} · 팬덤 갱신`, sub: `새 장면 ${(entry.canonEventIds || []).length} · 새 해석 ${(entry.interpretationIds || []).length}`, time: Fmt.ago(entry.at) }));
       }
 
-      return `${search}${this.sfHeader('즐겨찾기')}${favorites}${this.sfHeader('Trending Ships', ships.length ? 'sf-open' : '', 'data-view="pixiv"')}${shipsHtml}${this.sfHeader('최근 Pixiv', recentWorks.length ? 'sf-open' : '', 'data-view="pixiv"')}${recentWorks.length ? this.sfPages(recentWorks.map((work) => this.sfPixivCard(work))) : '<div class="sf-empty">다음 Fanverse 갱신에서 작품이 올라옵니다.</div>'}${this.sfHeader('Reddit에서 화제', hotPosts.length ? 'sf-open' : '', 'data-view="reddit"')}${hotPosts.length ? this.sfPages(hotPosts.map((post) => this.sfRedditCard(post))) : '<div class="sf-empty">다음 Fanverse 갱신 뒤 토론이 생깁니다.</div>'}${this.sfHeader('최근 Fanverse 활동')}<div class="sf-list">${activity.join('')}</div><div class="sf-foot">fandom://current · ${this.esc(this.communityTitle())} · Fanverse ${APP_VERSION}</div>`;
+      return `${search}${this.sfHeader('즐겨찾기')}${favorites}${this.cpHomeHtml(world)}${this.sfHeader('Trending Ships', ships.length ? 'sf-open' : '', 'data-view="pixiv"')}${shipsHtml}${this.sfHeader('최근 Pixiv', recentWorks.length ? 'sf-open' : '', 'data-view="pixiv"')}${recentWorks.length ? this.sfPages(recentWorks.map((work) => this.sfPixivCard(work))) : '<div class="sf-empty">다음 Fanverse 갱신에서 작품이 올라옵니다.</div>'}${this.sfHeader('Reddit에서 화제', hotPosts.length ? 'sf-open' : '', 'data-view="reddit"')}${hotPosts.length ? this.sfPages(hotPosts.map((post) => this.sfRedditCard(post))) : '<div class="sf-empty">다음 Fanverse 갱신 뒤 토론이 생깁니다.</div>'}${this.sfHeader('최근 Fanverse 활동')}<div class="sf-list">${activity.join('')}</div><div class="sf-foot">fandom://current · ${this.esc(this.communityTitle())} · Fanverse ${APP_VERSION}</div>`;
+    }
+
+    // ---------- CP Trends (world.fandom.shipHistory; no extra Gemini calls) ----------
+
+    cpStats(world) {
+      const history = world.fandom.shipHistory || [];
+      const previous = history.length > 1 ? history[history.length - 2] : null;
+      const ranks = (snapshot) => new Map(Object.entries(snapshot?.ships || {}).sort((a, b) => b[1] - a[1]).map(([tag], index) => [tag, index + 1]));
+      const before = ranks(previous);
+      const ships = (world.fandom.ships || []).slice().sort((a, b) => (Number(b.momentum) || 0) - (Number(a.momentum) || 0));
+      const rows = ships.slice(0, 5).map((ship, index) => ({ tag: ship.tag, momentum: Number(ship.momentum) || 0, recentGrowth: Number(ship.recentGrowth) || 0, lastTurn: ship.lastTurn, rank: index + 1, rankChange: before.has(ship.tag) ? before.get(ship.tag) - (index + 1) : null }));
+      const gains = new Map();
+      for (const entry of history.slice(-3)) for (const [tag, delta] of Object.entries(entry.deltas || {})) gains.set(tag, (gains.get(tag) || 0) + (Number(delta) || 0));
+      const riser = [...gains].filter(([, gain]) => gain > 0).sort((a, b) => b[1] - a[1])[0] || null;
+      return { history, rows, riser };
+    }
+
+    cpDeltaHtml(value) {
+      const n = Number(value) || 0;
+      return `<span class="cp-delta ${n > 0 ? 'up' : n < 0 ? 'down' : ''}">${n > 0 ? '▲' : n < 0 ? '▼' : ''}${n ? Math.abs(n) : '–'}</span>`;
+    }
+
+    cpRankText(change) {
+      if (change == null) return '신규';
+      return change > 0 ? `순위 ▲${change}` : change < 0 ? `순위 ▼${-change}` : '순위 유지';
+    }
+
+    cpHomeHtml(world) {
+      const { rows, riser } = this.cpStats(world);
+      const unread = Number(world.badges.trends) > 0;
+      const head = `<div class="sf-h"><h2>CP Trends${unread ? '<span class="cp-new" aria-label="새 변화"></span>' : ''}</h2>${rows.length ? `<button data-act="cp-trends">그래프${icon('chevronRight', 14)}</button>` : ''}</div>`;
+      if (!rows.length) return `${head}<div class="sf-empty">CP가 생기면 순위와 변화가 여기에 표시됩니다.</div>`;
+      const list = rows.map((row) => `<button class="sf-row" data-act="cp-trends"><span class="cp-rank">${row.rank}</span><span class="sf-row-body"><span class="sf-row-title">#${this.esc(row.tag)}</span><span class="sf-row-sub">momentum ${row.momentum} · ${this.cpRankText(row.rankChange)}${row.lastTurn ? ` · ${this.esc(this.episodeAt(row.lastTurn) || `turn ${row.lastTurn}`)}` : ''}</span></span>${this.cpDeltaHtml(row.recentGrowth)}</button>`).join('');
+      return `${head}<div class="sf-list">${list}</div>${riser ? `<div class="cp-riser">급상승 · <b>#${this.esc(riser[0])}</b> 최근 3회 갱신 +${riser[1]}</div>` : ''}`;
+    }
+
+    async cpTrendsHtml() {
+      const world = this.engine.world;
+      await this.loadFanIndex();
+      if (world === this.engine.world) this.engine.clearUnread('trends');
+      const { history, rows } = this.cpStats(world);
+      const points = history.slice(-40);
+      const colors = ['#ff2d55', '#007aff', '#34c759', '#ff9500', '#af52de'];
+      const tags = rows.map((row) => row.tag).filter((tag) => points.some((entry) => tag in (entry.ships || {}))).slice(0, 5);
+      const header = `<div class="sf-h"><h2>CP Trends</h2></div>`;
+      const table = rows.length ? `<div class="sf-h"><h2>현재 순위</h2></div><div class="sf-list">${rows.map((row) => `<div class="sf-row"><span class="cp-rank">${row.rank}</span><span class="sf-row-body"><span class="sf-row-title">#${this.esc(row.tag)}</span><span class="sf-row-sub">momentum ${row.momentum} · ${this.cpRankText(row.rankChange)}</span></span>${this.cpDeltaHtml(row.recentGrowth)}</div>`).join('')}</div>` : '';
+      if (points.length < 1 || !tags.length) return `${header}<div class="sf-empty">아직 CP 변화 기록이 없습니다. 다음 팬덤 갱신부터 쌓입니다.</div>${table}`;
+      const W = 340; const H = 210; const left = 30; const right = 12; const top = 10; const bottom = 30;
+      const x = (index) => left + (points.length === 1 ? (W - left - right) / 2 : (index * (W - left - right)) / (points.length - 1));
+      const y = (value) => top + ((100 - Utils.clamp(Number(value) || 0, -100, 100)) * (H - top - bottom)) / 200;
+      // Fan-facing N화; turn only as a fallback or to tell apart several updates within one 화.
+      const perEpisode = new Map();
+      for (const entry of points) if (entry.episodeLabel) perEpisode.set(entry.episodeLabel, (perEpisode.get(entry.episodeLabel) || 0) + 1);
+      const label = (entry) => (!entry.episodeLabel ? `T${entry.turn}` : perEpisode.get(entry.episodeLabel) > 1 ? `${entry.episodeLabel}·T${entry.turn}` : entry.episodeLabel);
+      const grid = [-100, -50, 0, 50, 100].map((v) => `<line x1="${left}" x2="${W - right}" y1="${y(v)}" y2="${y(v)}" stroke="${v === 0 ? '#c7c7cc' : '#efeff4'}" stroke-width="1"/><text x="${left - 6}" y="${y(v) + 3}" text-anchor="end">${v}</text>`).join('');
+      const labelIndexes = [...new Set([0, Math.floor((points.length - 1) / 2), points.length - 1])];
+      const xLabels = labelIndexes.map((index) => `<text x="${x(index)}" y="${H - 10}" text-anchor="middle">${this.esc(label(points[index]))}</text>`).join('');
+      const route = this.route || {};
+      const selectedTag = tags.includes(route.tag) ? route.tag : tags[0];
+      const selectedIndex = Number.isInteger(route.point) && route.point >= 0 && route.point < points.length ? route.point : points.length - 1;
+      const series = tags.map((tag, n) => {
+        const coords = points.map((entry, index) => (tag in (entry.ships || {}) ? [index, entry.ships[tag]] : null)).filter(Boolean);
+        const line = coords.length > 1 ? `<polyline fill="none" stroke="${colors[n]}" stroke-width="${tag === selectedTag ? 2.5 : 1.6}" stroke-linejoin="round" points="${coords.map(([i, v]) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ')}"/>` : '';
+        const dots = coords.map(([i, v]) => `<g data-act="cp-point" data-i="${i}" data-tag="${this.esc(tag)}" style="cursor:pointer"><circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="9" fill="transparent"/><circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="${tag === selectedTag && i === selectedIndex ? 4.5 : 2.6}" fill="${tag === selectedTag && i === selectedIndex ? '#fff' : colors[n]}" stroke="${colors[n]}" stroke-width="${tag === selectedTag && i === selectedIndex ? 2.5 : 0}"/></g>`).join('');
+        return line + dots;
+      }).join('');
+      const legend = tags.map((tag, n) => `<span style="--c:${colors[n]}"><i></i>#${this.esc(tag)}</span>`).join('');
+      const entry = points[selectedIndex];
+      const detail = entry?.details?.[selectedTag];
+      const value = entry?.ships?.[selectedTag];
+      const delta = entry?.deltas?.[selectedTag];
+      const info = `<div class="cp-point"><b>#${this.esc(selectedTag)}</b> · ${this.esc(label(entry))}<small>momentum ${value ?? '–'}${delta != null ? ` · 이번 갱신 ${delta > 0 ? '+' : ''}${delta}` : ' · 이번 갱신에서 변화 없음'}</small>${detail?.sceneLabel ? `<small>${this.esc(detail.sceneEpisodeLabel ? `${detail.sceneEpisodeLabel} · ` : '')}${this.esc(detail.sceneLabel)}</small>` : ''}${detail?.reason ? `<div>${this.esc(this.engine.fanText(detail.reason))}</div>` : ''}</div>`;
+      return `${header}<div class="cp-chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="상위 CP momentum 추이">${grid}${series}${xLabels}</svg><div class="cp-legend">${legend}</div></div>${info}${table}`;
     }
 
     sfSearchHtml(q, works, posts) {
@@ -4241,10 +4621,7 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
       else if (route.type === 'series') body = this.pxSeriesHtml(route.title);
       else {
         body = this.pxListHtml(all, route);
-        if (world.badges.pixiv) {
-          world.badges.pixiv = 0; world.badges.phone = world.badges.reddit || 0;
-          this.engine.saveWorld();
-        }
+        if (world === this.engine.world) this.engine.clearUnread('pixiv');
       }
       return `${this.pxHeaderHtml(route)}${body}`;
     }
@@ -4435,10 +4812,7 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
       this.rdCollapsed ||= new Set();
       const route = this.route || {};
       if (route.type === 'reddit-post') return this.rdDetailHtml(posts, route);
-      if (world.badges.reddit) {
-        world.badges.reddit = 0; world.badges.phone = world.badges.pixiv || 0;
-        this.engine.saveWorld();
-      }
+      if (world === this.engine.world) this.engine.clearUnread('reddit');
       const sort = route.sort || 'best';
       const tab = route.tab || 'feed';
       const q = String(route.q || '').trim().toLowerCase();
@@ -4800,6 +5174,8 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
         switch (act) {
           // safari home
           case 'sf-open': return this.push(null, target.dataset.view);
+          case 'cp-trends': return this.push({ type: 'cp-trends' }, 'home');
+          case 'cp-point': return this.replace({ ...route, point: Number(target.dataset.i), tag: target.dataset.tag }, { keepScroll: true });
           case 'sf-clear': return this.replace({ ...route, q: '' });
           case 'sf-pixiv': return this.push({ type: 'pixiv-work', id }, 'pixiv');
           case 'sf-reddit': return this.push({ type: 'reddit-post', id }, 'reddit');
@@ -4862,9 +5238,8 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
             const work = await this.db.get(STORES.pixivWorks, id);
             if (!work) return;
             const stream = this.root.querySelector('#fanwork-stream');
-            await this.withButton(target, '본문 생성 중…', async () => {
-              await this.engine.generateFanwork(work, (text) => { if (stream?.isConnected) stream.innerHTML = this.pxReaderBody(text, { cursor: true }).html; });
-            });
+            const record = await this.withButton(target, '본문 생성 중…', () => this.engine.generateFanwork(work, (text) => { if (stream?.isConnected) stream.innerHTML = this.pxReaderBody(text, { cursor: true }).html; }));
+            if (!record) return; // the room changed while generating: nothing was saved
             this.notify('success', '전문을 생성하고 저장했습니다.');
             return this.render({ keepScroll: true });
           }
@@ -4898,7 +5273,8 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
           case 'rd-more': {
             const post = await this.db.get(STORES.redditPosts, id);
             if (!post) return;
-            await this.withButton(target, '댓글 생성 중…', () => this.engine.loadMoreRedditComments(post));
+            const updated = await this.withButton(target, '댓글 생성 중…', () => this.engine.loadMoreRedditComments(post));
+            if (!updated) return; // the room changed while generating: nothing was saved
             this.notify('success', '새 댓글을 저장했습니다.');
             return this.render({ keepScroll: true });
           }
@@ -5129,12 +5505,20 @@ main.screen.nav-front{box-shadow:-10px 0 28px #0000001f}
     }
   }
 
+  // Node tests: the engine and its world guard are exposed too; nothing below (App, UI startup) runs.
+  if (NODE_TEST_MODE) {
+    Object.assign(globalThis.__RP_FANVERSE_TEST_HOOKS__, { FanverseEngine, StaleWorldError, isStaleWorldError, createWorld, STORES, scopedDatabase, PhoneUI });
+    return;
+  }
+
   class App {
     constructor() {
       this.db = new Database(); this.api = new CrackApiAdapter(); this.dom = new CrackDomFallbackAdapter();
       this.settings = normalizeSettings(); this.gemini = new GeminiClient(() => this.settings);
       this.engine = new FanverseEngine(this.db, this.api, this.dom, this.gemini, () => this.settings, (kind, message) => this.ui?.notify(kind, message));
       this.ui = new PhoneUI(this.engine, this.db, () => this.settings, (settings) => this.persistSettings(settings));
+      // Called by the engine only for the attached room's own updates (stale rooms never reach the UI).
+      this.engine.onFanContent = () => this.ui.fanContentArrived();
       this.lastUrl = '';
     }
 
