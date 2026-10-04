@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RP Fanverse
 // @namespace    https://crack.wrtn.ai/
-// @version      0.12.4
+// @version      0.12.5
 // @description  Treats a Crack RP episode as canon and grows a persistent virtual Pixiv/Reddit fandom around it.
 // @author       Personal userscript
 // @match        https://crack.wrtn.ai/stories/*/episodes/*
@@ -24,7 +24,7 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '0.12.4';
+  const APP_VERSION = '0.12.5';
   const DB_NAME = 'rp-fanverse';
   const DB_VERSION = 1;
   const SETTINGS_KEY = 'rp-fanverse:settings:v1';
@@ -578,6 +578,33 @@ ORIGINAL FANWORK:
     return text;
   }
 
+  // ---------- chat room title (world.chatTitle) ----------
+  // world.chatTitle is the title of the Crack character-chat room the user has open, read from Crack
+  // itself (never generated, never an ID). It is the shared work title for Reddit's community name and
+  // later RIDI/EPUB (dc:title, cover/TOC, file name). Only surrounding whitespace is removed.
+  const GENERIC_TITLES = new Set(['크랙', 'crack', 'wrtn', 'fanverse', 'rp fanverse', 'untitled', 'story', 'chat', 'undefined', 'null', '새 채팅', '채팅']);
+
+  function isValidChatTitle(value, ids = []) {
+    if (typeof value !== 'string') return false;
+    const text = value.trim();
+    if (!text || text.length > 100) return false;
+    if (GENERIC_TITLES.has(text.toLowerCase())) return false;
+    if (ids.filter(Boolean).includes(text)) return false;
+    if (/^[0-9a-f]{24}$/i.test(text) || /^[0-9a-f-]{32,36}$/i.test(text)) return false; // Mongo/UUID-style IDs
+    return true;
+  }
+
+  // GET /v3/chats/{chatId} → data. Crack's room object carries its own room title; `story.name` is the
+  // original work's name, which Crack also uses as the default name of a new room, so it is only used
+  // when the room has no title of its own. Returns { title, source } or null.
+  function extractChatRoomTitle(chat, ids = []) {
+    if (!chat || typeof chat !== 'object') return null;
+    for (const [source, value] of [['api:title', chat.title], ['api:name', chat.name], ['api:story.name', chat.story?.name]]) {
+      if (isValidChatTitle(value, ids)) return { title: value.trim(), source };
+    }
+    return null;
+  }
+
   function readingMinutes(characters) {
     return Math.max(1, Math.round((Number(characters) || 0) / 550));
   }
@@ -607,6 +634,8 @@ ORIGINAL FANWORK:
       buildJsonGenerationConfig,
       parseSseText,
       readingMinutes,
+      isValidChatTitle,
+      extractChatRoomTitle,
       promptDefinitions: PROMPT_DEFINITIONS,
       defaultPromptTemplates: DEFAULT_PROMPT_TEMPLATES,
     };
@@ -958,6 +987,12 @@ ORIGINAL FANWORK:
       } while (full && cursor && page < 100);
       return all;
     }
+
+    // The room object Crack's chat page itself loads (GET /v3/chats/{chatId}, same API and auth as messages).
+    async fetchChatRoomTitle(info) {
+      const json = await this.request(`${API_BASE}/chats/${encodeURIComponent(info.episodeId)}`);
+      return extractChatRoomTitle(json?.data, [info.storyId, info.episodeId]);
+    }
   }
 
   class CrackDomFallbackAdapter {
@@ -1018,6 +1053,27 @@ ORIGINAL FANWORK:
       });
       for (let i = 1; i < messages.length; i += 1) messages[i].parentTurnId = messages[i - 1].turnId;
       return messages.reverse();
+    }
+
+    // DOM fallback for the room title: only links that point at exactly this room
+    // (/stories/{storyId}/episodes/{episodeId}, e.g. the chat-list entry for the open room) are trusted —
+    // never page-wide headings or CSS classes. Uses the link's title/aria-label, else its first text line.
+    readChatRoomTitle(info) {
+      const path = `/stories/${info.storyId}/episodes/${info.episodeId}`;
+      const ids = [info.storyId, info.episodeId];
+      for (const link of document.querySelectorAll('a[href]')) {
+        let pathname = '';
+        try { pathname = new URL(link.getAttribute('href'), location.origin).pathname.replace(/\/$/, ''); } catch (_) { continue; }
+        if (pathname !== path || link.closest('#rp-fanverse-host')) continue;
+        // Text nodes, not innerText: innerText of a collapsed/hidden list glues title and preview together.
+        const texts = [];
+        const walker = document.createTreeWalker(link, NodeFilter.SHOW_TEXT);
+        while (walker.nextNode()) texts.push(walker.currentNode.nodeValue);
+        const candidates = [link.getAttribute('title'), link.getAttribute('aria-label'), ...texts];
+        const title = candidates.find((value) => isValidChatTitle(value, ids));
+        if (title) return { title: title.trim(), source: 'dom:room-link' };
+      }
+      return null;
     }
   }
 
@@ -1584,8 +1640,30 @@ ORIGINAL FANWORK:
       this.world.fandom.recentPlatformSignals ||= [];
       this.world.fandom.history ||= [];
       this.world.badges ||= { phone: 0, reddit: 0, pixiv: 0 };
+      // Worlds saved before 0.12.5 have no chatTitle; it is filled in by the next refreshChatTitle().
+      if (this.world.chatTitle === undefined) this.world.chatTitle = null;
+      this.chatTitleCheckedAt = 0;
       await this.db.put(STORES.worlds, this.world);
       return this.world;
+    }
+
+    // Reads the open room's title from Crack (API first, then the room-link DOM fallback) and stores it
+    // as world.chatTitle when it is new or changed. Never throws: a missing title must not affect sync.
+    async refreshChatTitle({ force = false } = {}) {
+      if (!this.world || !this.worldInfo) return false;
+      if (!force && this.world.chatTitle && Date.now() - this.chatTitleCheckedAt < 5 * 60 * 1000) return false;
+      this.chatTitleCheckedAt = Date.now();
+      let found = null;
+      try { found = await this.api.fetchChatRoomTitle(this.worldInfo); } catch (error) { console.warn('[RP Fanverse] chat title via API unavailable:', error.message); }
+      if (!found) {
+        try { found = this.dom.readChatRoomTitle(this.worldInfo); } catch (error) { console.warn('[RP Fanverse] chat title via DOM unavailable:', error.message); }
+      }
+      if (!found || (found.title === this.world.chatTitle && found.source === this.world.chatTitleSource)) return false;
+      this.world.chatTitle = found.title;
+      this.world.chatTitleSource = found.source;
+      this.world.chatTitleUpdatedAt = new Date().toISOString();
+      await this.saveWorld();
+      return true;
     }
 
     async saveWorld() {
@@ -1593,11 +1671,14 @@ ORIGINAL FANWORK:
       await this.db.put(STORES.worlds, this.world);
     }
 
-    async sync({ full = false, onProgress = null, allowUpdate = true } = {}) {
+    // silent: automatic/background syncs (polling, page entry). They show no progress/success toast;
+    // abnormal states (DOM fallback, branch change) and errors are still reported.
+    async sync({ full = false, onProgress = null, allowUpdate = true, silent = false } = {}) {
       if (this.syncing || !this.worldInfo) return null;
       this.syncing = true;
       const wasNeverSynced = this.world.sync.status === 'new';
-      this.notify('sync', '원작 로그 동기화 중…');
+      const previousAdapter = this.world.sync.adapter;
+      if (!silent) this.notify('sync', '원작 로그 동기화 중…');
       let messages;
       try {
         try {
@@ -1622,11 +1703,19 @@ ORIGINAL FANWORK:
         if (branchChanged && !this.world.needsCanonRebuild) {
           this.world.needsCanonRebuild = true;
           await this.suspendPendingForBranchChange();
+          this.notify('error', '재생성/삭제로 활성 원작 분기가 바뀌었습니다. Settings > Data에서 Canon rebuild가 필요합니다.');
         }
         this.world.activeMessageIds = active.map((message) => message._id);
         this.world.turnCount = turns.length;
         await this.saveWorld();
-        this.notify('sync', this.world.sync.adapter === 'api' ? `API 동기화 완료 · ${turns.length} turns` : `Crack API sync failed — DOM fallback active · ${turns.length} turns`);
+        if (this.world.sync.adapter === 'dom') {
+          // Background syncs report the fallback once when it starts, not on every poll.
+          if (!silent || previousAdapter !== 'dom') this.notify('error', `Crack API sync failed — DOM fallback active · ${turns.length} turns
+${this.world.sync.error}`);
+        } else if (!silent) {
+          this.notify('sync', `API 동기화 완료 · ${turns.length} turns`);
+        }
+        await this.refreshChatTitle();
         if (wasNeverSynced && turns.length > this.getSettings().turnsPerUpdate * 2) this.world.needsImport = true;
         await this.saveWorld();
         if (allowUpdate && !this.world.needsImport && !this.world.needsCanonRebuild) await this.maybeUpdate(turns);
@@ -2798,6 +2887,11 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
 
     esc(value) { return Utils.escapeHtml(value); }
 
+    // Work title shared by Reddit (and later RIDI/EPUB): the open Crack room's title (world.chatTitle).
+    storyTitle() { return this.engine.world?.chatTitle || null; }
+    communityTitle() { return this.storyTitle() || '채팅방 제목 확인 중'; }
+    communityName() { return `r/${this.communityTitle()}`; }
+
     paragraphs(text) {
       return String(text || '').split(/\n{2,}/).map((block) => block.trim()).filter(Boolean).map((block) => `<p>${Utils.nl2br(block)}</p>`).join('');
     }
@@ -2859,7 +2953,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
 
     sfRedditCard(post) {
       const persona = this.redditPersona(post.personaId);
-      return `<button class="sf-card" data-act="sf-reddit" data-id="${post.id}"><span class="sf-thumb reddit">${icon('up', 18)}<b>${Fmt.compact(post.score)}</b><small>댓글 ${Fmt.compact(Math.max(post.comments?.length || 0, post.estimatedCommentCount || 0))}</small></span><span class="sf-card-body"><span class="sf-card-title">${this.esc(post.title)}</span><span class="sf-card-desc">${this.esc(String(post.spoiler ? '(스포일러)' : post.body || '').replace(/\s+/g, ' '))}</span><span class="sf-card-site">reddit.com/r/Fanverse · u/${this.esc(persona?.name || post.personaId)} · ${Fmt.ago(post.createdAt)}</span></span></button>`;
+      return `<button class="sf-card" data-act="sf-reddit" data-id="${post.id}"><span class="sf-thumb reddit">${icon('up', 18)}<b>${Fmt.compact(post.score)}</b><small>댓글 ${Fmt.compact(Math.max(post.comments?.length || 0, post.estimatedCommentCount || 0))}</small></span><span class="sf-card-body"><span class="sf-card-title">${this.esc(post.title)}</span><span class="sf-card-desc">${this.esc(String(post.spoiler ? '(스포일러)' : post.body || '').replace(/\s+/g, ' '))}</span><span class="sf-card-site">reddit.com/${this.esc(this.communityName())} · u/${this.esc(persona?.name || post.personaId)} · ${Fmt.ago(post.createdAt)}</span></span></button>`;
     }
 
     sfRow({ act, attrs = '', color, glyph, title, sub = '', time = '' }) {
@@ -2896,7 +2990,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
         activity.push(this.sfRow({ act: 'sf-open', attrs: 'data-view="reddit"', color: '#5e5ce6', glyph: icon('sparkle', 18), title: `turn ${entry.turn} · 팬덤 갱신`, sub: `Canon 사건 ${(entry.canonEventIds || []).length} · 새 해석 ${(entry.interpretationIds || []).length}`, time: Fmt.ago(entry.at) }));
       }
 
-      return `${search}${this.sfHeader('즐겨찾기')}${favorites}${this.sfHeader('Trending Ships', ships.length ? 'sf-open' : '', 'data-view="pixiv"')}${shipsHtml}${this.sfHeader('최근 Pixiv', recentWorks.length ? 'sf-open' : '', 'data-view="pixiv"')}${recentWorks.length ? this.sfPages(recentWorks.map((work) => this.sfPixivCard(work))) : '<div class="sf-empty">다음 Fanverse 갱신에서 작품이 올라옵니다.</div>'}${this.sfHeader('Reddit에서 화제', hotPosts.length ? 'sf-open' : '', 'data-view="reddit"')}${hotPosts.length ? this.sfPages(hotPosts.map((post) => this.sfRedditCard(post))) : '<div class="sf-empty">다음 Fanverse 갱신 뒤 토론이 생깁니다.</div>'}${this.sfHeader('최근 Fanverse 활동')}<div class="sf-list">${activity.join('')}</div><div class="sf-foot">fandom://current · ${this.esc(world.storyId)} · Fanverse ${APP_VERSION}</div>`;
+      return `${search}${this.sfHeader('즐겨찾기')}${favorites}${this.sfHeader('Trending Ships', ships.length ? 'sf-open' : '', 'data-view="pixiv"')}${shipsHtml}${this.sfHeader('최근 Pixiv', recentWorks.length ? 'sf-open' : '', 'data-view="pixiv"')}${recentWorks.length ? this.sfPages(recentWorks.map((work) => this.sfPixivCard(work))) : '<div class="sf-empty">다음 Fanverse 갱신에서 작품이 올라옵니다.</div>'}${this.sfHeader('Reddit에서 화제', hotPosts.length ? 'sf-open' : '', 'data-view="reddit"')}${hotPosts.length ? this.sfPages(hotPosts.map((post) => this.sfRedditCard(post))) : '<div class="sf-empty">다음 Fanverse 갱신 뒤 토론이 생깁니다.</div>'}${this.sfHeader('최근 Fanverse 활동')}<div class="sf-list">${activity.join('')}</div><div class="sf-foot">fandom://current · ${this.esc(this.communityTitle())} · Fanverse ${APP_VERSION}</div>`;
     }
 
     sfSearchHtml(q, works, posts) {
@@ -2909,7 +3003,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       const tagRows = [this.sfRow({ act: 'px-tag', attrs: `data-tag="${this.esc(q.replace(/^#/, ''))}"`, color: '#0096fa', glyph: icon('search', 18), title: `Pixiv에서 “${this.esc(q)}” 검색` })]
         .concat(tags.map((tag) => this.sfRow({ act: 'px-tag', attrs: `data-tag="${this.esc(tag)}"`, color: this.sfTileColor(tag), glyph: this.esc(Array.from(tag)[0] || '#'), title: `#${this.esc(tag)}`, sub: 'CP · 태그' })));
       const workRows = workHits.map((work) => this.sfRow({ act: 'sf-pixiv', attrs: `data-id="${work.id}"`, color: '#0096fa', glyph: 'P', title: this.esc(work.title), sub: `pixiv · ${this.esc(this.pixivAuthor(work.authorId)?.name || work.authorId)} · ${(work.tags || []).slice(0, 3).map((tag) => `#${this.esc(tag)}`).join(' ')}` }));
-      const postRows = postHits.map((post) => this.sfRow({ act: 'sf-reddit', attrs: `data-id="${post.id}"`, color: '#ff4500', glyph: icon('comment', 16), title: this.esc(post.title), sub: `r/Fanverse · ${this.esc(post.category)} · ▲ ${Fmt.compact(post.score)}`, time: Fmt.ago(post.createdAt) }));
+      const postRows = postHits.map((post) => this.sfRow({ act: 'sf-reddit', attrs: `data-id="${post.id}"`, color: '#ff4500', glyph: icon('comment', 16), title: this.esc(post.title), sub: `${this.esc(this.communityName())} · ${this.esc(post.category)} · ▲ ${Fmt.compact(post.score)}`, time: Fmt.ago(post.createdAt) }));
       return `${this.sfHeader('CP · 태그')}<div class="sf-list">${tagRows.join('')}</div>${this.sfHeader(`Pixiv · ${workRows.length}`)}${workRows.length ? `<div class="sf-list">${workRows.join('')}</div>` : '<div class="sf-empty">일치하는 작품이 없습니다.</div>'}${this.sfHeader(`Reddit · ${postRows.length}`)}${postRows.length ? `<div class="sf-list">${postRows.join('')}</div>` : '<div class="sf-empty">일치하는 게시물이 없습니다.</div>'}`;
     }
 
@@ -3115,7 +3209,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
     }
 
     rdHeaderHtml(q = '') {
-      return `<div class="rd-header"><button class="rd-iconbtn" data-act="rd-home" aria-label="r/Fanverse 홈">${icon('menu', 22)}</button><label class="rd-search">${icon('search', 18)}<span class="rd-search-chip">${this.rdLogo(20)}r/Fanverse</span><input data-rd-search placeholder="검색" value="${this.esc(q)}" enterkeyhint="search"></label>${this.rdAvatar('you', 32)}</div>`;
+      return `<div class="rd-header"><button class="rd-iconbtn" data-act="rd-home" aria-label="${this.esc(this.communityName())} 홈">${icon('menu', 22)}</button><label class="rd-search">${icon('search', 18)}<span class="rd-search-chip">${this.rdLogo(20)}${this.esc(this.communityName())}</span><input data-rd-search placeholder="검색" value="${this.esc(q)}" enterkeyhint="search"></label>${this.rdAvatar('you', 32)}</div>`;
     }
 
     async redditHtml() {
@@ -3136,7 +3230,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       const sortLabels = { best: ['베스트', 'rocket'], hot: ['인기', 'flame'], new: ['신규', 'sparkle'], top: ['톱', 'top'] };
       const sortMenu = route.sortMenu ? `<div class="rd-menu" style="right:16px;top:44px"><div class="rd-menu-title">정렬 기준</div>${Object.entries(sortLabels).map(([value, [label, iconName]]) => `<button class="${sort === value ? 'active' : ''}" data-act="rd-sort" data-sort="${value}">${icon(iconName, 20)}${label}</button>`).join('')}</div>` : '';
       const [c1, c2] = [RD_AVATARS[Fmt.seed(world.id, RD_AVATARS.length)], '#e5ebee'];
-      const top = `${this.rdHeaderHtml(route.q || '')}<div class="rd-banner" style="--c1:${c1};--c2:${c2}"></div><div class="rd-comm"><span class="rd-comm-icon">${this.rdLogo(48)}</span><h1>r/Fanverse</h1></div><div class="rd-comm-meta"><b>${Fmt.compact(stats.members)}</b> 멤버 · <span style="color:#46d160">●</span> <b>${stats.online}</b> 온라인</div><div class="rd-comm-actions"><button class="rd-btn outline" data-act="rd-compose">${icon('plus', 18)}게시물 만들기</button><button class="rd-btn ${world.redditJoined ? 'outline' : 'black'}" data-act="rd-join">${world.redditJoined ? '가입됨' : '가입하기'}</button></div><div class="rd-tabs" style="position:relative"><button class="rd-tab ${tab === 'feed' ? 'active' : ''}" data-act="rd-tab" data-tab="feed">피드</button><button class="rd-tab ${tab === 'about' ? 'active' : ''}" data-act="rd-tab" data-tab="about">정보</button><span class="grow"></span>${tab === 'feed' ? `<button class="rd-sortbtn" data-act="rd-sort-menu" aria-haspopup="menu" aria-expanded="${Boolean(route.sortMenu)}">${sortLabels[sort][0]}${icon('chevronDown', 16)}</button><button class="rd-sortbtn" data-act="rd-noop" aria-label="보기 방식">${icon('cards', 18)}${icon('chevronDown', 16)}</button>` : ''}${sortMenu}</div>`;
+      const top = `${this.rdHeaderHtml(route.q || '')}<div class="rd-banner" style="--c1:${c1};--c2:${c2}"></div><div class="rd-comm"><span class="rd-comm-icon">${this.rdLogo(48)}</span><h1>${this.esc(this.communityName())}</h1></div><div class="rd-comm-meta"><b>${Fmt.compact(stats.members)}</b> 멤버 · <span style="color:#46d160">●</span> <b>${stats.online}</b> 온라인</div><div class="rd-comm-actions"><button class="rd-btn outline" data-act="rd-compose">${icon('plus', 18)}게시물 만들기</button><button class="rd-btn ${world.redditJoined ? 'outline' : 'black'}" data-act="rd-join">${world.redditJoined ? '가입됨' : '가입하기'}</button></div><div class="rd-tabs" style="position:relative"><button class="rd-tab ${tab === 'feed' ? 'active' : ''}" data-act="rd-tab" data-tab="feed">피드</button><button class="rd-tab ${tab === 'about' ? 'active' : ''}" data-act="rd-tab" data-tab="about">정보</button><span class="grow"></span>${tab === 'feed' ? `<button class="rd-sortbtn" data-act="rd-sort-menu" aria-haspopup="menu" aria-expanded="${Boolean(route.sortMenu)}">${sortLabels[sort][0]}${icon('chevronDown', 16)}</button><button class="rd-sortbtn" data-act="rd-noop" aria-label="보기 방식">${icon('cards', 18)}${icon('chevronDown', 16)}</button>` : ''}${sortMenu}</div>`;
       if (tab === 'about') return `<div class="reddit-shell">${top}${this.rdAboutHtml(posts, stats)}</div>`;
       let feed = posts.slice();
       if (q) feed = feed.filter((post) => `${post.title}\n${post.body}\n${post.category}`.toLowerCase().includes(q));
@@ -3151,7 +3245,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       const world = this.engine.world;
       const flairs = posts.reduce((map, post) => map.set(post.category, (map.get(post.category) || 0) + 1), new Map());
       const rules = ['Canon과 팬 해석을 구분해서 쓰기', '최신 회차 내용은 스포일러 태그 필수', 'CP·캐릭터 비하 금지 — 해석은 자유, 공격은 금지', '밈은 밈 플레어로', '근거 없는 "공식 확정" 단정 금지'];
-      return `<div class="rd-about"><div class="rd-about-card"><h2>r/Fanverse</h2><p>공식 RP를 원작(Canon)으로 실시간 읽는 가상 팬 커뮤니티입니다. 같은 Canon을 공유하지만 해석은 저마다 다릅니다.</p><div style="font-size:12px;color:var(--rd-weak)">${icon('clock', 14).replace('class="ic ', 'style="display:inline;vertical-align:-2px" class="ic ')} 생성일 ${new Date(world.createdAt || Date.now()).toLocaleDateString('ko-KR')}</div><div class="rd-about-stats"><div><b>${Fmt.compact(stats.members)}</b>멤버</div><div><b>${stats.online}</b>온라인</div><div><b>${posts.length}</b>게시물</div></div></div><div class="rd-about-card"><h3>r/Fanverse 규칙</h3>${rules.map((rule, index) => `<div class="rd-rule"><span>${index + 1}</span>${this.esc(rule)}</div>`).join('')}</div>${flairs.size ? `<div class="rd-about-card"><h3>플레어</h3><div class="rd-flairs">${[...flairs].map(([name, count]) => `${this.rdFlair(name)}<span style="font-size:12px;color:var(--rd-weak);margin-right:6px">${count}</span>`).join('')}</div></div>` : ''}<div class="rd-about-card"><h3>활동 중인 멤버</h3>${world.personas.reddit.map((persona) => `<div class="rd-member">${this.rdAvatar(persona.name, 32)}<div>u/${this.esc(persona.name)}<small>${this.esc(persona.archetype)} · ${this.esc(persona.bias)}</small></div></div>`).join('')}</div></div>`;
+      return `<div class="rd-about"><div class="rd-about-card"><h2>${this.esc(this.communityName())}</h2><p>공식 RP를 원작(Canon)으로 실시간 읽는 가상 팬 커뮤니티입니다. 같은 Canon을 공유하지만 해석은 저마다 다릅니다.</p><div style="font-size:12px;color:var(--rd-weak)">${icon('clock', 14).replace('class="ic ', 'style="display:inline;vertical-align:-2px" class="ic ')} 생성일 ${new Date(world.createdAt || Date.now()).toLocaleDateString('ko-KR')}</div><div class="rd-about-stats"><div><b>${Fmt.compact(stats.members)}</b>멤버</div><div><b>${stats.online}</b>온라인</div><div><b>${posts.length}</b>게시물</div></div></div><div class="rd-about-card"><h3>${this.esc(this.communityName())} 규칙</h3>${rules.map((rule, index) => `<div class="rd-rule"><span>${index + 1}</span>${this.esc(rule)}</div>`).join('')}</div>${flairs.size ? `<div class="rd-about-card"><h3>플레어</h3><div class="rd-flairs">${[...flairs].map(([name, count]) => `${this.rdFlair(name)}<span style="font-size:12px;color:var(--rd-weak);margin-right:6px">${count}</span>`).join('')}</div></div>` : ''}<div class="rd-about-card"><h3>활동 중인 멤버</h3>${world.personas.reddit.map((persona) => `<div class="rd-member">${this.rdAvatar(persona.name, 32)}<div>u/${this.esc(persona.name)}<small>${this.esc(persona.archetype)} · ${this.esc(persona.bias)}</small></div></div>`).join('')}</div></div>`;
     }
 
     rdCommentTime(post, comment, index) {
@@ -3203,7 +3297,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       const tree = this.rdCommentsSorted(post, roots).map((comment) => this.rdCommentHtml(post, comment, 0)).join('');
       const remaining = Math.max(0, (post.estimatedCommentCount || 0) - comments.length);
       const menu = route.csortMenu ? `<div class="rd-menu" style="left:16px;top:30px"><div class="rd-menu-title">댓글 정렬</div>${Object.entries(csortLabels).map(([value, label]) => `<button class="${csort === value ? 'active' : ''}" data-act="rd-csort" data-sort="${value}">${label}</button>`).join('')}</div>` : '';
-      return `<div class="reddit-shell">${this.rdHeaderHtml()}<div class="rd-detail-head"><button class="rd-iconbtn filled" data-act="rd-back" aria-label="뒤로">${icon('back', 18)}</button>${this.rdLogo(32)}<div class="col"><span><b>r/Fanverse</b> <span class="dot">•</span> <time>${Fmt.ago(post.createdAt)}</time></span><span>${this.esc(name)}</span></div><span class="grow"></span><button class="rd-iconbtn" data-act="rd-noop" aria-label="더보기">${icon('more', 18)}</button></div><h1 class="rd-detail-title">${this.esc(post.title)}</h1><div class="rd-detail-body"><div class="rd-flairs">${this.rdFlair(post.category)}${post.spoiler ? `<span class="rd-spoiler-badge">${icon('warning', 12)}스포일러</span>` : ''}</div>${this.rdBody(post)}<p class="rd-canon-note">RP canon turn ${post.turn} 시점의 반응${post.sourceCanonEventIds?.length ? ` · 관련 Canon event ${post.sourceCanonEventIds.length}개` : ''}</p></div><div class="rd-detail-actions"><div class="rd-actions">${this.rdVote(post.id, post.userVote, post.score)}<button class="rd-pill" data-act="rd-noop">${icon('comment', 18)}${Fmt.compact(Math.max(comments.length, post.estimatedCommentCount || 0))}</button><button class="rd-pill" data-act="rd-share" data-id="${post.id}">${icon('share', 18)}공유</button></div></div><div class="rd-composer" data-act="rd-compose">대화 참여하기</div><div class="rd-csort"><span>정렬 기준:</span><button class="rd-sortbtn" data-act="rd-csort-menu" aria-haspopup="menu">${csortLabels[csort]}${icon('chevronDown', 16)}</button>${menu}</div>${route.focus ? `<div style="padding:0 16px"><button class="rd-morec" style="margin:0" data-act="rd-unfocus">${icon('back', 16)}전체 댓글 보기</button></div>` : ''}<div class="rd-comments">${tree || '<div class="empty" style="padding:24px 0">아직 댓글이 없습니다.</div>'}${!route.focus && post.hasMoreComments ? `<button class="rd-morec" data-act="rd-more" data-id="${post.id}">${icon('plusCircle', 20)}댓글 더 보기${remaining ? ` (약 ${remaining}개)` : ''}</button>` : ''}</div></div>`;
+      return `<div class="reddit-shell">${this.rdHeaderHtml()}<div class="rd-detail-head"><button class="rd-iconbtn filled" data-act="rd-back" aria-label="뒤로">${icon('back', 18)}</button>${this.rdLogo(32)}<div class="col"><span><b>${this.esc(this.communityName())}</b> <span class="dot">•</span> <time>${Fmt.ago(post.createdAt)}</time></span><span>${this.esc(name)}</span></div><span class="grow"></span><button class="rd-iconbtn" data-act="rd-noop" aria-label="더보기">${icon('more', 18)}</button></div><h1 class="rd-detail-title">${this.esc(post.title)}</h1><div class="rd-detail-body"><div class="rd-flairs">${this.rdFlair(post.category)}${post.spoiler ? `<span class="rd-spoiler-badge">${icon('warning', 12)}스포일러</span>` : ''}</div>${this.rdBody(post)}<p class="rd-canon-note">RP canon turn ${post.turn} 시점의 반응${post.sourceCanonEventIds?.length ? ` · 관련 Canon event ${post.sourceCanonEventIds.length}개` : ''}</p></div><div class="rd-detail-actions"><div class="rd-actions">${this.rdVote(post.id, post.userVote, post.score)}<button class="rd-pill" data-act="rd-noop">${icon('comment', 18)}${Fmt.compact(Math.max(comments.length, post.estimatedCommentCount || 0))}</button><button class="rd-pill" data-act="rd-share" data-id="${post.id}">${icon('share', 18)}공유</button></div></div><div class="rd-composer" data-act="rd-compose">대화 참여하기</div><div class="rd-csort"><span>정렬 기준:</span><button class="rd-sortbtn" data-act="rd-csort-menu" aria-haspopup="menu">${csortLabels[csort]}${icon('chevronDown', 16)}</button>${menu}</div>${route.focus ? `<div style="padding:0 16px"><button class="rd-morec" style="margin:0" data-act="rd-unfocus">${icon('back', 16)}전체 댓글 보기</button></div>` : ''}<div class="rd-comments">${tree || '<div class="empty" style="padding:24px 0">아직 댓글이 없습니다.</div>'}${!route.focus && post.hasMoreComments ? `<button class="rd-morec" data-act="rd-more" data-id="${post.id}">${icon('plusCircle', 20)}댓글 더 보기${remaining ? ` (약 ${remaining}개)` : ''}</button>` : ''}</div></div>`;
     }
 
     // ---------- settings (iOS Settings-style navigation) ----------
@@ -3358,7 +3452,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       return `${this.stHeader('Advanced')}<div class="st-section">Vertex AI</div><div class="st-card"><label class="st-field"><span>API version</span><select data-setting="vertexApiVersion"><option value="v1" ${s.vertexApiVersion === 'v1' ? 'selected' : ''}>v1 (권장)</option><option value="v1beta1" ${s.vertexApiVersion === 'v1beta1' ? 'selected' : ''}>v1beta1</option></select></label><label class="st-field"><span>수동 access token · <code class="st-code">gcloud auth print-access-token</code> 결과, 약 1시간 유효</span><input type="password" data-vertex-manual-token autocomplete="off" placeholder="ya29.…"></label><button class="st-btn" data-action="vertex-manual-token">토큰 확인 후 적용${icon('chevronRight', 16)}</button>${kv('Token', vertex.hasToken ? `${vertex.source === 'manual' ? '수동' : 'OAuth'} · ${vertex.authenticated ? `${Math.ceil(vertex.expiresInSeconds / 60)}분 남음` : '만료'}` : '없음')}</div>
 <div class="st-section">Firebase AI</div><div class="st-card"><label class="st-field"><span>Location (Agent Platform)</span><input data-setting="firebaseLocation" value="${this.esc(s.firebaseLocation)}" placeholder="global"></label>${kv('SDK 상태', this.esc({ idle: '미초기화 (사용 시 초기화)', ready: '초기화됨', error: '오류' }[firebase.phase] || firebase.phase))}</div>
 <div class="st-section">Endpoint</div><div class="st-card"><div class="st-mono">Developer · ${this.esc(devEndpoint)}</div><div class="st-mono">Vertex · ${this.esc(vertexEndpoint)}</div><div class="st-mono">Firebase · ${this.esc(firebaseEndpoint)}</div></div>
-<div class="st-section">진단</div><div class="st-card">${kv('App', APP_VERSION)}${kv('DB schema', DB_VERSION)}${kv('World', world ? this.esc(world.id) : '미연결')}${world ? kv('Sync', `${this.esc(world.sync.adapter)} · ${this.esc(world.sync.status)}`) : ''}${world?.sync.error ? `<div class="st-status"><span class="st-dot bad"></span><span>${this.esc(world.sync.error)}</span></div>` : ''}${(this.startupIssues || []).map((issue) => `<div class="st-status"><span class="st-dot bad"></span><span>${this.esc(issue)}</span></div>`).join('')}${kv('이전 Prompt override', '보존됨 · 사용 안 함')}</div>`;
+<div class="st-section">진단</div><div class="st-card">${kv('App', APP_VERSION)}${kv('DB schema', DB_VERSION)}${kv('World', world ? this.esc(world.id) : '미연결')}${kv('채팅방 제목', world?.chatTitle ? `${this.esc(world.chatTitle)} · ${this.esc(world.chatTitleSource || '')}` : '미확인')}${world ? kv('Sync', `${this.esc(world.sync.adapter)} · ${this.esc(world.sync.status)}`) : ''}${world?.sync.error ? `<div class="st-status"><span class="st-dot bad"></span><span>${this.esc(world.sync.error)}</span></div>` : ''}${(this.startupIssues || []).map((issue) => `<div class="st-status"><span class="st-dot bad"></span><span>${this.esc(issue)}</span></div>`).join('')}${kv('이전 Prompt override', '보존됨 · 사용 안 함')}</div>`;
     }
 
     // ---------- events ----------
@@ -3464,7 +3558,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
           case 'rd-sort': return this.replace({ ...route, sort: target.dataset.sort, sortMenu: false }, { keepScroll: true });
           case 'rd-csort-menu': return this.replace({ ...route, csortMenu: !route.csortMenu }, { keepScroll: true });
           case 'rd-csort': return this.replace({ ...route, csort: target.dataset.sort, csortMenu: false }, { keepScroll: true });
-          case 'rd-join': { const joined = await this.engine.toggleRedditJoin(); this.notify('success', joined ? 'r/Fanverse에 가입했습니다.' : '가입을 취소했습니다.'); return this.render({ keepScroll: true }); }
+          case 'rd-join': { const joined = await this.engine.toggleRedditJoin(); this.notify('success', joined ? `${this.communityName()}에 가입했습니다.` : '가입을 취소했습니다.'); return this.render({ keepScroll: true }); }
           case 'rd-vote': await this.engine.voteRedditPost(id, Number(target.dataset.value)); return this.render({ keepScroll: true });
           case 'rd-cvote': await this.engine.voteRedditComment(target.dataset.post, id, Number(target.dataset.value)); return this.render({ keepScroll: true });
           case 'rd-spoiler': this.rdRevealed.add(id); return this.render({ keepScroll: true });
@@ -3479,7 +3573,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
             if (post) GM_setClipboard(`${post.title}\n\n${post.body}`, 'text');
             this.notify('success', '게시물 내용을 클립보드에 복사했습니다.'); return;
           }
-          case 'rd-compose': this.notify('sync', 'r/Fanverse의 글과 댓글은 영구 페르소나들이 씁니다. 더 많은 반응은 "댓글 더 보기"로 불러오세요.'); return;
+          case 'rd-compose': this.notify('sync', `${this.communityName()}의 글과 댓글은 영구 페르소나들이 씁니다. 더 많은 반응은 "댓글 더 보기"로 불러오세요.`); return;
           case 'rd-more': {
             const post = await this.db.get(STORES.redditPosts, id);
             if (!post) return;
@@ -3748,7 +3842,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       // bundled SDK only when the Firebase backend is actually used (a request or 연결 테스트).
       await this.step('world', () => this.routeChanged());
       setInterval(() => { this.routeChanged().catch((error) => console.warn('[RP Fanverse] route check failed', error)); }, 2000);
-      setInterval(() => { if (this.engine.worldInfo && !document.hidden && !this.engine.syncing) this.engine.sync().catch((error) => this.ui.notify('error', error.message)); }, Math.max(15, this.settings.pollSeconds) * 1000);
+      setInterval(() => { if (this.engine.worldInfo && !document.hidden && !this.engine.syncing) this.engine.sync({ silent: true }).catch((error) => this.ui.notify('error', error.message)); }, Math.max(15, this.settings.pollSeconds) * 1000);
     }
 
     async routeChanged() {
@@ -3768,7 +3862,9 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       this.ui.history = []; this.ui.route = null;
       this.ui.refreshBadges();
       if (this.ui.open) await this.ui.render();
-      await this.engine.sync().catch((error) => this.ui.notify('error', error.message));
+      await this.engine.sync({ silent: true }).catch((error) => this.ui.notify('error', error.message));
+      // Also when sync itself failed: the room title is independent of the message log.
+      await this.engine.refreshChatTitle().catch((error) => console.warn('[RP Fanverse] chat title refresh failed', error));
       if (this.ui.open) await this.ui.render();
     }
   }
