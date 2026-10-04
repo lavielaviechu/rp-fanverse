@@ -1,4 +1,4 @@
-/// ==UserScript==
+// ==UserScript==
 // @name         RP Fanverse
 // @namespace    https://crack.wrtn.ai/
 // @version      0.12.0
