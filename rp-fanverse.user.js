@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RP Fanverse
 // @namespace    https://crack.wrtn.ai/
-// @version      0.12.2
+// @version      0.12.3
 // @description  Treats a Crack RP episode as canon and grows a persistent virtual Pixiv/Reddit fandom around it.
 // @author       Personal userscript
 // @match        https://crack.wrtn.ai/stories/*/episodes/*
@@ -13,37 +13,59 @@
 // @grant        GM_setClipboard
 // @grant        unsafeWindow
 // @connect      crack-api.wrtn.ai
+// @connect      firebasevertexai.googleapis.com
+// @connect      content-firebaseappcheck.googleapis.com
 // @connect      generativelanguage.googleapis.com
-// @connect      aiplatform.googleapis.com
-// @connect      oauth2.googleapis.com
 // @connect      googleapis.com
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const APP_VERSION = '0.12.2';
+  const APP_VERSION = '0.12.3';
   const DB_NAME = 'rp-fanverse';
   const DB_VERSION = 1;
   const SETTINGS_KEY = 'rp-fanverse:settings:v1';
-  const PROMPTS_KEY = 'rp-fanverse:prompt-overrides:v1';
-  const VERTEX_TOKEN_KEY = 'rp-fanverse:vertex-token:v1';
-  const SETTINGS_VERSION = 2;
+  // Retired keys, cleaned up once on startup: 0.12.0–0.12.2 per-prompt overrides and the direct
+  // Vertex OAuth access token. Fanverse world data lives in IndexedDB and is never touched.
+  const LEGACY_PROMPTS_KEY = 'rp-fanverse:prompt-overrides:v1';
+  const LEGACY_VERTEX_TOKEN_KEY = 'rp-fanverse:vertex-token:v1';
+  const SETTINGS_VERSION = 3;
   const WORLD_RE = /^\/stories\/([^/]+)\/episodes\/([^/?#]+)/;
   const API_BASE = 'https://crack-api.wrtn.ai/crack-gen/v3';
   const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
-  const VERTEX_SCOPE = 'https://www.googleapis.com/auth/cloud-platform';
+
+  // Firebase Web App config for this project. This is client configuration, not a secret: the apiKey
+  // identifies the Firebase project and is only used to initialise the Firebase app (it is never sent
+  // as a Gemini Developer API key). Abuse protection comes from App Check + API key restrictions.
+  const DEFAULT_FIREBASE_CONFIG = Object.freeze({
+    apiKey: 'AIzaSyAQaeJGobiV4E_jcas1yD5tjL-nv9uD1ek',
+    authDomain: 'c2-refined-31f10.firebaseapp.com',
+    projectId: 'c2-refined-31f10',
+    storageBucket: 'c2-refined-31f10.firebasestorage.app',
+    messagingSenderId: '441466223155',
+    appId: '1:441466223155:web:5b6d30e58cd1ef95fe0146',
+  });
+
+  const DEFAULT_GLOBAL_INSTRUCTION = `- 원작(RP 로그)에 없는 사실을 Canon처럼 단정하지 않는다. 팬 해석과 Canon을 구분한다.
+- 캐릭터의 말투와 성격을 원작에 맞게 유지하고 OOC를 피한다.
+- CP를 승패나 경쟁처럼 다루지 않는다. 1:1, 삼각, 다인 관계, 캐릭터 중심 취향을 모두 자연스러운 팬덤 취향으로 다룬다.
+- Reddit은 실제 커뮤니티처럼 의견이 갈리고, 사람마다 근거와 말투가 다르게 쓴다.
+- Pixiv 제목·캡션·태그는 실제 일본 팬덤에서 볼 법한 자연스러운 표현을 쓴다.`;
+
   const DEFAULT_SETTINGS = Object.freeze({
     settingsVersion: SETTINGS_VERSION,
+    provider: 'firebase',
     apiKey: '',
-    provider: 'developer',
     model: 'gemini-3.8-flash',
     modelPreset: 'gemini-3.8-flash',
     customModelId: '',
-    vertexProjectId: '',
-    vertexLocation: 'global',
-    vertexApiVersion: 'v1',
-    vertexOAuthClientId: '',
+    firebaseLocation: 'global',
+    firebaseConfigOverride: null,
+    appCheckMode: 'off',
+    appCheckSiteKey: '',
+    appCheckDebugToken: '',
+    globalGeminiInstruction: DEFAULT_GLOBAL_INSTRUCTION,
     turnsPerUpdate: 5,
     activity: 'Normal',
     fanworkLanguage: '日本語',
@@ -63,6 +85,7 @@
   // was never a deliberate choice, so migration moves it to the new default preset instead of
   // preserving it as a Custom model ID.
   const LEGACY_DEFAULT_MODELS = Object.freeze(['', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest']);
+  const RETIRED_SETTING_FIELDS = Object.freeze(['vertexProjectId', 'vertexLocation', 'vertexApiVersion', 'vertexOAuthClientId', 'promptOverrides']);
 
   function resolveModelId(settings) {
     if (settings.modelPreset === 'custom') return String(settings.customModelId || '').trim() || DEFAULT_SETTINGS.model;
@@ -74,10 +97,29 @@
     return Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : fallback;
   }
 
+  // Accepts only the fields a Firebase web app needs; anything else in an override is dropped.
+  function normalizeFirebaseConfig(config) {
+    if (!config || typeof config !== 'object') return null;
+    const picked = {};
+    for (const key of ['apiKey', 'authDomain', 'projectId', 'storageBucket', 'messagingSenderId', 'appId']) {
+      if (typeof config[key] === 'string' && config[key].trim()) picked[key] = config[key].trim();
+    }
+    return picked.apiKey && picked.projectId && picked.appId ? picked : null;
+  }
+
+  function resolveFirebaseConfig(settings) {
+    return normalizeFirebaseConfig(settings.firebaseConfigOverride) || { ...DEFAULT_FIREBASE_CONFIG };
+  }
+
   function normalizeSettings(saved = {}) {
     const source = saved && typeof saved === 'object' ? saved : {};
     const result = { ...DEFAULT_SETTINGS, ...source };
-    result.provider = result.provider === 'vertex' ? 'vertex' : 'developer';
+    // 0.12.3: Firebase AI Logic becomes the default backend. Older settings (direct Vertex or the
+    // Gemini Developer API) move to Firebase once; the Developer API key is kept for the advanced
+    // fallback, which the user can still select afterwards.
+    const previousVersion = Number(source.settingsVersion) || 0;
+    if (previousVersion < 3) result.provider = 'firebase';
+    result.provider = result.provider === 'developer' ? 'developer' : 'firebase';
     if (!source.modelPreset) {
       const legacyModel = String(source.model || '').trim();
       if (MODEL_PRESETS.some((preset) => preset.id === legacyModel)) result.modelPreset = legacyModel;
@@ -86,10 +128,14 @@
     }
     if (!['custom', ...MODEL_PRESETS.map((preset) => preset.id)].includes(result.modelPreset)) result.modelPreset = DEFAULT_SETTINGS.modelPreset;
     result.customModelId = String(result.customModelId || '').trim();
-    result.vertexProjectId = String(result.vertexProjectId || '').trim();
-    result.vertexLocation = String(result.vertexLocation || 'global').trim().toLowerCase() || 'global';
-    result.vertexApiVersion = ['v1', 'v1beta1'].includes(result.vertexApiVersion) ? result.vertexApiVersion : 'v1';
-    result.vertexOAuthClientId = String(result.vertexOAuthClientId || '').trim();
+    result.apiKey = String(result.apiKey || '').trim();
+    result.firebaseLocation = String(result.firebaseLocation || 'global').trim().toLowerCase() || 'global';
+    result.firebaseConfigOverride = normalizeFirebaseConfig(result.firebaseConfigOverride);
+    result.appCheckMode = ['off', 'recaptcha-enterprise', 'debug'].includes(result.appCheckMode) ? result.appCheckMode : 'off';
+    result.appCheckSiteKey = String(result.appCheckSiteKey || '').trim();
+    result.appCheckDebugToken = String(result.appCheckDebugToken || '').trim();
+    // An empty string is a deliberate "no common instruction"; only a missing value gets the default.
+    result.globalGeminiInstruction = typeof source.globalGeminiInstruction === 'string' ? source.globalGeminiInstruction : DEFAULT_GLOBAL_INSTRUCTION;
     result.turnsPerUpdate = Math.round(clampNumber(result.turnsPerUpdate, 1, 100, DEFAULT_SETTINGS.turnsPerUpdate));
     result.fanworkTargetLength = Math.round(clampNumber(result.fanworkTargetLength, 500, 30000, DEFAULT_SETTINGS.fanworkTargetLength));
     result.uiScale = clampNumber(result.uiScale, 0.75, 1.25, 1);
@@ -99,29 +145,19 @@
       font: ['gothic', 'mincho'].includes(reader.font) ? reader.font : 'gothic',
       theme: ['light', 'sepia', 'dark'].includes(reader.theme) ? reader.theme : 'light',
     };
-    // 0.11.0 kept prompt overrides inside settings. They now live under PROMPTS_KEY; App.init
-    // migrates the legacy field once and the next save drops it.
-    if (!source.promptOverrides) delete result.promptOverrides;
+    for (const field of RETIRED_SETTING_FIELDS) delete result[field];
     result.settingsVersion = SETTINGS_VERSION;
     result.model = resolveModelId(result);
     return result;
   }
 
-  // Vertex AI host per location: `global` uses the global endpoint, the `us`/`eu` multi-regions
-  // use the regional-endpoint (REP) hosts, and anything else is treated as a region name.
-  function vertexHost(location) {
-    if (location === 'global') return 'aiplatform.googleapis.com';
-    if (location === 'us' || location === 'eu') return `aiplatform.${location}.rep.googleapis.com`;
-    return `${location}-aiplatform.googleapis.com`;
-  }
-
-  function buildVertexEndpoint(settings, stream = false) {
-    const location = String(settings.vertexLocation || 'global').trim().toLowerCase() || 'global';
-    const version = settings.vertexApiVersion === 'v1beta1' ? 'v1beta1' : 'v1';
-    const project = encodeURIComponent(String(settings.vertexProjectId || '').trim());
-    const model = encodeURIComponent(resolveModelId(settings));
-    const method = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
-    return `https://${vertexHost(location)}/${version}/projects/${project}/locations/${encodeURIComponent(location)}/publishers/google/models/${model}:${method}`;
+  // The user's common Gemini instruction travels as systemInstruction, separate from the internal
+  // task prompt. The preamble keeps task rules (JSON shape, canon/fan-interpretation split, source
+  // IDs) authoritative when a style preference would conflict with them.
+  function buildSystemInstruction(instruction) {
+    const text = String(instruction || '').trim();
+    if (!text) return null;
+    return `다음은 사용자가 지정한 RP Fanverse 공통 작성 지침이다. 모든 작업에서 취향·문체·관점 지침으로 반영하라. 단, 각 요청에 포함된 작업 지시(출력 JSON 구조, Canon과 팬 해석의 구분, 근거 ID 규칙)와 충돌하면 작업 지시를 우선한다.\n\n[Gemini 공통 지침]\n${text}`;
   }
 
   const STORES = Object.freeze({
@@ -217,36 +253,8 @@
     },
   };
 
-  // Every runtime value a prompt template can receive. Strings and numbers are inserted as-is;
-  // objects and arrays are inserted as pretty-printed JSON.
-  const PLACEHOLDER_DOCS = Object.freeze({
-    CANON: '현재 Canon 스냅샷 또는 작품/댓글과 관련된 Canon 문맥 (facts, characters, relationships, events) · JSON',
-    NEW_TURNS: '이번에 분석할 RP turn 목록 (turnId, messageIds, user, assistant) · JSON',
-    CANON_UPDATE: '이번 update에서 새로 추출된 Canon facts/events/character·relationship 변화 · JSON',
-    FANDOM_STATE: '누적 팬덤 상태 (해석, CP/태그 momentum, 최근 플랫폼 화제) · JSON',
-    CURRENT_TURN: '현재 처리된 RP turn 번호 · 숫자',
-    ACTIVITY: '팬덤 활동량 설정 (Quiet / Normal / Active / Chaos) · 문자열',
-    PERSONAS: '영구 페르소나 목록 (Reddit 사용자 또는 Pixiv 작가; id, name, 성향) · JSON',
-    REACTIONS: '이번에 실행할 반응 입력 (due pending events, 즉시 반응, 새 Canon events, 해석, cross-post 문맥) · JSON',
-    POST: '댓글을 이어 붙일 Reddit 게시물 (id, title, body, category) · JSON',
-    EXISTING_COMMENTS: '이미 저장된 댓글 목록 (id, parentId, personaId, body, score) · JSON',
-    CONTINUATION_TOPICS: '아직 다루지 않은 토론 주제 목록 · JSON',
-    WORK_METADATA: 'Pixiv 작품 metadata (title, tags, caption, summary, ship, workType, tone, series) · JSON',
-    AUTHOR: '작품을 쓴 Pixiv 작가 페르소나 · JSON',
-    LANGUAGE: '팬픽 언어 설정 · 문자열',
-    TARGET_LENGTH: '목표 글자 수 · 숫자',
-    OUTLINE: '장편 개요 (title, premise, continuityConstraints, sections) · JSON',
-    FANWORK: '검사/수정할 팬픽 전문 · 문자열',
-    ISSUES: 'Continuity Check가 찾은 문제 목록 · JSON',
-    CONTINUITY_NOTES: 'Continuity Check의 메모 목록 · JSON',
-    FANWORK_PROMPT: 'Pixiv Full Fanwork Generator 프롬프트를 렌더링한 전체 텍스트 · 문자열',
-    SECTION_NUMBER: '지금 쓸 섹션 번호 (1부터) · 숫자',
-    SECTION_TOTAL: '전체 섹션 수 · 숫자',
-    PREVIOUS_TEXT: '이미 작성된 앞 섹션의 마지막 부분 (최대 12,000자) · 문자열',
-  });
-
-  // `required` placeholders must stay in the template (removing them would silently drop the data
-  // the call depends on). `optional` ones may be removed; the editor only warns.
+  // Internal task prompts. They are code, not user settings: `required` placeholders are checked by
+  // the unit tests so a template edit cannot silently drop the data a call depends on.
   const PROMPT_DEFINITIONS = Object.freeze({
     redditGenerator: { label: 'Reddit Post Generator', group: 'reddit', description: '팬덤 반응을 Reddit 게시물 + 초기 댓글 샘플로 만듭니다.', output: 'JSON (Reddit posts schema)', required: ['PERSONAS', 'REACTIONS'], optional: ['ACTIVITY'] },
     redditMoreComments: { label: 'Reddit Comment Expansion', group: 'reddit', description: '"more comments"를 누를 때 다음 댓글 batch를 생성합니다.', output: 'JSON (Reddit comments schema)', required: ['POST', 'EXISTING_COMMENTS', 'PERSONAS'], optional: ['CONTINUATION_TOPICS', 'CANON', 'FANDOM_STATE'] },
@@ -259,13 +267,6 @@
     continuity: { label: 'Continuity Check', group: 'continuity', description: '장편 전문을 개요·Canon과 대조해 의도치 않은 모순을 찾습니다.', output: 'JSON (continuity schema)', required: ['FANWORK'], optional: ['OUTLINE', 'CANON'] },
     fanworkRevision: { label: 'Continuity Rewrite / Fix', group: 'continuity', description: 'Continuity Check 결과로 전문을 수정합니다.', output: 'Text (수정된 전문)', required: ['FANWORK', 'ISSUES'], optional: ['LANGUAGE', 'OUTLINE', 'CANON', 'CONTINUITY_NOTES'] },
   });
-
-  const PROMPT_GROUPS = Object.freeze([
-    { id: 'reddit', label: 'Reddit 팬덤 글', hint: '게시물 · 댓글 생성' },
-    { id: 'pixiv', label: 'Pixiv 팬픽', hint: 'metadata · 전문 · 장편' },
-    { id: 'canon', label: 'Canon · Fandom 분석', hint: '원작 추출 · 팬덤 진화' },
-    { id: 'continuity', label: 'Continuity', hint: '장편 검사 · 수정' },
-  ]);
 
   const DEFAULT_PROMPT_TEMPLATES = Object.freeze({
     canonExtractor: `You are the Canon Extractor for RP Fanverse. The RP log is the only canon. Extract only explicit facts, events, knowledge states, spoken claims (without assuming they are true), and confirmed feelings. Never turn inference into canon. Preserve uncertainty. Return Korean descriptions while retaining proper names in their source language when useful.
@@ -420,43 +421,11 @@ ORIGINAL FANWORK:
     return true;
   }
 
-  function overrideTemplate(overrides, promptId) {
-    const entry = overrides?.[promptId];
-    if (typeof entry === 'string') return entry;
-    return typeof entry?.template === 'string' ? entry.template : null;
-  }
-
-  // Resolves the template actually used for a call. An override that no longer validates (for
-  // example after a placeholder rename in a newer version) falls back to the code default rather
-  // than breaking generation; `source` tells the caller which one was used.
-  function resolvePromptTemplate(promptId, overrides = {}) {
-    const custom = overrideTemplate(overrides, promptId);
-    if (custom == null) return { template: DEFAULT_PROMPT_TEMPLATES[promptId], source: 'default', error: null };
-    const { errors } = inspectPromptTemplate(promptId, custom);
-    if (errors.length) return { template: DEFAULT_PROMPT_TEMPLATES[promptId], source: 'fallback', error: errors.join(' / ') };
-    return { template: custom, source: 'override', error: null };
-  }
-
-  function renderPromptTemplate(promptId, values, overrides = {}) {
-    const { template } = resolvePromptTemplate(promptId, overrides);
-    return template.replace(PLACEHOLDER_RE, (_, name) => {
+  function renderPromptTemplate(promptId, values) {
+    return DEFAULT_PROMPT_TEMPLATES[promptId].replace(PLACEHOLDER_RE, (_, name) => {
       const value = values[name];
       return typeof value === 'string' || typeof value === 'number' ? String(value) : JSON.stringify(value ?? null, null, 2);
     });
-  }
-
-  // GM storage layout under PROMPTS_KEY. Only edited prompts are stored; defaultHash records which
-  // code default the edit was based on so the editor can flag defaults that changed since.
-  function normalizePromptStore(raw) {
-    const overrides = {};
-    const source = raw?.overrides && typeof raw.overrides === 'object' ? raw.overrides : {};
-    for (const [id, entry] of Object.entries(source)) {
-      if (!PROMPT_DEFINITIONS[id]) continue;
-      const template = overrideTemplate(source, id);
-      if (template == null) continue;
-      overrides[id] = { template, updatedAt: entry?.updatedAt || new Date().toISOString(), defaultHash: entry?.defaultHash || '' };
-    }
-    return { schemaVersion: 1, overrides };
   }
 
   function parseWorldFromUrl(url) {
@@ -530,8 +499,9 @@ ORIGINAL FANWORK:
   }
 
   // Structured output uses `responseJsonSchema` (standard JSON Schema), which both the Gemini
-  // Developer API and Vertex AI accept. The older `responseSchema` is an OpenAPI subset whose
-  // `type` is a single enum, so nullable fields written as ["string", "null"] would be rejected.
+  // Developer API and Firebase AI Logic (GenerationConfig.responseJsonSchema) accept. The older
+  // `responseSchema` is an OpenAPI subset whose `type` is a single enum, so nullable fields written
+  // as ["string", "null"] would be rejected.
   function buildJsonGenerationConfig(schema, temperature) {
     return { temperature, responseMimeType: 'application/json', responseJsonSchema: schema };
   }
@@ -569,12 +539,14 @@ ORIGINAL FANWORK:
       validateSchema: Utils.validateSchema,
       normalizeSettings,
       resolveModelId,
-      buildVertexEndpoint,
+      normalizeFirebaseConfig,
+      resolveFirebaseConfig,
+      buildSystemInstruction,
+      defaultGlobalInstruction: DEFAULT_GLOBAL_INSTRUCTION,
+      defaultFirebaseConfig: DEFAULT_FIREBASE_CONFIG,
       validatePromptTemplate,
       inspectPromptTemplate,
-      resolvePromptTemplate,
       renderPromptTemplate,
-      normalizePromptStore,
       buildJsonGenerationConfig,
       parseSseText,
       readingMinutes,
@@ -615,52 +587,128 @@ ORIGINAL FANWORK:
     return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })]).finally(() => clearTimeout(timer));
   }
 
-  // Google Identity Services is only needed for the Vertex "Google 로그인" button, so it is never
-  // part of startup. It is injected on demand as a page <script>; with Tampermonkey's sandbox the
-  // resulting `google` global lives on the page window, hence unsafeWindow.
-  const GIS_SRC = 'https://accounts.google.com/gsi/client';
-  const GIS_TIMEOUT_MS = 15000;
-  let gisLoading = null;
-
   function pageWindow() {
     try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow) return unsafeWindow; } catch (_) { /* no unsafeWindow grant */ }
     return window;
   }
 
-  function googleOAuth() {
-    return pageWindow().google?.accounts?.oauth2 || globalThis.google?.accounts?.oauth2 || null;
+  function parseRawHeaders(raw) {
+    const headers = new Headers();
+    for (const line of String(raw || '').split(/\r?\n/)) {
+      const at = line.indexOf(':');
+      if (at > 0) { try { headers.append(line.slice(0, at).trim(), line.slice(at + 1).trim()); } catch (_) { /* forbidden header name */ } }
+    }
+    return headers;
   }
 
-  function loadGoogleIdentityServices(timeoutMs = GIS_TIMEOUT_MS) {
-    const ready = googleOAuth();
-    if (ready) return Promise.resolve(ready);
-    if (gisLoading) return gisLoading; // a second click while loading shares the same request
+  function abortError(signal) {
+    return signal?.reason instanceof Error ? signal.reason : new DOMException('The operation was aborted.', 'AbortError');
+  }
+
+  // fetch() for the bundled Firebase SDK, routed through GM_xmlhttpRequest so requests are not
+  // subject to the host page's CSP/CORS. The body is exposed as a ReadableStream fed from
+  // onprogress, so SSE streaming (generateContentStream) still arrives incrementally; if a userscript
+  // manager does not report partial text, the stream simply delivers everything on load.
+  function gmFetch(input, init = {}) {
+    const url = typeof input === 'string' ? input : input?.url || String(input);
+    if (typeof GM_xmlhttpRequest !== 'function') return fetch(input, init);
+    const signal = init.signal;
+    if (signal?.aborted) return Promise.reject(abortError(signal));
+    return new Promise((resolve, reject) => {
+      const headers = {};
+      new Headers(init.headers || {}).forEach((value, key) => { headers[key] = value; });
+      const encoder = new TextEncoder();
+      let controller = null;
+      let consumed = 0;
+      let responded = false;
+      let finished = false;
+      let request = null;
+      const body = new ReadableStream({ start(c) { controller = c; }, cancel() { try { request?.abort?.(); } catch (_) { /* already done */ } } });
+      const push = (text) => {
+        const fresh = String(text ?? '').slice(consumed);
+        if (!fresh) return;
+        consumed += fresh.length;
+        controller.enqueue(encoder.encode(fresh));
+      };
+      const respond = (response) => {
+        if (responded || !response?.status) return;
+        responded = true;
+        resolve(new Response(body, { status: response.status, statusText: response.statusText || '', headers: parseRawHeaders(response.responseHeaders) }));
+      };
+      const fail = (error) => {
+        if (finished) return;
+        finished = true;
+        if (!responded) { responded = true; reject(error); return; }
+        try { controller.error(error); } catch (_) { /* stream already closed */ }
+      };
+      request = GM_xmlhttpRequest({
+        method: init.method || 'GET', url, headers, data: init.body,
+        onreadystatechange: (response) => { if (response.readyState >= 2) respond(response); },
+        onprogress: (response) => { respond(response); if (responded && !finished) push(response.responseText); },
+        onload: (response) => {
+          respond(response);
+          if (finished) return;
+          finished = true;
+          push(response.responseText);
+          try { controller.close(); } catch (_) { /* cancelled by the reader */ }
+        },
+        onerror: () => fail(new TypeError(`Failed to fetch ${new URL(url).host} (network error)`)),
+        ontimeout: () => fail(new TypeError(`Failed to fetch ${new URL(url).host} (timeout)`)),
+        onabort: () => fail(abortError(signal)),
+      });
+      signal?.addEventListener('abort', () => { try { request?.abort?.(); } catch (_) { /* noop */ } fail(abortError(signal)); }, { once: true });
+    });
+  }
+
+  // Loads a third-party script into the page on demand (deduplicated, with timeout and cleanup so a
+  // failed load can be retried). Used only for reCAPTCHA Enterprise when App Check is configured.
+  const pageScriptLoads = new Map();
+  function loadPageScript(src, isReady, label, timeoutMs = 15000) {
+    if (isReady()) return Promise.resolve();
+    if (pageScriptLoads.has(src)) return pageScriptLoads.get(src);
     let script = null;
-    gisLoading = new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = (error, value) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (error) reject(error); else resolve(value);
-      };
-      const timer = setTimeout(() => finish(new Error(`Google 로그인 라이브러리 로딩 시간 초과 (${Math.round(timeoutMs / 1000)}초)`)), timeoutMs);
+    const loading = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${label} 로딩 시간 초과 (${Math.round(timeoutMs / 1000)}초)`)), timeoutMs);
       script = document.createElement('script');
-      script.src = GIS_SRC;
+      script.src = src;
       script.async = true;
-      script.dataset.rpFanverseGis = '1';
-      script.onload = () => {
-        const oauth = googleOAuth();
-        finish(oauth ? null : new Error('Google 로그인 라이브러리는 받았지만 google.accounts.oauth2를 찾을 수 없습니다'), oauth);
-      };
-      script.onerror = () => finish(new Error('Google 로그인 라이브러리를 불러오지 못했습니다 (네트워크 또는 차단)'));
+      script.dataset.rpFanverse = label;
+      script.onload = () => { clearTimeout(timer); isReady() ? resolve() : reject(new Error(`${label}를 불러왔지만 초기화되지 않았습니다`)); };
+      script.onerror = () => { clearTimeout(timer); reject(new Error(`${label}를 불러오지 못했습니다 (네트워크 또는 차단)`)); };
       (document.head || document.documentElement).appendChild(script);
     }).catch((error) => {
-      gisLoading = null; // allow a later retry
+      pageScriptLoads.delete(src);
       script?.remove();
       throw error;
     });
-    return gisLoading;
+    pageScriptLoads.set(src, loading);
+    return loading;
+  }
+
+  // App Check through the SDK's CustomProvider. The token is obtained here and exchanged with the
+  // documented App Check REST methods (projects.apps.exchangeRecaptchaEnterpriseToken /
+  // exchangeDebugToken) — the same calls the SDK's own providers make — because the built-in
+  // reCAPTCHA provider reads `self.grecaptcha`, which lives on the page window and is not reliably
+  // visible from a userscript sandbox.
+  async function exchangeAppCheckToken(config, method, body) {
+    const url = `https://content-firebaseappcheck.googleapis.com/v1/projects/${encodeURIComponent(config.projectId)}/apps/${config.appId}:${method}?key=${encodeURIComponent(config.apiKey)}`;
+    const response = await gmFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!response.ok) {
+      let message = '';
+      try { message = (await response.json())?.error?.message || ''; } catch (_) { /* non-JSON error */ }
+      throw new Error(`App Check 토큰 교환 실패 (HTTP ${response.status})${message ? `: ${message}` : ''}`);
+    }
+    const json = await response.json();
+    const seconds = parseFloat(String(json.ttl || '3600s'));
+    if (!json.token) throw new Error('App Check 응답에 token이 없습니다');
+    return { token: json.token, expireTimeMillis: Date.now() + (Number.isFinite(seconds) ? seconds : 3600) * 1000 };
+  }
+
+  async function recaptchaEnterpriseToken(siteKey) {
+    const enterprise = () => pageWindow().grecaptcha?.enterprise;
+    await loadPageScript(`https://www.google.com/recaptcha/enterprise.js?render=${encodeURIComponent(siteKey)}`, () => typeof enterprise()?.ready === 'function', 'reCAPTCHA Enterprise');
+    await withTimeout(new Promise((resolve) => enterprise().ready(resolve)), 15000, 'reCAPTCHA Enterprise 준비 시간 초과');
+    return withTimeout(Promise.resolve(enterprise().execute(siteKey, { action: 'fire_app_check' })), 15000, 'reCAPTCHA Enterprise 토큰 발급 시간 초과');
   }
 
   class Database {
@@ -906,20 +954,10 @@ ORIGINAL FANWORK:
     }
   }
 
+  // Builds the internal task prompt (the user prompt of each call). The user's common Gemini
+  // instruction is not mixed in here; it is sent separately as systemInstruction by GeminiClient.
   const PromptLibrary = {
-    overridesProvider: () => ({}),
-    onFallback: null,
-    warned: new Set(),
-    configure(overridesProvider, onFallback = null) { this.overridesProvider = overridesProvider; this.onFallback = onFallback; },
-    render(id, values) {
-      const overrides = this.overridesProvider();
-      const resolved = resolvePromptTemplate(id, overrides);
-      if (resolved.source === 'fallback' && !this.warned.has(id)) {
-        this.warned.add(id);
-        this.onFallback?.(id, resolved.error);
-      }
-      return renderPromptTemplate(id, values, overrides);
-    },
+    render(id, values) { return renderPromptTemplate(id, values); },
     canonExtractor(input) { return this.render('canonExtractor', { CANON: input.canon, NEW_TURNS: input.turns }); },
     fandomUpdate(input) { return this.render('fandomUpdate', { CANON_UPDATE: input.canonUpdate, FANDOM_STATE: input.fandom, CURRENT_TURN: input.currentTurn, ACTIVITY: input.activity }); },
     redditGenerator(input) { return this.render('redditGenerator', { PERSONAS: input.personas, REACTIONS: input.reactions, ACTIVITY: input.activity }); },
@@ -972,36 +1010,46 @@ ORIGINAL FANWORK:
 
   // Shared request/stream/JSON logic. Provider subclasses only supply `request(payload, options)`
   // (endpoint + auth headers), so FanverseEngine never depends on which backend is active.
-  class BaseGenerationClient {
+  // ---------- generation clients ----------
+  // Both clients implement the same interface — generateJson(prompt, schema, options),
+  // generateText(prompt, options), generateTextStream(prompt, options), testConnection(), ready() —
+  // and accept `options.systemInstruction`. FanverseEngine only ever talks to GeminiClient below.
+
+  function isRetryableStatus(status) {
+    return !status || status === 429 || status >= 500;
+  }
+
+  // Advanced fallback: the Gemini Developer API called directly with the user's own Gemini API key.
+  class GeminiDeveloperClient {
     constructor(getSettings) {
       this.getSettings = getSettings;
     }
 
-    describeHttpError(providerName, status, body) {
-      let message = '';
-      try { message = JSON.parse(body)?.error?.message || ''; } catch (_) { /* non-JSON error body */ }
-      if (!message) {
-        try { message = JSON.parse(body)?.[0]?.error?.message || ''; } catch (_) { /* noop */ }
-      }
-      const hints = {
-        400: '요청 형식 또는 model ID를 확인하세요.',
-        401: '인증이 만료되었거나 잘못되었습니다.',
-        403: '권한이 없거나 API가 사용 설정되지 않았습니다.',
-        404: 'model ID, project, location 조합을 확인하세요.',
-        429: '할당량/요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.',
-      };
-      return `${providerName} HTTP ${status}${message ? `: ${message}` : ''}${hints[status] ? ` (${hints[status]})` : ''}`;
+    ready() { return Boolean(this.getSettings().apiKey); }
+
+    endpoint(stream = false) {
+      const method = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
+      return `${GEMINI_BASE}/${encodeURIComponent(resolveModelId(this.getSettings()))}:${method}`;
     }
 
-    send(url, headers, payload, { stream = false, onChunk = null, providerName = 'Gemini' } = {}) {
+    describeHttpError(status, body) {
+      let message = '';
+      try { message = JSON.parse(body)?.error?.message || ''; } catch (_) { /* non-JSON error body */ }
+      const hints = { 400: '요청 형식 또는 model ID를 확인하세요.', 401: 'API key가 잘못되었습니다.', 403: '권한이 없거나 API가 사용 설정되지 않았습니다.', 404: 'model ID를 확인하세요.', 429: '요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.' };
+      return `Gemini Developer API HTTP ${status}${message ? `: ${message}` : ''}${hints[status] ? ` (${hints[status]})` : ''}`;
+    }
+
+    request(payload, { stream = false, onChunk = null } = {}) {
+      const settings = this.getSettings();
+      if (!settings.apiKey) return Promise.reject(new Error('Gemini Developer API key가 없습니다. Settings > 고급 설정에서 입력하세요.'));
       return new Promise((resolve, reject) => {
         let consumed = 0;
         let accumulated = '';
         let sseBuffer = '';
         GM_xmlhttpRequest({
-          method: 'POST', url,
-          headers,
-          data: JSON.stringify(payload), timeout: 180000,
+          method: 'POST', url: this.endpoint(stream), timeout: 300000,
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.apiKey },
+          data: JSON.stringify(payload),
           onprogress: stream ? (response) => {
             const fresh = String(response.responseText || '').slice(consumed);
             consumed += fresh.length;
@@ -1018,228 +1066,236 @@ ORIGINAL FANWORK:
           } : undefined,
           onload: (response) => {
             if (response.status < 200 || response.status >= 300) {
-              reject(Object.assign(new Error(this.describeHttpError(providerName, response.status, response.responseText)), { status: response.status }));
+              reject(Object.assign(new Error(this.describeHttpError(response.status, response.responseText)), { status: response.status }));
               return;
             }
             try {
               if (stream) {
                 const full = parseSseText(response.responseText);
-                if (!full && !accumulated) throw new Error(`${providerName} stream returned no text`);
+                if (!full && !accumulated) throw new Error('Gemini Developer API stream returned no text');
                 resolve(full || accumulated);
                 return;
               }
               const json = JSON.parse(response.responseText);
               const text = candidateText(json);
-              if (!text) {
-                const reason = json.promptFeedback?.blockReason || json.candidates?.[0]?.finishReason;
-                throw new Error(`${providerName} returned no text candidate${reason ? ` (${reason})` : ''}`);
-              }
+              if (!text) throw new Error(`Gemini Developer API returned no text${json.promptFeedback?.blockReason ? ` (${json.promptFeedback.blockReason})` : ''}`);
               resolve(text);
             } catch (error) { reject(error); }
           },
-          onerror: () => reject(new Error(`${providerName} network error`)),
-          ontimeout: () => reject(new Error(`${providerName} request timed out`)),
+          onerror: () => reject(new Error('Gemini Developer API network error')),
+          ontimeout: () => reject(new Error('Gemini Developer API request timed out')),
         });
       });
     }
 
-    async generateJson(prompt, schema, { retries = 1, temperature = 0.5 } = {}) {
+    payload(prompt, generationConfig, systemInstruction) {
+      return {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig,
+        ...(systemInstruction ? { systemInstruction: { parts: [{ text: systemInstruction }] } } : {}),
+      };
+    }
+
+    async generateJson(prompt, schema, { retries = 1, temperature = 0.5, systemInstruction = null } = {}) {
       let lastError;
       for (let attempt = 0; attempt <= retries; attempt += 1) {
         try {
-          const text = await this.request({
-            contents: [{ role: 'user', parts: [{ text: attempt ? `${prompt}\n\nPrevious output failed validation. Return complete valid JSON only.` : prompt }] }],
-            generationConfig: buildJsonGenerationConfig(schema, temperature),
-          });
+          const text = await this.request(this.payload(attempt ? `${prompt}\n\nPrevious output failed validation. Return complete valid JSON only.` : prompt, buildJsonGenerationConfig(schema, temperature), systemInstruction));
           const parsed = Utils.parseJson(text);
           if (!parsed || typeof parsed !== 'object') throw new Error('Structured response is not an object');
           Utils.validateSchema(parsed, schema);
           return parsed;
         } catch (error) {
           lastError = error;
-          if (error.status && error.status !== 429 && error.status < 500) break; // auth/config errors won't fix themselves
+          if (!isRetryableStatus(error.status)) break;
         }
       }
       throw lastError;
     }
 
-    async generateText(prompt, { stream = false, onChunk = null, temperature = 0.85 } = {}) {
-      return this.request({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature } }, { stream, onChunk });
+    generateText(prompt, { stream = false, onChunk = null, temperature = 0.85, systemInstruction = null } = {}) {
+      return this.request(this.payload(prompt, { temperature }, systemInstruction), { stream, onChunk });
     }
+
+    generateTextStream(prompt, options = {}) { return this.generateText(prompt, { ...options, stream: true }); }
 
     async testConnection() {
-      const text = await this.request({ contents: [{ role: 'user', parts: [{ text: 'Reply with exactly OK.' }] }], generationConfig: { temperature: 0 } });
-      return text.trim().slice(0, 40);
+      return (await this.generateText('Reply with exactly OK.', { temperature: 0 })).trim().slice(0, 40);
     }
   }
 
-  class GeminiDeveloperClient extends BaseGenerationClient {
-    endpoint(stream = false) {
-      const method = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
-      return `${GEMINI_BASE}/${encodeURIComponent(resolveModelId(this.getSettings()))}:${method}`;
-    }
-
-    ready() { return Boolean(this.getSettings().apiKey); }
-
-    request(payload, options = {}) {
-      const settings = this.getSettings();
-      if (!settings.apiKey) return Promise.reject(new Error('Gemini Developer API key is not configured'));
-      return this.send(this.endpoint(Boolean(options.stream)), { 'Content-Type': 'application/json', 'x-goog-api-key': settings.apiKey }, payload, { ...options, providerName: 'Gemini Developer API' });
-    }
-  }
-
-  // Vertex AI with a user OAuth access token. Tokens come from Google Identity Services' token
-  // model (the documented browser flow for apps without a backend) or are pasted from
-  // `gcloud auth print-access-token`. Only the short-lived access token and its expiry are kept
-  // (GM storage, never exported); no service-account key, refresh token or client secret is stored.
-  class VertexGeminiClient extends BaseGenerationClient {
+  // Default backend: Firebase AI Logic (firebase/ai) with AgentPlatformBackend — the Agent Platform
+  // (formerly Vertex AI) Gemini API of the configured Firebase/Google Cloud project, called through
+  // the Firebase AI Logic proxy. The SDK is bundled into this file (see createFirebaseSdk at the end)
+  // and only evaluated after the launcher is mounted. Nothing here can take down the UI: failures
+  // are kept in `state` and surfaced in Settings, and only AI generation is affected.
+  class FirebaseAILogicClient {
     constructor(getSettings) {
-      super(getSettings);
-      this.accessToken = '';
-      this.expiresAt = 0;
-      this.tokenSource = '';
-      this.tokenClient = null;
-      this.tokenClientId = '';
+      this.getSettings = getSettings;
+      this.instance = null;
+      this.instanceKey = '';
+      this.state = { phase: 'idle', error: null, appCheck: 'off', appCheckError: null, appCheckAt: null, lastTest: null };
     }
 
-    async restore() {
-      const saved = await GMStore.get(VERTEX_TOKEN_KEY, null);
-      if (saved?.accessToken && Number(saved.expiresAt) > Date.now() + 60000) {
-        this.accessToken = saved.accessToken; this.expiresAt = Number(saved.expiresAt); this.tokenSource = saved.source || 'oauth';
-      } else if (saved) {
-        await GMStore.remove(VERTEX_TOKEN_KEY);
+    configKey(settings) {
+      return JSON.stringify([resolveFirebaseConfig(settings), settings.firebaseLocation, settings.appCheckMode, settings.appCheckSiteKey, settings.appCheckDebugToken]);
+    }
+
+    async appCheckToken(config, settings) {
+      try {
+        let result;
+        if (settings.appCheckMode === 'recaptcha-enterprise') {
+          if (!settings.appCheckSiteKey) throw new Error('reCAPTCHA Enterprise site key가 없습니다');
+          result = await exchangeAppCheckToken(config, 'exchangeRecaptchaEnterpriseToken', { recaptcha_enterprise_token: await recaptchaEnterpriseToken(settings.appCheckSiteKey) });
+        } else {
+          if (!settings.appCheckDebugToken) throw new Error('App Check 디버그 토큰이 없습니다');
+          result = await exchangeAppCheckToken(config, 'exchangeDebugToken', { debug_token: settings.appCheckDebugToken });
+        }
+        this.state.appCheck = 'ok'; this.state.appCheckError = null; this.state.appCheckAt = Date.now();
+        return result;
+      } catch (error) {
+        this.state.appCheck = 'error'; this.state.appCheckError = error.message;
+        throw error;
       }
     }
 
-    async persist() {
-      if (this.accessToken) await GMStore.set(VERTEX_TOKEN_KEY, { accessToken: this.accessToken, expiresAt: this.expiresAt, source: this.tokenSource });
-      else await GMStore.remove(VERTEX_TOKEN_KEY);
+    // Lazily initialises (or re-initialises after a config change) the Firebase app, App Check and AI.
+    ensure() {
+      const settings = this.getSettings();
+      const key = this.configKey(settings);
+      if (this.instance && this.instanceKey === key) return this.instance;
+      try {
+        const sdk = getFirebaseSdk();
+        const config = resolveFirebaseConfig(settings);
+        // A named app per configuration: no clash with any Firebase app the host page may run, and a
+        // changed config gets a fresh app instead of a duplicate-app error.
+        const app = sdk.initializeApp(config, `rp-fanverse-${Utils.hash(key)}`);
+        this.state.appCheck = 'off'; this.state.appCheckError = null;
+        if (settings.appCheckMode !== 'off') {
+          try {
+            sdk.initializeAppCheck(app, { provider: new sdk.CustomProvider({ getToken: () => this.appCheckToken(config, this.getSettings()) }), isTokenAutoRefreshEnabled: true });
+            this.state.appCheck = 'pending';
+          } catch (error) {
+            if (!/already-initialized/.test(error?.code || error?.message || '')) throw error;
+          }
+        }
+        const ai = sdk.getAI(app, { backend: new sdk.AgentPlatformBackend(settings.firebaseLocation || 'global') });
+        this.instance = { sdk, app, ai, config };
+        this.instanceKey = key;
+        this.state.phase = 'ready'; this.state.error = null;
+        return this.instance;
+      } catch (error) {
+        this.instance = null;
+        this.state.phase = 'error'; this.state.error = error?.message || String(error);
+        throw new Error(`Firebase 초기화 실패: ${this.state.error}`);
+      }
+    }
+
+    ready() { return this.state.phase !== 'error'; }
+
+    model(generationConfig, systemInstruction) {
+      const { sdk, ai } = this.ensure();
+      return sdk.getGenerativeModel(ai, {
+        model: resolveModelId(this.getSettings()),
+        generationConfig,
+        ...(systemInstruction ? { systemInstruction } : {}),
+      }, { timeout: 300000 });
+    }
+
+    describeError(error) {
+      const status = error?.customErrorData?.status || error?.status;
+      // The SDK prefixes server errors with "Error fetching from <url>: [403 Forbidden]"; keep the server message.
+      const raw = String(error?.message || error).replace(/^AI: /, '').replace(/^Error fetching from \S+:\s+(\[[^\]]*\]\s*)?/, '').replace(/\s*\(AI\/[\w-]+\)\.?$/, '');
+      let hint = '';
+      if (!status && /Failed to fetch|network error|timeout/i.test(raw)) hint = '네트워크 연결을 확인하세요. Tampermonkey가 googleapis.com 도메인 접근 허용을 물으면 “항상 허용”을 선택하세요.';
+      else if (/App Check/i.test(raw)) hint = '이 모델/프로젝트는 Firebase App Check가 필요합니다. Settings > App Check를 설정하고 Firebase 콘솔에서 Firebase AI Logic의 App Check enforcement를 켜세요.';
+      else if (error?.code === 'api-not-enabled' || /SERVICE_DISABLED|firebasevertexai.googleapis.com\W+to be enabled/i.test(raw)) hint = 'Firebase 콘솔의 AI Logic에서 Agent Platform Gemini API 설정(Get started)을 완료하세요.';
+      else if (status === 429) hint = '요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.';
+      else if (status === 404) hint = 'model ID 또는 location을 확인하세요.';
+      else if (status === 400 && /API key/i.test(raw)) hint = 'Firebase API key 제한(허용 API·HTTP referrer)을 확인하세요.';
+      const message = `Firebase AI Logic${status ? ` HTTP ${status}` : ''}: ${raw.slice(0, 400)}${hint ? `\n→ ${hint}` : ''}`;
+      return Object.assign(new Error(message), { status });
+    }
+
+    responseText(response) {
+      try { return response.text(); } catch (error) { throw new Error(`응답에 텍스트가 없습니다: ${error.message}`); }
+    }
+
+    async generateJson(prompt, schema, { retries = 1, temperature = 0.5, systemInstruction = null } = {}) {
+      let lastError;
+      for (let attempt = 0; attempt <= retries; attempt += 1) {
+        try {
+          const model = this.model(buildJsonGenerationConfig(schema, temperature), systemInstruction);
+          let result;
+          try { result = await model.generateContent(attempt ? `${prompt}\n\nPrevious output failed validation. Return complete valid JSON only.` : prompt); } catch (error) { throw this.describeError(error); }
+          const parsed = Utils.parseJson(this.responseText(result.response));
+          if (!parsed || typeof parsed !== 'object') throw new Error('Structured response is not an object');
+          Utils.validateSchema(parsed, schema);
+          return parsed;
+        } catch (error) {
+          lastError = error;
+          if (!isRetryableStatus(error.status) || /Firebase 초기화 실패/.test(error.message)) break;
+        }
+      }
+      throw lastError;
+    }
+
+    async generateText(prompt, { stream = false, onChunk = null, temperature = 0.85, systemInstruction = null } = {}) {
+      const model = this.model({ temperature }, systemInstruction);
+      try {
+        if (!stream) return this.responseText((await model.generateContent(prompt)).response);
+        const result = await model.generateContentStream(prompt);
+        let accumulated = '';
+        for await (const chunk of result.stream) {
+          let text = '';
+          try { text = chunk.text(); } catch (_) { /* chunk without text (e.g. thought-only) */ }
+          if (text) { accumulated += text; onChunk?.(accumulated); }
+        }
+        if (!accumulated) accumulated = this.responseText(await result.response);
+        return accumulated;
+      } catch (error) {
+        throw error?.customErrorData || /^AI: /.test(error?.message || '') ? this.describeError(error) : error;
+      }
+    }
+
+    generateTextStream(prompt, options = {}) { return this.generateText(prompt, { ...options, stream: true }); }
+
+    async testConnection() {
+      const model = resolveModelId(this.getSettings());
+      try {
+        const text = (await this.generateText('Reply with exactly OK.', { temperature: 0 })).trim().slice(0, 40);
+        this.state.lastTest = { ok: true, at: Date.now(), model, message: text };
+        return text;
+      } catch (error) {
+        this.state.lastTest = { ok: false, at: Date.now(), model, message: error.message };
+        throw error;
+      }
     }
 
     status() {
-      const seconds = Math.max(0, Math.floor((this.expiresAt - Date.now()) / 1000));
-      return { authenticated: Boolean(this.accessToken && seconds > 30), expiresInSeconds: seconds, source: this.tokenSource, hasToken: Boolean(this.accessToken) };
-    }
-
-    ready() { return Boolean(this.getSettings().vertexProjectId && this.status().authenticated); }
-
-    async clearAccessToken() {
-      this.accessToken = ''; this.expiresAt = 0; this.tokenSource = '';
-      await this.persist();
-    }
-
-    async setToken(accessToken, expiresInSeconds, source) {
-      this.accessToken = accessToken;
-      this.expiresAt = Date.now() + Math.max(60, Number(expiresInSeconds) || 3600) * 1000;
-      this.tokenSource = source;
-      await this.persist();
-      return this.status();
-    }
-
-    // Called from the "Google 로그인" click: GIS is lazy-loaded here, then opens its consent popup
-    // from requestAccessToken(). If loading took long enough for the click's user activation to
-    // lapse, the browser may block the popup; the library is cached by then, so a second click works.
-    async authorize() {
       const settings = this.getSettings();
-      if (!settings.vertexOAuthClientId) throw new Error('Vertex OAuth Client ID가 없습니다. Settings에 OAuth Client ID를 먼저 입력하세요.');
-      const loadStarted = Date.now();
-      let oauth;
-      try {
-        oauth = await loadGoogleIdentityServices();
-      } catch (error) {
-        throw new Error(`${error.message}. 잠시 후 다시 시도하거나 아래 수동 access token을 사용하세요.`);
-      }
-      const slowLoad = Date.now() - loadStarted > 3000;
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('Google OAuth window timed out or was closed')), 180000);
-        const settle = (fn) => (value) => { clearTimeout(timer); fn(value); };
-        const onToken = settle(async (response) => {
-          if (response?.error || !response?.access_token) { reject(new Error(response?.error_description || response?.error || 'Google OAuth returned no access token')); return; }
-          if (typeof oauth.hasGrantedAllScopes === 'function' && !oauth.hasGrantedAllScopes(response, VERTEX_SCOPE)) { reject(new Error('cloud-platform scope가 승인되지 않았습니다. 동의 화면에서 권한을 허용하세요.')); return; }
-          resolve(await this.setToken(response.access_token, response.expires_in, 'oauth'));
-        });
-        const onError = settle((error) => reject(new Error(error?.type === 'popup_closed' ? 'Google 로그인 창이 닫혔습니다.' : error?.type === 'popup_failed_to_open' ? (slowLoad ? '라이브러리 로딩이 끝났습니다. "Google 로그인"을 한 번 더 눌러 주세요.' : '팝업이 차단되었습니다. 이 사이트의 팝업을 허용하세요.') : error?.message || error?.type || 'Google OAuth popup failed')));
-        if (!this.tokenClient || this.tokenClientId !== settings.vertexOAuthClientId) {
-          // The token client lives across requests; its callbacks dispatch to whichever request is
-          // pending, so an abandoned popup's late response cannot settle a newer request.
-          this.tokenClient = oauth.initTokenClient({
-            client_id: settings.vertexOAuthClientId,
-            scope: VERTEX_SCOPE,
-            callback: (response) => this.pendingAuth?.onToken(response),
-            error_callback: (error) => this.pendingAuth?.onError(error),
-          });
-          this.tokenClientId = settings.vertexOAuthClientId;
-        }
-        this.pendingAuth?.onError({ type: 'superseded', message: '새 로그인 요청으로 대체되었습니다.' });
-        const pending = {
-          onToken: (response) => { if (this.pendingAuth === pending) { this.pendingAuth = null; onToken(response); } },
-          onError: (error) => { if (this.pendingAuth === pending) { this.pendingAuth = null; onError(error); } },
-        };
-        this.pendingAuth = pending;
-        this.tokenClient.requestAccessToken({ prompt: this.accessToken ? '' : 'consent' });
-      });
-    }
-
-    // Validates a pasted token with Google's tokeninfo endpoint (POST body, so the token never
-    // appears in a URL) and records its real expiry.
-    async useManualToken(token) {
-      const accessToken = String(token || '').trim().replace(/^Bearer\s+/i, '');
-      if (!accessToken) throw new Error('access token을 입력하세요.');
-      const info = await new Promise((resolve, reject) => {
-        GM_xmlhttpRequest({
-          method: 'POST', url: 'https://oauth2.googleapis.com/tokeninfo', timeout: 20000,
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          data: `access_token=${encodeURIComponent(accessToken)}`,
-          onload: (response) => {
-            if (response.status !== 200) { reject(new Error('유효하지 않거나 만료된 access token입니다.')); return; }
-            try { resolve(JSON.parse(response.responseText)); } catch (error) { reject(error); }
-          },
-          onerror: () => reject(new Error('tokeninfo network error')),
-          ontimeout: () => reject(new Error('tokeninfo timed out')),
-        });
-      });
-      if (!String(info.scope || '').split(' ').includes(VERTEX_SCOPE)) throw new Error('이 token에는 cloud-platform scope가 없습니다.');
-      return this.setToken(accessToken, info.expires_in, 'manual');
-    }
-
-    async revoke() {
-      const token = this.accessToken;
-      await this.clearAccessToken();
-      if (!token) return;
-      const oauth = googleOAuth(); // never loads GIS just to log out
-      if (oauth?.revoke) { oauth.revoke(token, () => {}); return; }
-      GM_xmlhttpRequest({ method: 'POST', url: 'https://oauth2.googleapis.com/revoke', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, data: `token=${encodeURIComponent(token)}` });
-    }
-
-    request(payload, options = {}) {
-      const settings = this.getSettings();
-      if (!settings.vertexProjectId) return Promise.reject(new Error('Vertex Google Cloud Project ID is not configured'));
-      if (!this.status().authenticated) return Promise.reject(new Error('Vertex access token이 없거나 만료되었습니다. Settings에서 Google 로그인/재인증을 하세요.'));
-      return this.send(buildVertexEndpoint(settings, Boolean(options.stream)), { 'Content-Type': 'application/json', Authorization: `Bearer ${this.accessToken}` }, payload, { ...options, providerName: 'Vertex AI' }).catch(async (error) => {
-        if (error.status === 401) await this.clearAccessToken();
-        throw error;
-      });
+      return { ...this.state, projectId: resolveFirebaseConfig(settings).projectId, location: settings.firebaseLocation, overridden: Boolean(settings.firebaseConfigOverride), appCheckMode: settings.appCheckMode };
     }
   }
 
-  // Provider-neutral facade used by FanverseEngine and the UI.
+  // Provider-neutral facade used by FanverseEngine and the UI. It adds the user's common Gemini
+  // instruction as systemInstruction to every call except those made with `useInstruction: false`
+  // (the mechanical continuity check).
   class GeminiClient {
     constructor(getSettings) {
       this.getSettings = getSettings;
+      this.firebase = new FirebaseAILogicClient(getSettings);
       this.developer = new GeminiDeveloperClient(getSettings);
-      this.vertex = new VertexGeminiClient(getSettings);
     }
 
-    client(provider = this.getSettings().provider) { return provider === 'vertex' ? this.vertex : this.developer; }
+    client(provider = this.getSettings().provider) { return provider === 'developer' ? this.developer : this.firebase; }
     providerReady() { return this.client().ready(); }
-    generateJson(...args) { return this.client().generateJson(...args); }
-    generateText(...args) { return this.client().generateText(...args); }
+    systemInstruction(useInstruction = true) { return useInstruction === false ? null : buildSystemInstruction(this.getSettings().globalGeminiInstruction); }
+    generateJson(prompt, schema, options = {}) { return this.client().generateJson(prompt, schema, { ...options, systemInstruction: this.systemInstruction(options.useInstruction) }); }
+    generateText(prompt, options = {}) { return this.client().generateText(prompt, { ...options, systemInstruction: this.systemInstruction(options.useInstruction) }); }
+    generateTextStream(prompt, options = {}) { return this.generateText(prompt, { ...options, stream: true }); }
     testConnection(provider) { return this.client(provider).testConnection(); }
-    authorizeVertex() { return this.vertex.authorize(); }
-    useManualVertexToken(token) { return this.vertex.useManualToken(token); }
-    revokeVertex() { return this.vertex.revoke(); }
-    vertexStatus() { return this.vertex.status(); }
-    clearVertexToken() { return this.vertex.clearAccessToken(); }
+    firebaseStatus() { return this.firebase.status(); }
   }
 
   function seedPersonas() {
@@ -1365,9 +1421,9 @@ ORIGINAL FANWORK:
       if (unprocessed.length < settings.turnsPerUpdate) return;
       if (!this.gemini.providerReady()) {
         // Turns are kept unprocessed, so the update simply runs once the provider is usable again.
-        if (settings.provider === 'vertex' && this.gemini.vertexStatus().hasToken === false && !this.warnedProviderUnready) {
+        if (!this.warnedProviderUnready) {
           this.warnedProviderUnready = true;
-          this.notify('error', 'Vertex access token이 없거나 만료되어 자동 갱신을 보류했습니다. Settings에서 재인증하세요.');
+          this.notify('error', settings.provider === 'developer' ? 'Gemini Developer API key가 없어 자동 갱신을 보류했습니다. Settings를 확인하세요.' : 'Firebase AI Logic을 사용할 수 없어 자동 갱신을 보류했습니다. Settings에서 상태를 확인하세요.');
         }
         return;
       }
@@ -1770,13 +1826,13 @@ ORIGINAL FANWORK:
           sections.push(section);
         }
         text = sections.join('\n\n');
-        initialContinuity = await this.gemini.generateJson(PromptLibrary.continuity({ outline, text, canon: canonContext }), Schemas.continuity, { retries: 1, temperature: 0.2 });
+        initialContinuity = await this.gemini.generateJson(PromptLibrary.continuity({ outline, text, canon: canonContext }), Schemas.continuity, { retries: 1, temperature: 0.2, useInstruction: false });
         continuity = initialContinuity;
         if (initialContinuity.issues?.length) {
           onChunk?.(`${text}\n\n[continuity revision in progress…]`);
           text = await this.gemini.generateText(PromptLibrary.fanworkRevision({ outline, text, canon: canonContext, issues: initialContinuity.issues, continuityNotes: initialContinuity.continuityNotes, language: settings.fanworkLanguage }), { stream: false, temperature: 0.55 });
           revisionApplied = true;
-          continuity = await this.gemini.generateJson(PromptLibrary.continuity({ outline, text, canon: canonContext }), Schemas.continuity, { retries: 1, temperature: 0.15 });
+          continuity = await this.gemini.generateJson(PromptLibrary.continuity({ outline, text, canon: canonContext }), Schemas.continuity, { retries: 1, temperature: 0.15, useInstruction: false });
           onChunk?.(text);
         }
       } else {
@@ -1933,7 +1989,7 @@ ORIGINAL FANWORK:
 
   // Shell + home + settings + prompt editor.
   const SHELL_CSS = `
-:host{all:initial;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR","Noto Sans JP",sans-serif;color:#1f1f1f}
+:host{all:initial;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,"Noto Sans KR","Noto Sans JP",sans-serif;color:#1f1f1f}
 *{box-sizing:border-box}[hidden]{display:none!important}
 button{font:inherit;color:inherit;-webkit-tap-highlight-color:transparent}
 .ic{display:block;flex:none}
@@ -1942,43 +1998,72 @@ button{font:inherit;color:inherit;-webkit-tap-highlight-color:transparent}
 .launcher-badge,.app-badge{position:absolute;right:-6px;top:-6px;min-width:20px;height:20px;padding:0 6px;border-radius:10px;background:#ff3b30;color:#fff;font:700 11px/20px -apple-system,system-ui,sans-serif;text-align:center;box-shadow:0 0 0 2px #fff}
 .veil[hidden]{display:none!important}
 .veil{position:fixed;inset:0;z-index:2147483001;background:#0d0b1299;display:grid;place-items:center;padding:16px}
-.phone{position:relative;width:min(392px,calc(100vw - 20px));height:min(820px,calc(100vh - 24px));background:#fff;border:9px solid #0e0e10;border-radius:46px;overflow:hidden;box-shadow:0 0 0 1.5px #3a3a40,0 30px 80px #000a;display:grid;grid-template-rows:38px minmax(0,1fr) 54px;transform:scale(var(--ui-scale,1))}
-.statusbar{position:relative;z-index:6;display:grid;grid-template-columns:40px 1fr 40px;align-items:center;padding:0 8px;background:#fff;color:#111}
-.statusbar button{width:32px;height:32px;border:0;border-radius:50%;background:transparent;display:grid;place-items:center;cursor:pointer;color:#111}
+.phone{position:relative;width:min(392px,calc(100vw - 20px));height:min(820px,calc(100vh - 24px));background:#fff;border:9px solid #0e0e10;border-radius:46px;overflow:hidden;box-shadow:0 0 0 1.5px #3a3a40,0 30px 80px #000a;display:grid;grid-template-rows:40px minmax(0,1fr) 54px;transform:scale(var(--ui-scale,1))}
+.statusbar{position:relative;z-index:6;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 10px 0 14px;background:var(--sb-bg,#fff);color:#000}
+.sb-left,.sb-right{display:flex;align-items:center;gap:4px;min-width:0}
+.sb-right{justify-content:flex-end;gap:6px}
+.statusbar .clock{font:600 15px/1 -apple-system,"SF Pro Text",system-ui,sans-serif;letter-spacing:-.2px;padding-left:4px}
+.statusbar button{width:28px;height:28px;border:0;border-radius:50%;background:transparent;display:grid;place-items:center;cursor:pointer;color:#000;padding:0}
 .statusbar button:hover{background:#0000000d}
-.brand{display:flex;align-items:center;justify-content:center;gap:6px;font:600 13px/1 -apple-system,system-ui,sans-serif;letter-spacing:.01em}
-.brand small{color:#8e8e93;font:500 10px/1 -apple-system,system-ui,sans-serif}
-.phone.dark-bar .statusbar{background:transparent;color:#fff;position:absolute;left:0;right:0;top:0;height:38px}
-.phone.dark-bar .statusbar button{color:#fff}
-.phone.dark-bar main.screen{grid-row:1/3}
+.statusbar [data-action="back"]{margin-left:-8px}
+.sb-icons{display:flex;align-items:center;gap:5px;color:#000}
+.brand small{color:#8e8e93;font:500 10px/1 -apple-system,system-ui,sans-serif;white-space:nowrap}
 main.screen{position:relative;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;background:#fff;min-height:0}
 main.screen::-webkit-scrollbar{width:0;height:0}
-.phone nav{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid #0000001a;background:#fbfbfdf2;z-index:5}
+.phone nav{display:grid;grid-template-columns:repeat(4,1fr);border-top:.5px solid #0000002e;background:#f9f9f9;z-index:5}
 .phone nav button{position:relative;border:0;background:transparent;color:#8e8e93;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;cursor:pointer;font-size:10px}
-.phone nav button.active{color:#111}
+.phone nav button.active{color:#007aff}
 .phone nav .app-badge{right:calc(50% - 22px);top:4px;min-width:16px;height:16px;line-height:16px;font-size:9px;padding:0 4px}
 .toast{position:absolute;left:16px;right:16px;bottom:66px;z-index:20;background:#1c1c1eeb;color:#fff;padding:11px 14px;border-radius:14px;font:12px/1.45 -apple-system,system-ui,sans-serif;box-shadow:0 8px 24px #0005;white-space:pre-line}
 .toast[data-kind="error"]{background:#3a1416f0}
 .empty{text-align:center;color:#858585;padding:48px 16px;font-size:13px;line-height:1.6}
 @media(max-width:500px){.launcher{right:12px;bottom:80px}.veil{padding:0}.phone{width:100vw;height:100vh;height:100dvh;border:0;border-radius:0;box-shadow:none;transform:none}}
 
-.screen-home{background:radial-gradient(120% 70% at 20% 0%,#7b6cf0 0%,#3c3a8f 45%,#141428 100%)!important;color:#fff;padding:52px 18px 24px}
-.home-time{text-align:center;font:200 58px/1 -apple-system,system-ui,sans-serif;letter-spacing:-1px}
-.home-date{text-align:center;font:500 13px/1.4 -apple-system,system-ui,sans-serif;opacity:.85;margin:6px 0 22px}
-.home-widget{border-radius:22px;padding:14px 16px;background:#ffffff26;border:1px solid #ffffff22;backdrop-filter:blur(18px);font-size:12px;line-height:1.55;margin-bottom:18px}
-.home-widget b{font-size:13px}
-.home-widget .warn{color:#ffd60a}
-.home-apps{display:grid;grid-template-columns:repeat(4,1fr);gap:16px 10px;margin:4px 0 22px}
-.home-app{position:relative;border:0;background:transparent;color:#fff;display:flex;flex-direction:column;align-items:center;gap:6px;font-size:11px;cursor:pointer}
-.home-icon{width:58px;height:58px;border-radius:15px;display:grid;place-items:center;box-shadow:0 6px 16px #0003}
-.home-icon.pixiv{background:#0096fa;color:#fff;font:900 30px/1 "Helvetica Neue",Arial,sans-serif}
-.home-icon.reddit{background:#ff4500}
-.home-icon.settings{background:linear-gradient(#8e8e93,#636366);color:#fff}
-.home-icon.prompts{background:linear-gradient(#5e5ce6,#3634a3);color:#fff}
-.home-app .app-badge{right:4px;top:-4px}
-.home-section{font:600 12px/1 -apple-system,system-ui,sans-serif;opacity:.75;margin:0 2px 10px}
-.home-chips{display:flex;flex-wrap:wrap;gap:6px}
-.home-chip{border:0;border-radius:999px;padding:7px 11px;background:#ffffff26;color:#fff;font-size:11px;cursor:pointer}
+.screen-home{background:#f2f2f7!important;color:#000;padding-bottom:28px}
+.sf-searchwrap{position:sticky;top:0;z-index:4;padding:6px 16px 10px;background:#f2f2f7}
+.sf-search{display:flex;align-items:center;gap:8px;height:44px;padding:0 8px 0 14px;border-radius:22px;background:#fff;color:#8a8a8e;box-shadow:0 0 0 .5px #0000001a,0 1px 3px #0000000f}
+.sf-search input{flex:1;min-width:0;border:0;outline:0;background:transparent;color:#000;font:16px/22px -apple-system,"SF Pro Text",system-ui,sans-serif}
+.sf-search input::placeholder{color:#8a8a8e}
+.sf-search button{width:28px;height:28px;border:0;border-radius:50%;background:transparent;color:#8a8a8e;display:grid;place-items:center;cursor:pointer}
+.sf-h{display:flex;align-items:baseline;justify-content:space-between;margin:22px 16px 10px}
+.sf-h h2{margin:0;font:700 20px/24px -apple-system,"SF Pro Display",system-ui,sans-serif;letter-spacing:-.3px;color:#000}
+.sf-h button{border:0;background:transparent;padding:0;color:#8a8a8e;font-size:15px;display:flex;align-items:center;gap:2px;cursor:pointer}
+.sf-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px 6px;padding:0 12px}
+.sf-fav{position:relative;display:flex;flex-direction:column;align-items:center;gap:6px;border:0;background:transparent;padding:0;cursor:pointer;min-width:0}
+.sf-tile{width:64px;height:64px;border-radius:16px;display:grid;place-items:center;background:#fff;box-shadow:0 0 0 .5px #0000001a;overflow:hidden}
+.sf-fav:active .sf-tile{transform:scale(.96)}
+.sf-tile.pixiv{background:#0096fa;color:#fff;font:800 34px/1 "Helvetica Neue",Arial,sans-serif}
+.sf-tile.reddit{background:#fff}
+.sf-tile.guide{background:#fff;color:#5e5ce6}
+.sf-tile.settings{background:#8e8e93;color:#fff}
+.sf-tile.letter{background:var(--t,#e5e5ea);color:#fff;font:600 24px/1 -apple-system,system-ui,sans-serif}
+.sf-label{width:100%;color:#3c3c43;font-size:12px;line-height:15px;text-align:center;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all}
+.sf-fav .app-badge{right:6px;top:-6px}
+.sf-pages{display:grid;grid-auto-flow:column;grid-auto-columns:calc(100% - 44px);gap:10px;overflow-x:auto;padding:0 16px 2px;scroll-snap-type:x mandatory;scroll-padding:0 16px;scrollbar-width:none}
+.sf-pages::-webkit-scrollbar{display:none}
+.sf-page{display:grid;gap:10px;align-content:start;scroll-snap-align:start}
+.sf-card{display:flex;gap:12px;width:100%;min-height:96px;padding:12px;border:0;border-radius:18px;background:#fff;text-align:left;cursor:pointer;box-shadow:0 0 0 .5px #0000000f}
+.sf-card:active{background:#f7f7f7}
+.sf-thumb{flex:none;width:72px;height:72px;border-radius:10px;display:grid;place-items:center;overflow:hidden;color:#fff;font:700 13px/1.25 -apple-system,system-ui,sans-serif;text-align:center;padding:6px;background:var(--t,#c7c7cc)}
+.sf-thumb.reddit{background:#fff4ef;color:#d93900;font-size:15px;display:flex;flex-direction:column;gap:2px;align-items:center;justify-content:center}
+.sf-thumb.reddit small{font-size:10px;font-weight:600;color:#8a8a8e}
+.sf-card-body{flex:1;min-width:0;display:flex;flex-direction:column}
+.sf-card-title{color:#000;font:600 15px/20px -apple-system,system-ui,sans-serif;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.sf-card-desc{margin-top:2px;color:#8a8a8e;font-size:13px;line-height:17px;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
+.sf-card-site{margin-top:auto;padding-top:6px;color:#8a8a8e;font-size:12px;line-height:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sf-list{margin:0 16px;border-radius:14px;background:#fff;overflow:hidden;box-shadow:0 0 0 .5px #0000000f}
+.sf-row{display:flex;align-items:center;gap:12px;width:100%;min-height:52px;padding:8px 14px;border:0;background:transparent;text-align:left;cursor:pointer;position:relative}
+.sf-row+.sf-row:before{content:"";position:absolute;left:58px;right:0;top:0;height:.5px;background:#3c3c4329}
+.sf-row:active{background:#f2f2f7}
+.sf-dot{flex:none;width:32px;height:32px;border-radius:9px;display:grid;place-items:center;color:#fff;background:var(--t,#8e8e93)}
+.sf-row-body{flex:1;min-width:0}
+.sf-row-title{display:block;color:#000;font-size:15px;line-height:20px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sf-row-sub{display:block;color:#8a8a8e;font-size:12px;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sf-row time{flex:none;color:#8a8a8e;font-size:12px}
+.sf-note{margin:10px 20px 0;color:#8a8a8e;font-size:12px;line-height:17px}
+.sf-note.warn{color:#c93400}
+.sf-empty{margin:0 16px;padding:18px;border-radius:14px;background:#fff;color:#8a8a8e;font-size:13px;line-height:18px;text-align:center}
+.sf-foot{margin:26px 16px 0;color:#8a8a8e;font-size:11px;line-height:16px;text-align:center}
 
 .screen-settings{background:#f2f2f7!important;padding-bottom:28px}
 .st-title{padding:14px 18px 2px;font:700 26px/1.2 -apple-system,system-ui,sans-serif}
@@ -1988,10 +2073,13 @@ main.screen::-webkit-scrollbar{width:0;height:0}
 .st-field:last-child{border-bottom:0}
 .st-field>span{display:block;margin-bottom:6px;color:#6d6d72;font-size:11px;font-weight:600}
 .st-field input,.st-field select,.st-field textarea{width:100%;border:0;border-radius:8px;padding:9px 10px;background:#f2f2f7;color:#111;font:13px/1.35 -apple-system,system-ui,sans-serif;outline:none}
+.st-field textarea{font:11.5px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;min-height:150px;resize:vertical}
 .st-field input:focus,.st-field select:focus,.st-field textarea:focus{box-shadow:0 0 0 2px #007aff55}
 .st-inline{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid #e5e5ea;font-size:14px}
 .st-inline:last-child{border-bottom:0}
 .st-inline input[type=checkbox]{width:20px;height:20px;accent-color:#34c759}
+.st-kv{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid #e5e5ea;font-size:14px}
+.st-kv span:last-child{color:#8a8a8e;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .st-btn{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;padding:12px 14px;border:0;border-bottom:1px solid #e5e5ea;background:#fff;color:#007aff;text-align:left;font-size:14px;cursor:pointer}
 .st-btn:last-child{border-bottom:0}
 .st-btn:hover{background:#f7f7fa}
@@ -1999,10 +2087,12 @@ main.screen::-webkit-scrollbar{width:0;height:0}
 .st-btn:disabled{color:#c7c7cc;cursor:default}
 .st-btn .ic{color:#c7c7cc}
 .st-note{padding:8px 18px 0;color:#6d6d72;font-size:11px;line-height:1.55}
+.st-note.warn{color:#c93400}
 .st-note code,.st-code{font:11px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;background:#e9e9ee;border-radius:5px;padding:1px 4px;word-break:break-all}
-.st-status{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid #e5e5ea;font-size:12px;color:#3a3a3c}
+.st-status{display:flex;align-items:flex-start;gap:8px;padding:10px 14px;border-bottom:1px solid #e5e5ea;font-size:12px;line-height:1.45;color:#3a3a3c;white-space:pre-line;word-break:break-word}
+.st-status .st-dot{margin-top:4px}
 .st-dot{width:8px;height:8px;border-radius:50%;background:#c7c7cc;flex:none}
-.st-dot.ok{background:#34c759}.st-dot.bad{background:#ff3b30}
+.st-dot.ok{background:#34c759}.st-dot.bad{background:#ff3b30}.st-dot.warn{background:#ff9500}
 .st-badge{margin-left:auto;padding:2px 7px;border-radius:999px;background:#e9e9ee;color:#3a3a3c;font-size:10px;font-weight:700}
 .st-badge.on{background:#007aff;color:#fff}
 details.st-details{margin:0 14px;background:#fff;border-radius:12px;overflow:hidden}
@@ -2011,37 +2101,16 @@ details.st-details>summary::-webkit-details-marker{display:none}
 details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
 .st-steps{margin:0;padding:10px 14px 12px 30px;font-size:11.5px;line-height:1.6;color:#3a3a3c}
 
-.pe-head{padding:14px 18px 4px}
-.pe-head h2{margin:0;font:700 22px/1.25 -apple-system,system-ui,sans-serif}
-.pe-head p{margin:6px 0 0;color:#6d6d72;font-size:12px;line-height:1.5}
-.pe-item{display:grid;grid-template-columns:1fr auto;gap:2px 10px;align-items:center;width:100%;padding:11px 14px;border:0;border-bottom:1px solid #e5e5ea;background:#fff;text-align:left;cursor:pointer}
-.pe-item:last-child{border-bottom:0}
-.pe-item:hover{background:#f7f7fa}
-.pe-item b{font-size:14px;font-weight:600}
-.pe-item small{grid-column:1;color:#6d6d72;font-size:11px;line-height:1.4}
-.pe-item .st-badge{grid-row:1/3;grid-column:2;margin:0}
-.pe-item .st-badge.warn{background:#ff9500;color:#fff}
-.pe-group-head{display:flex;align-items:baseline;gap:8px}
-.pe-group-head small{text-transform:none;letter-spacing:0;color:#8e8e93}
-.pe-meta{margin:10px 14px 0;padding:10px 12px;border-radius:10px;background:#fff;font-size:11.5px;line-height:1.55;color:#3a3a3c}
-.pe-chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 14px 0}
-.pe-chip{border:1px solid #d1d1d6;border-radius:8px;background:#fff;padding:5px 8px;font:600 11px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;color:#3634a3;cursor:pointer;text-align:left}
-.pe-chip.req{border-color:#5e5ce6;background:#efeffd}
-.pe-chip:hover{background:#e5e5fb}
-.pe-doc{margin:8px 14px 0;font-size:11px;line-height:1.55;color:#6d6d72}
-.pe-doc div{padding:2px 0}
-.pe-doc code{font:600 10.5px ui-monospace,SFMono-Regular,Consolas,monospace;color:#3634a3}
-.pe-textarea{display:block;width:calc(100% - 28px);margin:10px 14px 0;min-height:340px;resize:vertical;border:0;border-radius:12px;padding:12px;background:#1c1c1e;color:#f2f2f7;font:11.5px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;outline:none;tab-size:2}
-.pe-textarea:focus{box-shadow:0 0 0 2px #5e5ce6}
-.pe-validation{margin:10px 14px 0;font-size:11.5px;line-height:1.5}
-.pe-validation .ok{color:#248a3d}
-.pe-validation .err{color:#d70015;white-space:pre-wrap}
-.pe-validation .warn{color:#b25000}
-.pe-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 14px 0}
-.pe-actions button{border:0;border-radius:10px;padding:11px 8px;background:#fff;color:#007aff;font-size:13px;cursor:pointer}
-.pe-actions button.primary{background:#007aff;color:#fff;font-weight:600}
-.pe-actions button.primary:disabled{background:#a7c8f5;cursor:not-allowed}
-.pe-actions button.danger{color:#ff3b30}
+.gi-head{padding:14px 18px 2px}
+.gi-head h2{margin:0;font:700 26px/1.2 -apple-system,system-ui,sans-serif}
+.gi-head p{margin:8px 0 0;color:#6d6d72;font-size:13px;line-height:1.55}
+.gi-text{display:block;width:calc(100% - 28px);min-height:380px;margin:14px 14px 0;padding:14px;border:0;border-radius:14px;background:#fff;color:#000;font:15px/1.6 -apple-system,"SF Pro Text",system-ui,"Noto Sans KR",sans-serif;resize:vertical;outline:none;box-shadow:0 0 0 .5px #0000001a}
+.gi-text:focus{box-shadow:0 0 0 2px #007aff66}
+.gi-meta{display:flex;justify-content:space-between;margin:8px 20px 0;color:#8a8a8e;font-size:12px}
+.gi-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 14px 0}
+.gi-actions button{height:46px;border:0;border-radius:12px;background:#fff;color:#007aff;font-size:15px;cursor:pointer}
+.gi-actions button.primary{background:#007aff;color:#fff;font-weight:600}
+.gi-actions button:disabled{opacity:.45;cursor:default}
 `;
 
   // Pixiv (mobile web, measured from pixiv.net novel tag/detail/user pages).
@@ -2328,11 +2397,13 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
 .rd-member small{display:block;color:var(--rd-weak);font-size:12px;line-height:16px}
 `;
 
+  const STATUS_ICONS = '<svg width="17" height="11" viewBox="0 0 17 11" aria-hidden="true"><rect x="0" y="7" width="3" height="4" rx="1" fill="currentColor"/><rect x="4.5" y="5" width="3" height="6" rx="1" fill="currentColor"/><rect x="9" y="2.5" width="3" height="8.5" rx="1" fill="currentColor"/><rect x="13.5" y="0" width="3" height="11" rx="1" fill="currentColor"/></svg><svg width="15" height="11" viewBox="0 0 15 11" aria-hidden="true"><path d="M7.5 2.2c2.2 0 4.2.8 5.7 2.2l1.1-1.1A9.6 9.6 0 0 0 7.5.6 9.6 9.6 0 0 0 .7 3.3l1.1 1.1a8 8 0 0 1 5.7-2.2zm0 3.1c1.3 0 2.5.5 3.5 1.3l1.1-1.1a6.6 6.6 0 0 0-9.2 0L4 6.6a5 5 0 0 1 3.5-1.3zm0 3c-.5 0-.9.2-1.3.5L7.5 10l1.3-1.2c-.4-.3-.8-.5-1.3-.5z" fill="currentColor"/></svg><svg width="25" height="12" viewBox="0 0 25 12" aria-hidden="true"><rect x=".5" y=".5" width="21" height="11" rx="3.2" fill="none" stroke="currentColor" opacity=".4"/><rect x="2" y="2" width="16" height="8" rx="2" fill="currentColor"/><path d="M23 4v4c.8-.3 1.4-1.1 1.4-2s-.6-1.7-1.4-2z" fill="currentColor" opacity=".4"/></svg>';
+
   class PhoneUI {
-    constructor(engine, db, getSettings, saveSettings, prompts) {
-      this.engine = engine; this.db = db; this.getSettings = getSettings; this.saveSettings = saveSettings; this.prompts = prompts;
+    constructor(engine, db, getSettings, saveSettings) {
+      this.engine = engine; this.db = db; this.getSettings = getSettings; this.saveSettings = saveSettings;
       this.host = null; this.root = null; this.open = false; this.view = 'home'; this.route = null; this.toastTimer = null;
-      this.history = []; this.renderToken = 0; this.promptDraft = null; this.validateTimer = null; this.searchTimer = null;
+      this.history = []; this.renderToken = 0; this.instructionDraft = null; this.searchTimer = null;
     }
 
     mount() {
@@ -2341,7 +2412,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       this.host.id = 'rp-fanverse-host';
       this.root = this.host.attachShadow({ mode: 'open' });
       const navButton = (view, iconName, label) => `<button data-view="${view}" aria-label="${label}">${icon(iconName, 22)}<span>${label}</span></button>`;
-      this.root.innerHTML = `<style>${SHELL_CSS}${PIXIV_CSS}${REDDIT_CSS}</style><button class="launcher" aria-label="RP Fanverse 열기" aria-expanded="false"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="6.5" y="2.8" width="11" height="18.4" rx="2.6"/><path d="M10.5 5.6h3"/></svg><span class="launcher-badge" hidden></span></button><div class="veil" hidden aria-hidden="true"><section class="phone" role="dialog" aria-modal="true" aria-label="RP Fanverse"><header class="statusbar"><button data-action="back" aria-label="뒤로">${icon('back', 20)}</button><div class="brand"><span class="clock"></span><small></small></div><button data-action="close" aria-label="닫기">${icon('close', 20)}</button></header><main class="screen screen-home"></main><nav>${navButton('home', 'home', 'Home')}${navButton('pixiv', 'pen', 'Pixiv')}${navButton('reddit', 'comment', 'Reddit')}${navButton('settings', 'gear', 'Settings')}</nav><div class="toast" hidden></div></section></div>`;
+      this.root.innerHTML = `<style>${SHELL_CSS}${PIXIV_CSS}${REDDIT_CSS}</style><button class="launcher" aria-label="RP Fanverse 열기" aria-expanded="false"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="6.5" y="2.8" width="11" height="18.4" rx="2.6"/><path d="M10.5 5.6h3"/></svg><span class="launcher-badge" hidden></span></button><div class="veil" hidden aria-hidden="true"><section class="phone" role="dialog" aria-modal="true" aria-label="RP Fanverse"><header class="statusbar"><div class="sb-left"><button data-action="back" aria-label="뒤로">${icon('back', 18)}</button><span class="clock"></span></div><div class="brand"><small></small></div><div class="sb-right"><span class="sb-icons">${STATUS_ICONS}</span><button data-action="close" aria-label="닫기">${icon('close', 16)}</button></div></header><main class="screen screen-home"></main><nav>${navButton('home', 'home', 'Home')}${navButton('pixiv', 'pen', 'Pixiv')}${navButton('reddit', 'comment', 'Reddit')}${navButton('settings', 'gear', 'Settings')}</nav><div class="toast" hidden></div></section></div>`;
       document.documentElement.appendChild(this.host);
       this.host.style.setProperty('--ui-scale', String(this.getSettings().uiScale || 1));
       this.bind(); this.refreshBadges();
@@ -2376,23 +2447,24 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       this.root.querySelector('.launcher').setAttribute('aria-expanded', 'false');
     }
 
-    confirmDiscardPrompt() {
-      if (!this.promptDraft?.dirty) return true;
-      if (!confirm('저장하지 않은 프롬프트 변경 사항이 있습니다. 버릴까요?')) return false;
-      this.promptDraft = null;
+    // Unsaved edits on the Gemini 공통 지침 screen survive accidental navigation only by consent.
+    confirmDiscardDraft() {
+      if (!this.instructionDraft?.dirty) return true;
+      if (!confirm('저장하지 않은 Gemini 공통 지침 변경 사항이 있습니다. 버릴까요?')) return false;
+      this.instructionDraft = null;
       return true;
     }
 
     // Bottom-nav switch: a fresh stack per app.
     go(view, route = null) {
-      if (!this.confirmDiscardPrompt()) return;
+      if (!this.confirmDiscardDraft()) return;
       this.view = view; this.route = route; this.history = [];
       this.render();
     }
 
     // In-app navigation: remembers where the user was (including scroll) for back().
     push(route, view = this.view) {
-      if (!this.confirmDiscardPrompt()) return;
+      if (!this.confirmDiscardDraft()) return;
       this.history.push({ view: this.view, route: this.route, scroll: this.root.querySelector('main').scrollTop });
       this.view = view; this.route = route;
       this.render();
@@ -2405,7 +2477,7 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
     }
 
     back() {
-      if (!this.confirmDiscardPrompt()) return;
+      if (!this.confirmDiscardDraft()) return;
       const previous = this.history.pop();
       if (previous) { this.view = previous.view; this.route = previous.route; this.render({ restoreScroll: previous.scroll }); return; }
       if (this.route) { this.route = null; this.render(); return; }
@@ -2422,10 +2494,12 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
 
     renderHeader() {
       const now = new Date();
-      const clock = this.root.querySelector('.brand .clock');
+      const clock = this.root.querySelector('.statusbar .clock');
       if (clock) clock.textContent = `${now.getHours()}:${String(now.getMinutes()).padStart(2, '0')}`;
       const small = this.root.querySelector('.brand small');
       if (small) small.textContent = this.engine.world ? `${this.engine.world.turnCount} turns · ${this.engine.world.sync.adapter}` : 'connecting…';
+      const back = this.root.querySelector('[data-action="back"]');
+      if (back) back.hidden = this.view === 'home' && !this.route && !this.history.length;
     }
 
     refreshBadges() {
@@ -2453,24 +2527,23 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       // Without a world (still starting, or IndexedDB/route attach failed) only Settings and the
       // status screen are available, so opening the phone can never show a blank page.
       const startup = !this.engine.world && this.view !== 'settings';
-      this.root.querySelector('.phone').classList.toggle('dark-bar', this.view === 'home' && !startup);
       let html;
       try {
         if (startup) html = this.startupHtml();
-        else if (this.view === 'home') html = this.homeHtml();
+        else if (this.view === 'home') html = await this.homeHtml();
         else if (this.view === 'reddit') html = await this.redditHtml();
         else if (this.view === 'pixiv') html = await this.pixivHtml();
-        else if (this.route?.type === 'prompt-list') html = this.promptListHtml();
-        else if (this.route?.type === 'prompt-editor') html = this.promptEditorHtml();
+        else if (this.route?.type === 'instruction') html = this.instructionHtml();
         else html = this.settingsHtml();
       } catch (error) {
         html = `<div class="empty">${Utils.escapeHtml(error.message)}</div>`;
       }
       if (token !== this.renderToken) return; // a newer render started while this one awaited IndexedDB
-      main.className = `screen screen-${startup ? 'settings' : this.view}`;
+      const screen = startup ? 'settings' : this.view;
+      main.className = `screen screen-${screen}`;
+      this.root.querySelector('.statusbar').style.setProperty('--sb-bg', screen === 'home' || screen === 'settings' ? '#f2f2f7' : '#fff');
       main.innerHTML = html;
       main.scrollTop = restoreScroll ?? (keepScroll ? previousScroll : 0);
-      if (this.route?.type === 'prompt-editor') this.updatePromptValidation();
       this.refreshBadges();
     }
 
@@ -2512,21 +2585,85 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       return `<div class="st-title">Fanverse</div><div class="st-section">상태</div><div class="st-card"><div class="st-status"><span class="st-dot ${issues.length ? 'bad' : ''}"></span>${issues.length ? '일부 초기화 단계가 실패했습니다' : 'RP world 연결 중…'}</div>${issues.map((issue) => `<div class="st-status">${this.esc(issue)}</div>`).join('')}<button class="st-btn" data-go="settings">Settings 열기${icon('chevronRight', 18)}</button></div><div class="st-note">launcher와 Settings는 AI provider 설정이나 Vertex 인증 상태와 관계없이 항상 사용할 수 있습니다.</div>`;
     }
 
-    // ---------- home ----------
+    // ---------- home (Safari start page) ----------
+    // Modeled on the iOS 26/27 Safari start page (Apple iPhone User Guide screenshot): rounded search
+    // capsule, "Favorites" 4-column tile grid with two-line labels, "Show All" section headers and
+    // Reading-List style cards paged horizontally. Uses the "Top" address-bar layout and the plain
+    // light background (no wallpaper/blur).
 
-    homeHtml() {
+    sfTileColor(text) {
+      return ['#5ac8fa', '#ff9f0a', '#34c759', '#af52de', '#ff375f', '#5e5ce6', '#64d2ff', '#ffcc00'][Fmt.seed(String(text), 8)];
+    }
+
+    sfHeader(title, act = '', attrs = '') {
+      return `<div class="sf-h"><h2>${this.esc(title)}</h2>${act ? `<button data-act="${act}" ${attrs}>모두 보기${icon('chevronRight', 14)}</button>` : ''}</div>`;
+    }
+
+    sfPages(cards, perPage = 2) {
+      const pages = [];
+      for (let i = 0; i < cards.length; i += perPage) pages.push(`<div class="sf-page">${cards.slice(i, i + perPage).join('')}</div>`);
+      return `<div class="sf-pages">${pages.join('')}</div>`;
+    }
+
+    sfPixivCard(work) {
+      const author = this.pixivAuthor(work.authorId);
+      return `<button class="sf-card" data-act="sf-pixiv" data-id="${work.id}"><span class="sf-thumb" style="--t:${PX_COVERS[Fmt.seed(work.seriesTitle || work.title || work.id, PX_COVERS.length)][1]}">${this.esc(String(work.title).slice(0, 14))}</span><span class="sf-card-body"><span class="sf-card-title">${this.esc(work.title)}</span><span class="sf-card-desc">${this.esc(work.caption || work.summary || '')}</span><span class="sf-card-site">pixiv.net · ${this.esc(author?.name || work.authorId)} · ♡ ${Fmt.int(work.bookmarks)}</span></span></button>`;
+    }
+
+    sfRedditCard(post) {
+      const persona = this.redditPersona(post.personaId);
+      return `<button class="sf-card" data-act="sf-reddit" data-id="${post.id}"><span class="sf-thumb reddit">${icon('up', 18)}<b>${Fmt.compact(post.score)}</b><small>댓글 ${Fmt.compact(Math.max(post.comments?.length || 0, post.estimatedCommentCount || 0))}</small></span><span class="sf-card-body"><span class="sf-card-title">${this.esc(post.title)}</span><span class="sf-card-desc">${this.esc(String(post.spoiler ? '(스포일러)' : post.body || '').replace(/\s+/g, ' '))}</span><span class="sf-card-site">reddit.com/r/Fanverse · u/${this.esc(persona?.name || post.personaId)} · ${Fmt.ago(post.createdAt)}</span></span></button>`;
+    }
+
+    sfRow({ act, attrs = '', color, glyph, title, sub = '', time = '' }) {
+      return `<button class="sf-row" data-act="${act}" ${attrs}><span class="sf-dot" style="--t:${color}">${glyph}</span><span class="sf-row-body"><span class="sf-row-title">${title}</span>${sub ? `<span class="sf-row-sub">${sub}</span>` : ''}</span>${time ? `<time>${this.esc(time)}</time>` : ''}</button>`;
+    }
+
+    async homeHtml() {
       const world = this.engine.world;
       const settings = this.getSettings();
-      const now = new Date();
-      const pending = Math.max(0, settings.turnsPerUpdate - ((world.turnCount - world.lastProcessedTurn) % settings.turnsPerUpdate));
-      const sync = world.sync.status === 'fallback' ? `<span class="warn">⚠ Crack API 실패 — DOM fallback · ${this.esc(world.sync.error)}</span>` : `✓ ${world.sync.adapter === 'api' ? 'Crack API 동기화됨' : '동기화 대기'}`;
-      const notice = world.needsCanonRebuild ? '<br><span class="warn">재생성/삭제로 활성 원작 분기가 바뀌었습니다. Settings에서 Canon rebuild가 필요합니다.</span>'
-        : world.needsImport ? '<br><span class="warn">기존 장기 로그가 감지되었습니다. Settings에서 원작 가져오기를 실행하세요.</span>'
-          : `<br>다음 자동 갱신까지 ${pending} turns`;
-      const providerOk = this.engine.gemini.providerReady();
-      const app = (go, cls, glyph, label, badge) => `<button class="home-app" data-go="${go}"><span class="home-icon ${cls}">${glyph}</span><span>${label}</span>${badge ? `<span class="app-badge">${badge > 99 ? '99+' : badge}</span>` : ''}</button>`;
-      const chips = [...world.fandom.ships.slice(0, 6), ...world.fandom.tags.slice(0, 4)].map((item) => `<button class="home-chip" data-act="px-tag" data-tag="${this.esc(item.tag)}">#${this.esc(item.tag)} · ${Math.round(item.momentum)}</button>`).join('');
-      return `<div class="home-time">${now.getHours()}:${String(now.getMinutes()).padStart(2, '0')}</div><div class="home-date">${now.toLocaleDateString('ko-KR', { month: 'long', day: 'numeric', weekday: 'long' })}</div><div class="home-widget"><b>RP is CANON · ${world.turnCount} turns</b><br>${sync}${notice}${providerOk ? '' : '<br><span class="warn">AI provider 미설정 또는 인증 만료 — Settings 확인</span>'}</div><div class="home-apps">${app('pixiv', 'pixiv', 'P', 'pixiv', world.badges.pixiv)}${app('reddit', 'reddit', this.rdLogo(44, true), 'Reddit', world.badges.reddit)}<button class="home-app" data-action="open-prompt-editor"><span class="home-icon prompts">${icon('pen', 26)}</span><span>Prompts</span></button>${app('settings', 'settings', icon('gear', 28), 'Settings', 0)}</div><div class="home-section">Trending in fandom</div><div class="home-chips">${chips || '<span style="opacity:.7;font-size:12px">아직 팬덤 데이터가 없습니다.</span>'}</div>`;
+      const q = String(this.route?.q || '');
+      const [works, posts] = await Promise.all([
+        this.db.getAllByWorld(STORES.pixivWorks, world.id).catch(() => []),
+        this.db.getAllByWorld(STORES.redditPosts, world.id).catch(() => []),
+      ]);
+      const search = `<div class="sf-searchwrap"><label class="sf-search">${icon('search', 18)}<input data-sf-search placeholder="Fanverse 검색 또는 fandom://current" value="${this.esc(q)}" enterkeyhint="search" autocomplete="off" spellcheck="false">${q ? `<button data-act="sf-clear" aria-label="검색어 지우기">${icon('close', 14)}</button>` : ''}</label></div>`;
+      if (q.trim() && !/^fandom:\/\/current\/?$/i.test(q.trim())) return search + this.sfSearchHtml(q.trim(), works, posts);
+
+      const fav = (attrs, cls, glyph, label, badge = 0) => `<button class="sf-fav" ${attrs}><span class="sf-tile ${cls}">${glyph}</span><span class="sf-label">${label}</span>${badge ? `<span class="app-badge">${badge > 99 ? '99+' : badge}</span>` : ''}</button>`;
+      const favorites = `<div class="sf-grid">${fav('data-act="sf-open" data-view="pixiv"', 'pixiv', 'P', 'Pixiv', world.badges.pixiv)}${fav('data-act="sf-open" data-view="reddit"', 'reddit', this.rdLogo(44), 'Reddit', world.badges.reddit)}${fav('data-act="open-instruction"', 'guide', icon('pen', 30), 'Gemini 지침')}${fav('data-act="sf-open" data-view="settings"', 'settings', icon('gear', 32), '설정')}</div>`;
+
+      const ships = [...world.fandom.ships, ...world.fandom.tags].filter((item, index, list) => list.findIndex((other) => other.tag === item.tag) === index).slice(0, 8);
+      const shipsHtml = ships.length ? `<div class="sf-grid">${ships.map((item) => fav(`data-act="px-tag" data-tag="${this.esc(item.tag)}"`, 'letter', this.esc(Array.from(item.tag)[0] || '#'), `#${this.esc(item.tag)}`).replace('class="sf-tile letter"', `class="sf-tile letter" style="--t:${this.sfTileColor(item.tag)}"`)).join('')}</div>` : '<div class="sf-empty">아직 팬덤 데이터가 없습니다. RP가 진행되면 CP와 태그가 쌓입니다.</div>';
+
+      const recentWorks = works.slice().sort((a, b) => (b.publishOrder || 0) - (a.publishOrder || 0)).slice(0, 4);
+      const hotPosts = posts.slice().sort(this.rdSorters().hot).slice(0, 4);
+
+      const activity = [];
+      const syncOk = world.sync.status !== 'fallback';
+      activity.push(this.sfRow({ act: 'sf-open', attrs: 'data-view="settings"', color: syncOk ? '#34c759' : '#ff9500', glyph: icon(syncOk ? 'check' : 'warning', 18), title: syncOk ? `Crack 원작 동기화 · ${world.turnCount} turns` : 'Crack API 실패 — DOM fallback', sub: syncOk ? `${world.sync.adapter === 'api' ? 'Crack API' : '대기 중'} · 다음 자동 갱신까지 ${Math.max(0, settings.turnsPerUpdate - ((world.turnCount - world.lastProcessedTurn) % settings.turnsPerUpdate))} turns` : this.esc(world.sync.error || ''), time: world.sync.lastAt ? Fmt.ago(world.sync.lastAt) : '' }));
+      if (world.needsCanonRebuild) activity.push(this.sfRow({ act: 'sf-open', attrs: 'data-view="settings"', color: '#ff3b30', glyph: icon('warning', 18), title: '원작 분기가 바뀌었습니다', sub: 'Settings에서 Canon rebuild를 실행하세요' }));
+      else if (world.needsImport) activity.push(this.sfRow({ act: 'sf-open', attrs: 'data-view="settings"', color: '#ff9500', glyph: icon('warning', 18), title: '기존 장기 로그가 있습니다', sub: 'Settings에서 현재 RP를 원작으로 가져오기' }));
+      if (!this.engine.gemini.providerReady()) activity.push(this.sfRow({ act: 'sf-open', attrs: 'data-view="settings"', color: '#ff3b30', glyph: icon('warning', 18), title: 'AI 생성 사용 불가', sub: 'Settings에서 AI Backend 상태를 확인하세요' }));
+      for (const entry of (world.fandom.history || []).slice(-3).reverse()) {
+        activity.push(this.sfRow({ act: 'sf-open', attrs: 'data-view="reddit"', color: '#5e5ce6', glyph: icon('sparkle', 18), title: `turn ${entry.turn} · 팬덤 갱신`, sub: `Canon 사건 ${(entry.canonEventIds || []).length} · 새 해석 ${(entry.interpretationIds || []).length}`, time: Fmt.ago(entry.at) }));
+      }
+
+      return `${search}${this.sfHeader('즐겨찾기')}${favorites}${this.sfHeader('Trending Ships', ships.length ? 'sf-open' : '', 'data-view="pixiv"')}${shipsHtml}${this.sfHeader('최근 Pixiv', recentWorks.length ? 'sf-open' : '', 'data-view="pixiv"')}${recentWorks.length ? this.sfPages(recentWorks.map((work) => this.sfPixivCard(work))) : '<div class="sf-empty">다음 Fanverse 갱신에서 작품이 올라옵니다.</div>'}${this.sfHeader('Reddit에서 화제', hotPosts.length ? 'sf-open' : '', 'data-view="reddit"')}${hotPosts.length ? this.sfPages(hotPosts.map((post) => this.sfRedditCard(post))) : '<div class="sf-empty">다음 Fanverse 갱신 뒤 토론이 생깁니다.</div>'}${this.sfHeader('최근 Fanverse 활동')}<div class="sf-list">${activity.join('')}</div><div class="sf-foot">fandom://current · ${this.esc(world.storyId)} · Fanverse ${APP_VERSION}</div>`;
+    }
+
+    sfSearchHtml(q, works, posts) {
+      const needle = q.toLowerCase().replace(/^#/, '');
+      const has = (...values) => values.some((value) => String(value || '').toLowerCase().includes(needle));
+      const world = this.engine.world;
+      const tags = [...new Set([...world.fandom.ships, ...world.fandom.tags].map((item) => item.tag).concat(works.flatMap((work) => [...(work.tags || []), work.ship].filter(Boolean))))].filter((tag) => has(tag)).slice(0, 6);
+      const workHits = works.filter((work) => has(work.title, work.ship, work.caption, work.summary, work.seriesTitle, ...(work.tags || []))).slice(0, 8);
+      const postHits = posts.filter((post) => has(post.title, post.body, post.category)).slice(0, 8);
+      const tagRows = [this.sfRow({ act: 'px-tag', attrs: `data-tag="${this.esc(q.replace(/^#/, ''))}"`, color: '#0096fa', glyph: icon('search', 18), title: `Pixiv에서 “${this.esc(q)}” 검색` })]
+        .concat(tags.map((tag) => this.sfRow({ act: 'px-tag', attrs: `data-tag="${this.esc(tag)}"`, color: this.sfTileColor(tag), glyph: this.esc(Array.from(tag)[0] || '#'), title: `#${this.esc(tag)}`, sub: 'CP · 태그' })));
+      const workRows = workHits.map((work) => this.sfRow({ act: 'sf-pixiv', attrs: `data-id="${work.id}"`, color: '#0096fa', glyph: 'P', title: this.esc(work.title), sub: `pixiv · ${this.esc(this.pixivAuthor(work.authorId)?.name || work.authorId)} · ${(work.tags || []).slice(0, 3).map((tag) => `#${this.esc(tag)}`).join(' ')}` }));
+      const postRows = postHits.map((post) => this.sfRow({ act: 'sf-reddit', attrs: `data-id="${post.id}"`, color: '#ff4500', glyph: icon('comment', 16), title: this.esc(post.title), sub: `r/Fanverse · ${this.esc(post.category)} · ▲ ${Fmt.compact(post.score)}`, time: Fmt.ago(post.createdAt) }));
+      return `${this.sfHeader('CP · 태그')}<div class="sf-list">${tagRows.join('')}</div>${this.sfHeader(`Pixiv · ${workRows.length}`)}${workRows.length ? `<div class="sf-list">${workRows.join('')}</div>` : '<div class="sf-empty">일치하는 작품이 없습니다.</div>'}${this.sfHeader(`Reddit · ${postRows.length}`)}${postRows.length ? `<div class="sf-list">${postRows.join('')}</div>` : '<div class="sf-empty">일치하는 게시물이 없습니다.</div>'}`;
     }
 
     // ---------- pixiv ----------
@@ -2824,92 +2961,55 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
 
     // ---------- settings ----------
 
-    developerPanelHtml(s) {
-      return `<div class="st-card"><label class="st-field"><span>Gemini Developer API key · GM storage에만 저장, export 제외</span><input type="password" data-setting="apiKey" value="${this.esc(s.apiKey)}" autocomplete="off" placeholder="AIza…"></label><div class="st-status"><span class="st-dot ${s.apiKey ? 'ok' : ''}"></span>${s.apiKey ? 'API key 설정됨' : 'API key 없음'}</div><button class="st-btn" data-action="test-developer">Gemini API 연결 테스트${icon('chevronRight', 18)}</button></div><div class="st-note">Endpoint: <code>${this.esc(`${GEMINI_BASE}/${resolveModelId(s)}:generateContent`)}</code></div>`;
+    firebaseStatusLine() {
+      const status = this.engine.gemini.firebaseStatus();
+      const time = (at) => new Date(at).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
+      if (status.phase === 'error') return ['bad', `초기화 실패 — AI 생성만 비활성화됩니다\n${status.error}`];
+      if (status.lastTest?.ok) return ['ok', `연결됨 · ${time(status.lastTest.at)} 테스트 · ${status.lastTest.model}`];
+      if (status.lastTest) return ['bad', `연결 실패 (${time(status.lastTest.at)})\n${status.lastTest.message}`];
+      if (status.phase === 'ready') return ['warn', 'Firebase 초기화됨 · 아직 연결 테스트 전'];
+      return ['', '대기 중 · 첫 요청 때 초기화합니다'];
     }
 
-    vertexPanelHtml(s) {
-      const vertex = this.engine.gemini.vertexStatus();
-      const minutes = Math.ceil(vertex.expiresInSeconds / 60);
-      const tokenLine = vertex.authenticated ? `access token 유효 · 약 ${minutes}분 남음 (${vertex.source === 'manual' ? '수동 입력' : 'Google 로그인'})` : vertex.hasToken ? 'access token 만료 — 재인증 필요' : 'access token 없음';
-      const endpoint = s.vertexProjectId ? buildVertexEndpoint(s, false) : '(Project ID를 입력하면 표시됩니다)';
-      return `<div class="st-card"><label class="st-field"><span>Google Cloud Project ID</span><input data-setting="vertexProjectId" value="${this.esc(s.vertexProjectId)}" placeholder="my-gcp-project" autocomplete="off"></label><label class="st-field"><span>Location · global 권장 (us / eu 멀티 리전 또는 us-central1 같은 리전도 가능)</span><input data-setting="vertexLocation" value="${this.esc(s.vertexLocation)}" list="rpf-vertex-locations" placeholder="global"><datalist id="rpf-vertex-locations"><option value="global"><option value="us"><option value="eu"><option value="us-central1"><option value="asia-northeast3"><option value="asia-northeast1"></datalist></label><label class="st-field"><span>API version</span><select data-setting="vertexApiVersion"><option value="v1" ${s.vertexApiVersion === 'v1' ? 'selected' : ''}>v1 (권장)</option><option value="v1beta1" ${s.vertexApiVersion === 'v1beta1' ? 'selected' : ''}>v1beta1</option></select></label><label class="st-field"><span>OAuth 2.0 Client ID (웹 애플리케이션)</span><input data-setting="vertexOAuthClientId" value="${this.esc(s.vertexOAuthClientId)}" placeholder="…apps.googleusercontent.com" autocomplete="off"></label><div class="st-status"><span class="st-dot ${vertex.authenticated ? 'ok' : vertex.hasToken ? 'bad' : ''}"></span>${tokenLine}</div><button class="st-btn" data-action="vertex-auth">${vertex.hasToken ? 'Google 재인증' : 'Google 로그인'}${icon('chevronRight', 18)}</button><button class="st-btn" data-action="test-vertex">Vertex AI 연결 테스트${icon('chevronRight', 18)}</button><button class="st-btn danger" data-action="vertex-revoke" ${vertex.hasToken ? '' : 'disabled'}>토큰 폐기 (로그아웃)</button></div><div class="st-note">Endpoint: <code>${this.esc(endpoint)}</code></div><div class="st-section">수동 access token (선택)</div><div class="st-card"><label class="st-field"><span><code class="st-code">gcloud auth print-access-token</code> 결과를 붙여넣기 · 약 1시간 유효</span><input type="password" data-vertex-manual-token autocomplete="off" placeholder="ya29.…"></label><button class="st-btn" data-action="vertex-manual-token">토큰 확인 후 적용${icon('chevronRight', 18)}</button></div><div class="st-section">Vertex AI 준비 순서</div><details class="st-details"><summary>설정 방법 보기 ${icon('chevronDown', 18)}</summary><ol class="st-steps"><li>Google Cloud 프로젝트에 결제 계정을 연결합니다. 신규 가입 무료 체험 크레딧은 일반 Vertex AI 사용량에도 적용됩니다.</li><li>프로젝트에서 <b>Vertex AI API</b>(aiplatform.googleapis.com)를 사용 설정합니다.</li><li>IAM에서 로그인할 Google 계정에 <b>Vertex AI User</b>(roles/aiplatform.user) 역할을 부여합니다.</li><li>OAuth 동의 화면을 구성하고(테스트 모드면 본인을 테스트 사용자로 추가), <b>사용자 인증 정보 → OAuth 클라이언트 ID → 웹 애플리케이션</b>을 만듭니다.</li><li>승인된 JavaScript 원본에 <code>https://crack.wrtn.ai</code>를 추가하고 Client ID를 위에 붙여넣습니다.</li><li>Google 로그인 → Vertex AI 연결 테스트. 토큰은 약 1시간 뒤 만료되며 그때 재인증합니다.</li></ol><div class="st-note" style="padding:0 14px 12px">서비스 계정 JSON key, refresh token, client secret은 사용·저장하지 않습니다. 로그인은 Google Identity Services 토큰 모델(브라우저 전용 앱용 공식 흐름)을 사용하며, 라이브러리(accounts.google.com/gsi/client)는 "Google 로그인"을 누를 때만 불러옵니다.</div></details>`;
+    appCheckStatusLine(s) {
+      const status = this.engine.gemini.firebaseStatus();
+      if (s.appCheckMode === 'off') return ['warn', 'App Check 사용 안 함 — enforcement가 꺼진 프로젝트에서만 동작합니다'];
+      if (status.appCheck === 'ok') return ['ok', `App Check 토큰 정상 · ${new Date(status.appCheckAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })}`];
+      if (status.appCheck === 'error') return ['bad', `App Check 실패\n${status.appCheckError}`];
+      return ['', '설정됨 · 첫 AI 요청 때 토큰을 발급합니다'];
+    }
+
+    developerFieldsHtml(s) {
+      return `<label class="st-field"><span>Gemini Developer API key (직접 호출용 · GM storage에만 저장, export 제외)</span><input type="password" data-setting="apiKey" value="${this.esc(s.apiKey)}" autocomplete="off" placeholder="AIza…"></label><button class="st-btn" data-action="test-developer">Gemini API 연결 테스트${icon('chevronRight', 18)}</button>`;
     }
 
     settingsHtml() {
       const s = this.getSettings();
       const world = this.engine.world;
-      const presets = [...MODEL_PRESETS.map((preset) => `<option value="${preset.id}" ${s.modelPreset === preset.id ? 'selected' : ''}>${preset.label} — ${preset.id}</option>`), `<option value="custom" ${s.modelPreset === 'custom' ? 'selected' : ''}>Custom model ID…</option>`].join('');
-      const otherProvider = s.provider === 'vertex' ? 'developer' : 'vertex';
-      const overrides = Object.keys(this.prompts.get().overrides).length;
+      const firebase = s.provider !== 'developer';
+      const presets = [...MODEL_PRESETS.map((preset) => `<option value="${preset.id}" ${s.modelPreset === preset.id ? 'selected' : ''}>${preset.label}</option>`), `<option value="custom" ${s.modelPreset === 'custom' ? 'selected' : ''}>Custom model ID…</option>`].join('');
+      const config = resolveFirebaseConfig(s);
+      const [dot, statusText] = firebase ? this.firebaseStatusLine() : [s.apiKey ? 'ok' : 'bad', s.apiKey ? 'Gemini Developer API key 설정됨' : 'Gemini Developer API key 없음 — 고급 설정에서 입력'];
+      const [acDot, acText] = this.appCheckStatusLine(s);
+      const instructionLength = s.globalGeminiInstruction.trim().length;
+      const proNeedsAppCheck = firebase && s.modelPreset === 'gemini-3.1-pro-preview' && s.appCheckMode === 'off';
       return `<div class="st-title">Settings</div>
-<div class="st-section">AI Provider</div><div class="st-card"><label class="st-field"><span>Provider</span><select data-setting="provider"><option value="developer" ${s.provider === 'developer' ? 'selected' : ''}>Gemini Developer API</option><option value="vertex" ${s.provider === 'vertex' ? 'selected' : ''}>Vertex AI (Google Cloud)</option></select></label><label class="st-field"><span>Model preset</span><select data-setting="modelPreset">${presets}</select></label>${s.modelPreset === 'custom' ? `<label class="st-field"><span>Custom model ID</span><input data-setting="customModelId" value="${this.esc(s.customModelId)}" placeholder="예: gemini-3.7-flash" autocomplete="off"></label>` : ''}<div class="st-status"><span class="st-dot ${this.engine.gemini.providerReady() ? 'ok' : 'bad'}"></span>사용 중: <b>${s.provider === 'vertex' ? 'Vertex AI' : 'Gemini Developer API'}</b> · <code class="st-code">${this.esc(resolveModelId(s))}</code></div></div>
-<div class="st-section">${s.provider === 'vertex' ? 'Vertex AI' : 'Gemini Developer API'} (사용 중)</div>${s.provider === 'vertex' ? this.vertexPanelHtml(s) : this.developerPanelHtml(s)}
-<div class="st-section">다른 provider</div><details class="st-details"><summary>${otherProvider === 'vertex' ? 'Vertex AI 설정 · 연결 테스트' : 'Gemini Developer API 설정 · 연결 테스트'} ${icon('chevronDown', 18)}</summary><div style="padding:10px 0 12px;background:#f2f2f7">${otherProvider === 'vertex' ? this.vertexPanelHtml(s) : this.developerPanelHtml(s)}</div></details>
-<div class="st-section">Prompt Editor</div><div class="st-card"><button class="st-btn" data-action="open-prompt-editor">팬덤 생성 프롬프트 편집<span class="st-badge ${overrides ? 'on' : ''}">${overrides ? `${overrides}개 수정됨` : '기본값'}</span></button></div>
+<div class="st-section">AI Backend</div><div class="st-card"><div class="st-kv"><span>AI Backend</span><span>${firebase ? 'Firebase AI Logic' : 'Gemini Developer API (직접)'}</span></div>${firebase ? `<div class="st-kv"><span>Project</span><span>${this.esc(config.projectId)}${s.firebaseConfigOverride ? ' (사용자 config)' : ''}</span></div><div class="st-kv"><span>Backend</span><span>Agent Platform · ${this.esc(s.firebaseLocation)}</span></div>` : ''}<label class="st-field"><span>Model</span><select data-setting="modelPreset">${presets}</select></label>${s.modelPreset === 'custom' ? `<label class="st-field"><span>Custom model ID</span><input data-setting="customModelId" value="${this.esc(s.customModelId)}" placeholder="예: gemini-3.7-flash" autocomplete="off"></label>` : ''}<div class="st-status"><span class="st-dot ${dot}"></span>${this.esc(statusText)}</div><button class="st-btn" data-action="${firebase ? 'test-firebase' : 'test-developer'}">연결 테스트 · ${this.esc(resolveModelId(s))}${icon('chevronRight', 18)}</button></div>${proNeedsAppCheck ? '<div class="st-note warn">Gemini 3.1 Pro는 Firebase App Check enforcement가 켜진 프로젝트에서만 호출됩니다 (아니면 HTTP 403). 아래 App Check를 설정하세요.</div>' : ''}
+${firebase ? `<div class="st-section">App Check</div><div class="st-card"><label class="st-field"><span>App Check provider</span><select data-setting="appCheckMode"><option value="off" ${s.appCheckMode === 'off' ? 'selected' : ''}>사용 안 함</option><option value="recaptcha-enterprise" ${s.appCheckMode === 'recaptcha-enterprise' ? 'selected' : ''}>reCAPTCHA Enterprise (권장)</option><option value="debug" ${s.appCheckMode === 'debug' ? 'selected' : ''}>디버그 토큰 (개인 기기 전용)</option></select></label>${s.appCheckMode === 'recaptcha-enterprise' ? `<label class="st-field"><span>reCAPTCHA Enterprise site key</span><input data-setting="appCheckSiteKey" value="${this.esc(s.appCheckSiteKey)}" placeholder="6L…" autocomplete="off"></label>` : ''}${s.appCheckMode === 'debug' ? `<label class="st-field"><span>App Check 디버그 토큰 · GM storage에만 저장, export 제외 · 공유 금지</span><input type="password" data-setting="appCheckDebugToken" value="${this.esc(s.appCheckDebugToken)}" placeholder="xxxxxxxx-xxxx-…" autocomplete="off"></label>` : ''}<div class="st-status"><span class="st-dot ${acDot}"></span>${this.esc(acText)}</div></div><div class="st-note">Firebase AI Logic은 2026-11-02부터 App Check enforcement가 필수입니다. 현재도 일부 모델(Gemini 3.1 Pro 등)은 enforcement가 켜져 있어야 호출됩니다.</div><details class="st-details" style="margin-top:8px"><summary>App Check 설정 방법 ${icon('chevronDown', 18)}</summary><ol class="st-steps"><li>Google Cloud 콘솔 → reCAPTCHA Enterprise에서 웹 키를 만들고 허용 도메인에 <code class="st-code">crack.wrtn.ai</code>를 추가합니다.</li><li>Firebase 콘솔 → App Check → 웹 앱에 reCAPTCHA Enterprise provider로 그 site key를 등록합니다.</li><li>위에서 “reCAPTCHA Enterprise”를 고르고 site key를 입력한 뒤 연결 테스트로 토큰 발급을 확인합니다.</li><li>Firebase 콘솔 → App Check → APIs → Firebase AI Logic에서 enforcement를 켭니다.</li><li>개인 기기에서만 쓸 때는 Firebase 콘솔에서 디버그 토큰을 만들어 “디버그 토큰” 모드에 입력할 수도 있습니다. 디버그 토큰은 App Check를 우회하는 비밀값이므로 다른 사람과 공유하지 마세요.</li></ol></details>` : ''}
+<div class="st-section">Gemini 공통 지침</div><div class="st-card"><button class="st-btn" data-act="open-instruction">Gemini 공통 지침 편집<span class="st-badge ${instructionLength ? 'on' : ''}">${instructionLength ? `${Fmt.int(instructionLength)}자` : '비어 있음'}</span></button></div>
 <div class="st-section">Update</div><div class="st-card"><label class="st-field"><span>Turns per update</span><input type="number" min="1" max="100" data-setting="turnsPerUpdate" value="${s.turnsPerUpdate}"></label><label class="st-field"><span>Fandom activity</span><select data-setting="activity">${['Quiet', 'Normal', 'Active', 'Chaos'].map((value) => `<option ${s.activity === value ? 'selected' : ''}>${value}</option>`).join('')}</select></label><label class="st-inline"><span>Automatic fandom updates</span><input type="checkbox" data-setting="autoUpdate" ${s.autoUpdate ? 'checked' : ''}></label><button class="st-btn" data-action="update-now">처리 대기 turns 지금 갱신${icon('chevronRight', 18)}</button></div>
 <div class="st-section">Fanwork</div><div class="st-card"><label class="st-field"><span>Language</span><input data-setting="fanworkLanguage" value="${this.esc(s.fanworkLanguage)}"></label><label class="st-field"><span>Target length (characters) · 8,000 초과 시 개요 → 3섹션 → continuity check</span><input type="number" min="500" max="30000" data-setting="fanworkTargetLength" value="${s.fanworkTargetLength}"></label><label class="st-inline"><span>Streaming</span><input type="checkbox" data-setting="streaming" ${s.streaming ? 'checked' : ''}></label><label class="st-field"><span>UI scale</span><input type="number" min="0.75" max="1.25" step="0.05" data-setting="uiScale" value="${s.uiScale}"></label></div>
 <div class="st-section">World data</div><div class="st-card"><button class="st-btn" data-action="sync-now">지금 API 동기화${icon('chevronRight', 18)}</button><button class="st-btn" data-action="import-history">현재 RP를 원작으로 가져오기${icon('chevronRight', 18)}</button><button class="st-btn" data-action="rebuild-canon">Canon rebuild (팬덤 보존)${icon('chevronRight', 18)}</button><button class="st-btn" data-action="export-world">현재 world 내보내기${icon('chevronRight', 18)}</button><button class="st-btn" data-action="export-all">모든 worlds 내보내기${icon('chevronRight', 18)}</button><button class="st-btn" data-action="import-data">데이터 가져오기${icon('chevronRight', 18)}</button><input type="file" accept="application/json" data-import-file hidden><button class="st-btn danger" data-action="reset-world">현재 Fanverse 전체 초기화</button></div>
+<div class="st-section">고급 설정</div><details class="st-details"><summary>AI provider · Firebase config ${icon('chevronDown', 18)}</summary><label class="st-field"><span>AI provider</span><select data-setting="provider"><option value="firebase" ${firebase ? 'selected' : ''}>Firebase AI Logic (기본)</option><option value="developer" ${!firebase ? 'selected' : ''}>Gemini Developer API (직접 API key)</option></select></label>${this.developerFieldsHtml(s)}<label class="st-field"><span>Firebase AI Logic location (Agent Platform)</span><input data-setting="firebaseLocation" value="${this.esc(s.firebaseLocation)}" placeholder="global"></label><label class="st-field"><span>Firebase Web App config (JSON) · 비워 두거나 기본값이면 내장 config 사용</span><textarea data-firebase-config spellcheck="false">${this.esc(JSON.stringify(config, null, 2))}</textarea></label><button class="st-btn" data-action="firebase-config-save">Firebase config 저장${icon('chevronRight', 18)}</button><button class="st-btn" data-action="firebase-config-reset" ${s.firebaseConfigOverride ? '' : 'disabled'}>내장 config로 되돌리기</button></details>
 <div class="st-note">${world ? `world: ${this.esc(world.id)}<br>schema ${DB_VERSION} · app ${APP_VERSION} · sync ${this.esc(world.sync.status)}${world.sync.error ? ` · ${this.esc(world.sync.error)}` : ''}` : `world 미연결 · app ${APP_VERSION}`}${this.startupIssues?.length ? `<br>startup: ${this.startupIssues.map((issue) => this.esc(issue)).join(' / ')}` : ''}</div>`;
     }
 
-    // ---------- prompt editor ----------
+    // ---------- Gemini 공통 지침 ----------
 
-    promptState(id) {
-      const store = this.prompts.get();
-      const entry = store.overrides[id];
-      const resolved = resolvePromptTemplate(id, store.overrides);
-      return {
-        overridden: Boolean(entry),
-        fallback: resolved.source === 'fallback',
-        error: resolved.error,
-        defaultChanged: Boolean(entry && entry.defaultHash && entry.defaultHash !== Utils.hash(DEFAULT_PROMPT_TEMPLATES[id])),
-        template: entry ? entry.template : DEFAULT_PROMPT_TEMPLATES[id],
-        updatedAt: entry?.updatedAt,
-      };
-    }
-
-    promptListHtml() {
-      const groups = PROMPT_GROUPS.map((group) => {
-        const items = Object.entries(PROMPT_DEFINITIONS).filter(([, def]) => def.group === group.id).map(([id, def]) => {
-          const state = this.promptState(id);
-          const badge = state.fallback ? '<span class="st-badge warn">오류 · 기본값 사용</span>' : state.defaultChanged ? '<span class="st-badge warn">수정됨 · 기본값 갱신</span>' : state.overridden ? '<span class="st-badge on">수정됨</span>' : '<span class="st-badge">기본값</span>';
-          return `<button class="pe-item" data-act="open-prompt" data-prompt-id="${id}"><b>${this.esc(def.label)}</b>${badge}<small>${this.esc(def.description)}</small></button>`;
-        }).join('');
-        return `<div class="st-section pe-group-head">${this.esc(group.label)}<small>${this.esc(group.hint)}</small></div><div class="st-card">${items}</div>`;
-      }).join('');
-      return `<div class="pe-head"><h2>Prompt Editor</h2><p>팬덤 생성에 쓰이는 프롬프트를 직접 보고 고칩니다. 수정본은 GM storage에 override로 저장되고, 코드 기본값은 그대로 남아 언제든 복원할 수 있습니다. <code class="st-code">{{PLACEHOLDER}}</code> 자리에 호출 시점의 실제 데이터가 들어갑니다.</p></div>${groups}<div class="st-section">전체 prompts</div><div class="st-card"><button class="st-btn" data-action="export-prompts">전체 prompts JSON export${icon('chevronRight', 18)}</button><button class="st-btn" data-action="import-prompts">전체 prompts JSON import${icon('chevronRight', 18)}</button><button class="st-btn danger" data-action="reset-all-prompts">모든 프롬프트 기본값으로 복원</button></div><input type="file" accept="application/json" data-prompts-import-file hidden>`;
-    }
-
-    promptEditorHtml() {
-      const promptId = PROMPT_DEFINITIONS[this.route?.promptId] ? this.route.promptId : 'redditGenerator';
-      const def = PROMPT_DEFINITIONS[promptId];
-      const state = this.promptState(promptId);
-      const text = this.promptDraft?.id === promptId ? this.promptDraft.text : state.template;
-      const chips = [...def.required.map((name) => [name, true]), ...def.optional.map((name) => [name, false])];
-      const status = state.fallback ? `저장된 override가 유효하지 않아 <b>코드 기본값</b>으로 호출 중입니다: ${this.esc(state.error)}` : state.overridden ? `GM storage override 적용 중 · ${this.esc(new Date(state.updatedAt).toLocaleString('ko-KR'))} 저장${state.defaultChanged ? '<br><b>이 수정본을 만든 뒤 코드 기본값이 바뀌었습니다.</b> "기본값 불러오기"로 새 기본값을 확인하세요.' : ''}` : '코드 기본 프롬프트 적용 중';
-      return `<div class="pe-head"><h2>${this.esc(def.label)}</h2><p>${this.esc(def.description)}<br>출력: ${this.esc(def.output)}${def.output.startsWith('JSON') ? ' — 응답 구조는 코드의 JSON schema가 강제하므로 프롬프트에서 형식을 바꿀 필요는 없습니다.' : ''}</p></div><div class="pe-meta">${status}</div><div class="st-section">Placeholders · 눌러서 커서 위치에 삽입</div><div class="pe-chips">${chips.map(([name, required]) => `<button class="pe-chip ${required ? 'req' : ''}" data-act="insert-placeholder" data-name="${name}" title="${this.esc(PLACEHOLDER_DOCS[name])}">{{${name}}}${required ? ' *' : ''}</button>`).join('')}</div><div class="pe-doc">${chips.map(([name, required]) => `<div><code>{{${name}}}</code>${required ? ' (필수)' : ' (선택)'} — ${this.esc(PLACEHOLDER_DOCS[name])}</div>`).join('')}</div><textarea class="pe-textarea" data-prompt-text data-prompt-id="${promptId}" spellcheck="false">${this.esc(text)}</textarea><div class="pe-validation" data-prompt-validation></div><div class="pe-actions"><button class="primary" data-action="save-prompt" data-prompt-id="${promptId}">저장</button><button data-action="reset-prompt" data-prompt-id="${promptId}">기본값으로 복원</button><button data-action="load-default-prompt" data-prompt-id="${promptId}">기본값 불러오기 (편집기)</button><button data-action="copy-prompt">복사</button><button data-action="export-prompt" data-prompt-id="${promptId}">이 prompt export</button><button data-action="import-prompt">이 prompt import</button></div><div class="pe-actions" style="grid-template-columns:1fr"><button data-act="prompt-list">← 프롬프트 목록</button></div><input type="file" accept="application/json" data-prompt-import-file hidden><div style="height:24px"></div>`;
-    }
-
-    updatePromptValidation() {
-      const textarea = this.root.querySelector('[data-prompt-text]');
-      const target = this.root.querySelector('[data-prompt-validation]');
-      if (!textarea || !target) return;
-      const { errors, warnings } = inspectPromptTemplate(textarea.dataset.promptId, textarea.value);
-      const dirty = this.promptDraft?.dirty;
-      target.innerHTML = `${errors.length ? errors.map((error) => `<div class="err">✕ ${this.esc(error)}</div>`).join('') : `<div class="ok">✓ placeholder 검증 통과${dirty ? ' · 저장되지 않은 변경 있음' : ''}</div>`}${warnings.map((warning) => `<div class="warn">! ${this.esc(warning)}</div>`).join('')}`;
-      const save = this.root.querySelector('[data-action="save-prompt"]');
-      if (save) save.disabled = errors.length > 0;
-    }
-
-    async savePromptOverride(promptId, template) {
-      validatePromptTemplate(promptId, template);
-      const store = this.prompts.get();
-      const overrides = { ...store.overrides };
-      if (template === DEFAULT_PROMPT_TEMPLATES[promptId]) delete overrides[promptId];
-      else overrides[promptId] = { template, updatedAt: new Date().toISOString(), defaultHash: Utils.hash(DEFAULT_PROMPT_TEMPLATES[promptId]) };
-      await this.prompts.save({ schemaVersion: 1, overrides });
-      PromptLibrary.warned.delete(promptId);
+    instructionHtml() {
+      const saved = this.getSettings().globalGeminiInstruction;
+      const text = this.instructionDraft ? this.instructionDraft.text : saved;
+      return `<div class="gi-head"><h2>Gemini 공통 지침</h2><p>Fanverse가 Gemini에 요청할 때마다 함께 전달되는 취향·문체 지침입니다. 내부 작업 지시(출력 형식, Canon 규칙)는 그대로 유지되고, 이 지침은 systemInstruction으로 그 위에 더해집니다. 비워 두면 지침 없이 호출합니다.</p></div><textarea class="gi-text" data-instruction-text spellcheck="false" placeholder="예: 일본 팬덤 말투를 자연스럽게 / 캐릭터 OOC 금지 / CP를 승패처럼 다루지 않기 / Reddit은 의견이 갈리게 …">${this.esc(text)}</textarea><div class="gi-meta"><span data-instruction-count>${Fmt.int(text.trim().length)}자</span><span data-instruction-state>${this.instructionDraft?.dirty ? '저장되지 않음' : '저장됨'}</span></div><div class="gi-actions"><button class="primary" data-action="save-instruction">저장</button><button data-action="reset-instruction">기본값 복원</button></div><div class="st-note">적용: Canon 추출 · 팬덤 갱신 · Reddit 글/댓글 · Pixiv metadata · 팬픽 전문 · 장편 개요/섹션 · 연속성 수정. 제외: Continuity 검사(기계적 검증이라 정확도를 위해 지침 없이 호출).</div>`;
     }
 
     // ---------- events ----------
@@ -2934,6 +3034,12 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       const id = target.dataset.id;
       try {
         switch (act) {
+          // safari home
+          case 'sf-open': return this.push(null, target.dataset.view);
+          case 'sf-clear': return this.replace({ ...route, q: '' });
+          case 'sf-pixiv': return this.push({ type: 'pixiv-work', id }, 'pixiv');
+          case 'sf-reddit': return this.push({ type: 'reddit-post', id }, 'reddit');
+          case 'open-instruction': this.instructionDraft = null; return this.push({ type: 'instruction' }, 'settings');
           // pixiv
           case 'px-home': return this.go('pixiv');
           case 'px-search-toggle': return this.replace({ ...route, searchOpen: !route.searchOpen }, { keepScroll: true });
@@ -3015,19 +3121,6 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
             return this.render({ keepScroll: true });
           }
           case 'rd-noop': return;
-          // prompt editor
-          case 'prompt-list': return this.back();
-          case 'open-prompt': return this.push({ type: 'prompt-editor', promptId: target.dataset.promptId }, 'settings');
-          case 'insert-placeholder': {
-            const textarea = this.root.querySelector('[data-prompt-text]');
-            if (!textarea) return;
-            const start = textarea.selectionStart ?? textarea.value.length;
-            textarea.setRangeText(`{{${target.dataset.name}}}`, start, textarea.selectionEnd ?? start, 'end');
-            textarea.focus();
-            this.promptDraft = { id: textarea.dataset.promptId, text: textarea.value, dirty: true };
-            this.updatePromptValidation();
-            return;
-          }
           default: return;
         }
       } catch (error) {
@@ -3035,84 +3128,75 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       }
     }
 
+    updateInstructionMeta() {
+      const textarea = this.root.querySelector('[data-instruction-text]');
+      if (!textarea) return;
+      const count = this.root.querySelector('[data-instruction-count]');
+      const state = this.root.querySelector('[data-instruction-state]');
+      if (count) count.textContent = `${Fmt.int(textarea.value.trim().length)}자`;
+      if (state) state.textContent = this.instructionDraft?.dirty ? '저장되지 않음' : '저장됨';
+    }
+
+    async testProvider(provider, button) {
+      const label = provider === 'developer' ? 'Gemini Developer API' : 'Firebase AI Logic';
+      this.notify('sync', `${label} 연결 테스트 중… (${resolveModelId(this.getSettings())})`);
+      try {
+        const reply = await this.withButton(button, '테스트 중…', () => this.engine.gemini.testConnection(provider));
+        this.engine.warnedProviderUnready = false;
+        this.notify('success', `${label} 연결 성공 · 모델 응답: ${reply}`);
+      } finally {
+        if (this.view === 'settings') await this.render({ keepScroll: true });
+      }
+    }
+
     async handleAction(action, target) {
       if (!action) return;
       try {
         if (!this.engine.world && ['sync-now', 'update-now', 'import-history', 'rebuild-canon', 'export-world', 'reset-world'].includes(action)) throw new Error('RP world가 아직 연결되지 않았습니다. Crack 에피소드 페이지에서 잠시 후 다시 시도하세요.');
-        if (action === 'open-prompt-editor') { this.push({ type: 'prompt-list' }, 'settings'); return; }
-        if (action === 'save-prompt') {
-          const promptId = target.dataset.promptId;
-          await this.savePromptOverride(promptId, this.root.querySelector('[data-prompt-text]').value);
-          this.promptDraft = null;
-          this.notify('success', 'Prompt를 저장했습니다. 다음 호출부터 적용됩니다.');
+        if (action === 'save-instruction') {
+          const text = this.root.querySelector('[data-instruction-text]').value;
+          const settings = this.getSettings();
+          settings.globalGeminiInstruction = text;
+          await this.saveSettings(settings);
+          this.instructionDraft = null;
+          this.notify('success', text.trim() ? 'Gemini 공통 지침을 저장했습니다. 다음 요청부터 적용됩니다.' : '공통 지침을 비웠습니다. 지침 없이 호출합니다.');
+          this.updateInstructionMeta();
+          return;
+        }
+        if (action === 'reset-instruction') {
+          const current = this.root.querySelector('[data-instruction-text]').value;
+          if (current !== DEFAULT_GLOBAL_INSTRUCTION && !confirm('Gemini 공통 지침을 기본값으로 되돌릴까요?')) return;
+          const settings = this.getSettings();
+          settings.globalGeminiInstruction = DEFAULT_GLOBAL_INSTRUCTION;
+          await this.saveSettings(settings);
+          this.instructionDraft = null;
+          this.notify('success', '기본 지침으로 복원했습니다.');
           await this.render({ keepScroll: true });
           return;
         }
-        if (action === 'reset-prompt') {
-          const promptId = target.dataset.promptId;
-          if (this.promptState(promptId).overridden && !confirm(`${PROMPT_DEFINITIONS[promptId].label} 수정본을 삭제하고 코드 기본값으로 되돌릴까요?`)) return;
-          const store = this.prompts.get(); const overrides = { ...store.overrides };
-          delete overrides[promptId];
-          await this.prompts.save({ schemaVersion: 1, overrides });
-          this.promptDraft = null;
-          this.notify('success', '코드 기본 프롬프트로 복원했습니다.'); await this.render({ keepScroll: true });
+        if (action === 'test-firebase') { await this.testProvider('firebase', target); return; }
+        if (action === 'test-developer') { await this.testProvider('developer', target); return; }
+        if (action === 'firebase-config-save') {
+          const raw = this.root.querySelector('[data-firebase-config]').value.trim();
+          let parsed = null;
+          if (raw) {
+            try { parsed = JSON.parse(raw.replace(/^[^{]*?(\{)/s, '$1').replace(/;\s*$/, '')); } catch (error) { throw new Error(`Firebase config JSON을 읽지 못했습니다: ${error.message}`); }
+          }
+          const config = parsed ? normalizeFirebaseConfig(parsed) : null;
+          if (parsed && !config) throw new Error('Firebase config에는 apiKey, projectId, appId가 필요합니다.');
+          const settings = this.getSettings();
+          settings.firebaseConfigOverride = config && JSON.stringify(config) !== JSON.stringify(normalizeFirebaseConfig(DEFAULT_FIREBASE_CONFIG)) ? config : null;
+          await this.saveSettings(settings);
+          this.notify('success', settings.firebaseConfigOverride ? '사용자 Firebase config를 저장했습니다. 다음 요청부터 사용합니다.' : '내장 Firebase config를 사용합니다.');
+          await this.render({ keepScroll: true });
           return;
         }
-        if (action === 'load-default-prompt') {
-          const textarea = this.root.querySelector('[data-prompt-text]');
-          textarea.value = DEFAULT_PROMPT_TEMPLATES[target.dataset.promptId];
-          this.promptDraft = { id: target.dataset.promptId, text: textarea.value, dirty: true };
-          this.updatePromptValidation();
-          this.notify('sync', '편집기에 코드 기본값을 불러왔습니다. 저장해야 적용됩니다.');
-          return;
-        }
-        if (action === 'copy-prompt') { GM_setClipboard(this.root.querySelector('[data-prompt-text]').value, 'text'); this.notify('success', 'Prompt를 복사했습니다.'); return; }
-        if (action === 'export-prompt') {
-          const promptId = target.dataset.promptId;
-          Utils.download(`rp-fanverse-prompt-${promptId}.json`, JSON.stringify({ schemaVersion: 1, appVersion: APP_VERSION, promptId, template: this.root.querySelector('[data-prompt-text]').value }, null, 2));
-          return;
-        }
-        if (action === 'export-prompts') {
-          const store = this.prompts.get();
-          const prompts = Object.fromEntries(Object.keys(PROMPT_DEFINITIONS).map((id) => [id, this.promptState(id).template]));
-          Utils.download('rp-fanverse-prompts.json', JSON.stringify({ schemaVersion: 1, appVersion: APP_VERSION, exportedAt: new Date().toISOString(), overriddenIds: Object.keys(store.overrides), prompts }, null, 2));
-          return;
-        }
-        if (action === 'import-prompt') { this.root.querySelector('[data-prompt-import-file]').click(); return; }
-        if (action === 'import-prompts') { this.root.querySelector('[data-prompts-import-file]').click(); return; }
-        if (action === 'reset-all-prompts') {
-          if (!confirm('모든 프롬프트 수정본을 삭제하고 코드 기본값으로 되돌릴까요?')) return;
-          await this.prompts.save({ schemaVersion: 1, overrides: {} });
-          PromptLibrary.warned.clear();
-          this.notify('success', '모든 프롬프트를 기본값으로 복원했습니다.'); await this.render({ keepScroll: true });
-          return;
-        }
-        if (action === 'vertex-auth') {
-          this.notify('sync', 'Google 로그인 창을 여는 중…');
-          await this.engine.gemini.authorizeVertex();
-          this.engine.warnedProviderUnready = false;
-          this.notify('success', 'Vertex AI access token을 받았습니다.'); await this.render({ keepScroll: true });
-          this.engine.maybeUpdate().catch((error) => this.notify('error', error.message));
-          return;
-        }
-        if (action === 'vertex-manual-token') {
-          const input = target.closest('.st-card')?.querySelector('[data-vertex-manual-token]');
-          await this.withButton(target, '확인 중…', () => this.engine.gemini.useManualVertexToken(input?.value));
-          if (input) input.value = '';
-          this.notify('success', '수동 access token을 확인하고 적용했습니다.'); await this.render({ keepScroll: true });
-          return;
-        }
-        if (action === 'vertex-revoke') {
-          await this.engine.gemini.revokeVertex();
-          this.notify('success', 'Vertex access token을 폐기했습니다.'); await this.render({ keepScroll: true });
-          return;
-        }
-        if (action === 'test-developer' || action === 'test-vertex') {
-          const provider = action === 'test-vertex' ? 'vertex' : 'developer';
-          const label = provider === 'vertex' ? 'Vertex AI' : 'Gemini Developer API';
-          this.notify('sync', `${label} 연결 테스트 중… (${resolveModelId(this.getSettings())})`);
-          const reply = await this.withButton(target, '테스트 중…', () => this.engine.gemini.testConnection(provider));
-          this.notify('success', `${label} 연결 성공 · 모델 응답: ${reply}`);
+        if (action === 'firebase-config-reset') {
+          const settings = this.getSettings();
+          settings.firebaseConfigOverride = null;
+          await this.saveSettings(settings);
+          this.notify('success', '내장 Firebase config로 되돌렸습니다.');
+          await this.render({ keepScroll: true });
           return;
         }
         if (action === 'sync-now') { await this.engine.sync(); await this.render({ keepScroll: true }); return; }
@@ -3144,22 +3228,22 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
 
     handleInput(event) {
       const input = event.target;
-      if (input.matches('[data-prompt-text]')) {
-        this.promptDraft = { id: input.dataset.promptId, text: input.value, dirty: true };
-        clearTimeout(this.validateTimer);
-        this.validateTimer = setTimeout(() => this.updatePromptValidation(), 120);
+      if (input.matches('[data-instruction-text]')) {
+        this.instructionDraft = { text: input.value, dirty: input.value !== this.getSettings().globalGeminiInstruction };
+        this.updateInstructionMeta();
         return;
       }
-      if (input.matches('[data-rd-search]')) {
-        clearTimeout(this.searchTimer);
-        this.searchTimer = setTimeout(async () => {
-          const value = input.value;
-          const caret = input.selectionStart;
-          if (this.route?.type === 'reddit-post') { this.push({ q: value }, 'reddit'); } else { this.route = { ...(this.route || {}), q: value, tab: 'feed' }; await this.render({ keepScroll: true }); }
-          const fresh = this.root.querySelector('[data-rd-search]');
-          if (fresh) { fresh.focus(); fresh.setSelectionRange(caret, caret); }
-        }, 250);
-      }
+      const searchKind = input.matches('[data-rd-search]') ? 'reddit' : input.matches('[data-sf-search]') ? 'home' : null;
+      if (!searchKind) return;
+      clearTimeout(this.searchTimer);
+      this.searchTimer = setTimeout(async () => {
+        const value = input.value;
+        const caret = input.selectionStart;
+        if (searchKind === 'reddit' && this.route?.type === 'reddit-post') this.push({ q: value }, 'reddit');
+        else { this.route = { ...(this.route || {}), q: value, ...(searchKind === 'reddit' ? { tab: 'feed' } : {}) }; await this.render({ keepScroll: searchKind === 'reddit' }); }
+        const fresh = this.root.querySelector(searchKind === 'reddit' ? '[data-rd-search]' : '[data-sf-search]');
+        if (fresh) { fresh.focus(); fresh.setSelectionRange(caret, caret); }
+      }, 220);
     }
 
     handleKeydown(event) {
@@ -3167,10 +3251,10 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
         const value = event.target.value.trim();
         if (value) this.push({ type: 'tag', tag: value }, 'pixiv');
       }
-      if (event.key === 'Tab' && event.target.matches('[data-prompt-text]')) {
-        event.preventDefault();
-        event.target.setRangeText('  ', event.target.selectionStart, event.target.selectionEnd, 'end');
-        this.handleInput(event);
+      if (event.key === 'Enter' && event.target.matches('[data-sf-search]')) {
+        const value = event.target.value.trim();
+        if (/^fandom:\/\/current\/?$/i.test(value)) { clearTimeout(this.searchTimer); this.replace({ q: '' }); }
+        else event.target.blur();
       }
     }
 
@@ -3182,50 +3266,16 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
           let value = input.type === 'checkbox' ? input.checked : input.value;
           if (input.type === 'number') value = Number(value);
           settings[input.dataset.setting] = value;
-          if (input.dataset.setting === 'vertexOAuthClientId') await this.engine.gemini.clearVertexToken();
           await this.saveSettings(settings);
           if (input.dataset.setting === 'uiScale') this.host.style.setProperty('--ui-scale', String(this.getSettings().uiScale));
           this.notify('success', '설정을 저장했습니다.');
-          if (['provider', 'modelPreset', 'customModelId', 'vertexApiVersion', 'vertexLocation', 'vertexProjectId', 'apiKey', 'vertexOAuthClientId'].includes(input.dataset.setting)) await this.render({ keepScroll: true });
+          if (['provider', 'modelPreset', 'customModelId', 'apiKey', 'appCheckMode', 'appCheckSiteKey', 'appCheckDebugToken', 'firebaseLocation'].includes(input.dataset.setting)) await this.render({ keepScroll: true });
           return;
         }
         if (input.matches('[data-import-file]') && input.files?.[0]) {
           const payload = JSON.parse(await input.files[0].text());
           await this.db.restore(payload); await this.engine.attach(this.engine.worldInfo);
           this.notify('success', 'Fanverse 데이터를 가져왔습니다.'); await this.render();
-          return;
-        }
-        if (input.matches('[data-prompt-import-file]') && input.files?.[0]) {
-          const payload = JSON.parse(await input.files[0].text());
-          if (!PROMPT_DEFINITIONS[payload.promptId] || typeof payload.template !== 'string') throw new Error('개별 prompt JSON 형식이 올바르지 않습니다. (promptId, template 필요)');
-          await this.savePromptOverride(payload.promptId, payload.template);
-          this.promptDraft = null;
-          this.route = { type: 'prompt-editor', promptId: payload.promptId };
-          this.notify('success', `${PROMPT_DEFINITIONS[payload.promptId].label} prompt를 가져왔습니다.`); await this.render();
-          return;
-        }
-        if (input.matches('[data-prompts-import-file]') && input.files?.[0]) {
-          const payload = JSON.parse(await input.files[0].text());
-          // Accepts this script's export ({prompts:{id:template}}) and the raw storage layout ({overrides:{id:{template}}}).
-          const source = payload?.prompts && typeof payload.prompts === 'object' ? payload.prompts : payload?.overrides && typeof payload.overrides === 'object' ? Object.fromEntries(Object.entries(payload.overrides).map(([id, entry]) => [id, typeof entry === 'string' ? entry : entry?.template])) : null;
-          if (!source) throw new Error('전체 prompts JSON 형식이 올바르지 않습니다.');
-          const unknown = Object.keys(source).filter((id) => !PROMPT_DEFINITIONS[id]);
-          if (unknown.length) throw new Error(`알 수 없는 prompt ID: ${unknown.join(', ')}`);
-          const problems = [];
-          for (const [id, template] of Object.entries(source)) {
-            if (typeof template !== 'string') { problems.push(`${id}: template이 문자열이 아닙니다`); continue; }
-            const { errors } = inspectPromptTemplate(id, template);
-            if (errors.length) problems.push(`${PROMPT_DEFINITIONS[id].label}: ${errors.join(' / ')}`);
-          }
-          if (problems.length) throw new Error(`가져오기를 취소했습니다 (아무것도 변경되지 않음)\n${problems.join('\n')}`);
-          const overrides = { ...this.prompts.get().overrides };
-          for (const [id, template] of Object.entries(source)) {
-            if (template === DEFAULT_PROMPT_TEMPLATES[id]) delete overrides[id];
-            else overrides[id] = { template, updatedAt: new Date().toISOString(), defaultHash: Utils.hash(DEFAULT_PROMPT_TEMPLATES[id]) };
-          }
-          await this.prompts.save({ schemaVersion: 1, overrides });
-          PromptLibrary.warned.clear();
-          this.notify('success', `${Object.keys(source).length}개 prompt를 가져왔습니다.`); await this.render({ keepScroll: true });
         }
       } catch (error) {
         this.notify('error', error.message);
@@ -3239,32 +3289,20 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
     constructor() {
       this.db = new Database(); this.api = new CrackApiAdapter(); this.dom = new CrackDomFallbackAdapter();
       this.settings = normalizeSettings(); this.gemini = new GeminiClient(() => this.settings);
-      this.prompts = normalizePromptStore(null);
-      PromptLibrary.configure(() => this.prompts.overrides, (id, error) => this.ui?.notify('error', `${PROMPT_DEFINITIONS[id].label} 수정본이 유효하지 않아 기본 프롬프트로 호출했습니다: ${error}`));
       this.engine = new FanverseEngine(this.db, this.api, this.dom, this.gemini, () => this.settings, (kind, message) => this.ui?.notify(kind, message));
-      this.ui = new PhoneUI(this.engine, this.db, () => this.settings, (settings) => this.persistSettings(settings), {
-        get: () => this.prompts,
-        save: (store) => this.persistPrompts(store),
-      });
+      this.ui = new PhoneUI(this.engine, this.db, () => this.settings, (settings) => this.persistSettings(settings));
       this.lastUrl = '';
     }
 
     async persistSettings(settings) {
-      const next = { ...settings };
-      delete next.promptOverrides;
-      this.settings = normalizeSettings(next);
+      this.settings = normalizeSettings(settings);
       await GMStore.set(SETTINGS_KEY, this.settings);
-    }
-
-    async persistPrompts(store) {
-      this.prompts = normalizePromptStore(store);
-      await GMStore.set(PROMPTS_KEY, this.prompts);
     }
 
     // Startup is ordered so the launcher appears before anything optional runs, and every step is
     // isolated: a failing step is logged and surfaced in the UI, never allowed to abort the rest.
     // Required: settings (falls back to defaults) → IndexedDB → launcher. Optional after the launcher:
-    // Vertex token restore, world attach + sync.
+    // Firebase AI Logic init, world attach + sync.
     async step(name, task) {
       try {
         return await task();
@@ -3280,15 +3318,10 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       this.ui.startupIssues = this.startupIssues;
       if (!GMStore.available()) this.startupIssues.push('GM storage: Tampermonkey GM_* 권한을 사용할 수 없어 설정이 이 페이지에서만 유지됩니다 (userscript header 확인)');
       await this.step('settings', async () => {
-        const rawSettings = await GMStore.get(SETTINGS_KEY, {});
-        const rawPrompts = await GMStore.get(PROMPTS_KEY, null);
-        if (!rawPrompts && rawSettings?.promptOverrides && Object.keys(rawSettings.promptOverrides).length) {
-          // 0.11.0 → 0.12.x: overrides moved out of settings into their own key (with metadata).
-          await this.persistPrompts({ overrides: rawSettings.promptOverrides });
-        } else {
-          this.prompts = normalizePromptStore(rawPrompts);
-        }
-        await this.persistSettings(rawSettings || {});
+        await this.persistSettings(await GMStore.get(SETTINGS_KEY, {}));
+        // The direct-Vertex OAuth access token is obsolete; drop it. Legacy per-prompt overrides
+        // (LEGACY_PROMPTS_KEY) are left untouched but no longer read: internal prompts are code now.
+        await GMStore.remove(LEGACY_VERTEX_TOKEN_KEY);
       });
       await this.step('database', () => withTimeout(this.db.open(), 10000, 'IndexedDB를 열지 못했습니다 (10초 초과)'));
       try {
@@ -3298,7 +3331,11 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
         return; // nothing below is reachable for the user without the launcher
       }
       if (this.startupIssues.length) this.ui.notify('error', `Fanverse 일부 초기화 실패 — Settings에서 확인하세요.\n${this.startupIssues.join('\n')}`);
-      await this.step('vertex token', () => this.gemini.vertex.restore());
+      if (this.settings.provider === 'firebase') {
+        // Evaluates the bundled SDK and initialises Firebase/App Check/AI. A failure only disables AI
+        // generation; the state is shown in Settings and retried on the next AI request.
+        await this.step('firebase', () => this.gemini.firebase.ensure());
+      }
       await this.step('world', () => this.routeChanged());
       setInterval(() => { this.routeChanged().catch((error) => console.warn('[RP Fanverse] route check failed', error)); }, 2000);
       setInterval(() => { if (this.engine.worldInfo && !document.hidden && !this.engine.syncing) this.engine.sync().catch((error) => this.ui.notify('error', error.message)); }, Math.max(15, this.settings.pollSeconds) * 1000);
@@ -3325,6 +3362,494 @@ details.st-details[open]>summary{border-bottom:1px solid #e5e5ea}
       if (this.ui.open) await this.ui.render();
     }
   }
+
+  // ---------- bundled Firebase Web SDK ----------
+  // firebase/app + firebase/ai + firebase/app-check only, bundled by build/build.mjs with esbuild.
+  // The bundle is wrapped in a function so it is evaluated lazily (after the launcher is mounted)
+  // and stays private to this userscript. `fetch` inside the bundle is rebound to gmFetch.
+  let firebaseSdk = null;
+  function getFirebaseSdk() {
+    if (!firebaseSdk) firebaseSdk = createFirebaseSdk(gmFetch);
+    return firebaseSdk;
+  }
+
+  /* eslint-disable */
+  function createFirebaseSdk(__rpfFetch) {
+    // >>> FIREBASE SDK BUNDLE >>>
+    // firebase@12.19.0 (app, ai, app-check) · esbuild iife · generated by build/build.mjs — do not edit by hand
+var RpfFirebase=(()=>{var de=Object.defineProperty;var tn=Object.getOwnPropertyDescriptor;var nn=Object.getOwnPropertyNames;var sn=Object.prototype.hasOwnProperty;var rn=(t,e)=>{for(var n in e)de(t,n,{get:e[n],enumerable:!0})},on=(t,e,n,s)=>{if(e&&typeof e=="object"||typeof e=="function")for(let r of nn(e))!sn.call(t,r)&&r!==n&&de(t,r,{get:()=>e[r],enumerable:!(s=tn(e,r))||s.enumerable});return t};var an=t=>on(de({},"__esModule",{value:!0}),t);var kr={};rn(kr,{AgentPlatformBackend:()=>$,CustomProvider:()=>le,getAI:()=>xt,getGenerativeModel:()=>Ut,initializeApp:()=>ve,initializeAppCheck:()=>Zt});var Qe=()=>{};var tt=function(t){let e=[],n=0;for(let s=0;s<t.length;s++){let r=t.charCodeAt(s);r<128?e[n++]=r:r<2048?(e[n++]=r>>6|192,e[n++]=r&63|128):(r&64512)===55296&&s+1<t.length&&(t.charCodeAt(s+1)&64512)===56320?(r=65536+((r&1023)<<10)+(t.charCodeAt(++s)&1023),e[n++]=r>>18|240,e[n++]=r>>12&63|128,e[n++]=r>>6&63|128,e[n++]=r&63|128):(e[n++]=r>>12|224,e[n++]=r>>6&63|128,e[n++]=r&63|128)}return e},cn=function(t){let e=[],n=0,s=0;for(;n<t.length;){let r=t[n++];if(r<128)e[s++]=String.fromCharCode(r);else if(r>191&&r<224){let i=t[n++];e[s++]=String.fromCharCode((r&31)<<6|i&63)}else if(r>239&&r<365){let i=t[n++],o=t[n++],a=t[n++],c=((r&7)<<18|(i&63)<<12|(o&63)<<6|a&63)-65536;e[s++]=String.fromCharCode(55296+(c>>10)),e[s++]=String.fromCharCode(56320+(c&1023))}else{let i=t[n++],o=t[n++];e[s++]=String.fromCharCode((r&15)<<12|(i&63)<<6|o&63)}}return e.join("")},X={byteToCharMap_:null,charToByteMap_:null,byteToCharMapWebSafe_:null,charToByteMapWebSafe_:null,ENCODED_VALS_BASE:"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",get ENCODED_VALS(){return this.ENCODED_VALS_BASE+"+/="},get ENCODED_VALS_WEBSAFE(){return this.ENCODED_VALS_BASE+"-_."},HAS_NATIVE_SUPPORT:typeof atob=="function",encodeByteArray(t,e){if(!Array.isArray(t))throw Error("encodeByteArray takes an array as a parameter");this.init_();let n=e?this.byteToCharMapWebSafe_:this.byteToCharMap_,s=[];for(let r=0;r<t.length;r+=3){let i=t[r],o=r+1<t.length,a=o?t[r+1]:0,c=r+2<t.length,l=c?t[r+2]:0,h=i>>2,f=(i&3)<<4|a>>4,g=(a&15)<<2|l>>6,q=l&63;c||(q=64,o||(g=64)),s.push(n[h],n[f],n[g],n[q])}return s.join("")},encodeString(t,e){return this.HAS_NATIVE_SUPPORT&&!e?btoa(t):this.encodeByteArray(tt(t),e)},decodeString(t,e){return this.HAS_NATIVE_SUPPORT&&!e?atob(t):cn(this.decodeStringToByteArray(t,e))},decodeStringToByteArray(t,e){this.init_();let n=e?this.charToByteMapWebSafe_:this.charToByteMap_,s=[];for(let r=0;r<t.length;){let i=n[t.charAt(r++)],a=r<t.length?n[t.charAt(r)]:0;++r;let l=r<t.length?n[t.charAt(r)]:64;++r;let f=r<t.length?n[t.charAt(r)]:64;if(++r,i==null||a==null||l==null||f==null)throw new he;let g=i<<2|a>>4;if(s.push(g),l!==64){let q=a<<4&240|l>>2;if(s.push(q),f!==64){let en=l<<6&192|f;s.push(en)}}}return s},init_(){if(!this.byteToCharMap_){this.byteToCharMap_={},this.charToByteMap_={},this.byteToCharMapWebSafe_={},this.charToByteMapWebSafe_={};for(let t=0;t<this.ENCODED_VALS.length;t++)this.byteToCharMap_[t]=this.ENCODED_VALS.charAt(t),this.charToByteMap_[this.byteToCharMap_[t]]=t,this.byteToCharMapWebSafe_[t]=this.ENCODED_VALS_WEBSAFE.charAt(t),this.charToByteMapWebSafe_[this.byteToCharMapWebSafe_[t]]=t,t>=this.ENCODED_VALS_BASE.length&&(this.charToByteMap_[this.ENCODED_VALS_WEBSAFE.charAt(t)]=t,this.charToByteMapWebSafe_[this.ENCODED_VALS.charAt(t)]=t)}}},he=class extends Error{constructor(){super(...arguments),this.name="DecodeBase64StringError"}},ln=function(t){let e=tt(t);return X.encodeByteArray(e,!0)},fe=function(t){return ln(t).replace(/\./g,"")},J=function(t){try{return X.decodeString(t,!0)}catch(e){console.error("base64Decode failed: ",e)}return null};function H(){if(typeof self<"u")return self;if(typeof window<"u")return window;if(typeof global<"u")return global;throw new Error("Unable to locate global object.")}var un=()=>H().__FIREBASE_DEFAULTS__,dn=()=>{if(typeof process>"u"||typeof process.env>"u")return;let t=process.env.__FIREBASE_DEFAULTS__;if(t)return JSON.parse(t)},hn=()=>{if(typeof document>"u")return;let t;try{t=document.cookie.match(/__FIREBASE_DEFAULTS__=([^;]+)/)}catch{return}let e=t&&J(t[1]);return e&&JSON.parse(e)},fn=()=>{try{return Qe()||un()||dn()||hn()}catch(t){console.info(`Unable to get __FIREBASE_DEFAULTS__ due to: ${t}`);return}};var pe=()=>fn()?.config;var O=class{constructor(){this.reject=()=>{},this.resolve=()=>{},this.promise=new Promise((e,n)=>{this.resolve=e,this.reject=n})}wrapCallback(e){return(n,s)=>{n?this.reject(n):this.resolve(s),typeof e=="function"&&(this.promise.catch(()=>{}),e.length===1?e(n):e(n,s))}}};function G(){try{return typeof indexedDB=="object"}catch{return!1}}function nt(){return new Promise((t,e)=>{try{let n=!0,s="validate-browser-context-for-indexeddb-analytics-module",r=self.indexedDB.open(s);r.onsuccess=()=>{r.result.close(),n||self.indexedDB.deleteDatabase(s),t(!0)},r.onupgradeneeded=()=>{n=!1},r.onerror=()=>{e(r.error?.message||"")}}catch(n){e(n)}})}var pn="FirebaseError",C=class t extends Error{constructor(e,n,s){super(n),this.code=e,this.customData=s,this.name=pn,Object.setPrototypeOf(this,t.prototype),Error.captureStackTrace&&Error.captureStackTrace(this,P.prototype.create)}},P=class{constructor(e,n,s){this.service=e,this.serviceName=n,this.errors=s}create(e,...n){let s=n[0]||{},r=`${this.service}/${e}`,i=this.errors[e],o=i?gn(i,s):"Error",a=`${this.serviceName}: ${o} (${r}).`;return new C(r,a,s)}};function gn(t,e){try{let n=0,s="";for(;n<t.length;){let r=t.indexOf("{$",n);if(r===-1){s+=t.substring(n);break}let i=t.indexOf("}",r+2);if(i===-1){s+=t.substring(n);break}let o=t.substring(r+2,i),a=e[o];s+=t.substring(n,r)+(a!=null?String(a):`<${o}?>`),n=i+1}return s}catch{return t}}function Ze(t){return JSON.parse(t)}var mn=function(t){let e={},n={},s={},r="";try{let i=t.split(".");e=Ze(J(i[0])||""),n=Ze(J(i[1])||""),r=i[2],s=n.d||{},delete n.d}catch{}return{header:e,claims:n,data:s,signature:r}};var st=function(t){let e=mn(t).claims;return typeof e=="object"&&e.hasOwnProperty("iat")?e.iat:null};function Q(t,e){if(t===e)return!0;let n=Object.keys(t),s=Object.keys(e);for(let r of n){if(!s.includes(r))return!1;let i=t[r],o=e[r];if(et(i)&&et(o)){if(!Q(i,o))return!1}else if(i!==o)return!1}for(let r of s)if(!n.includes(r))return!1;return!0}function et(t){return t!==null&&typeof t=="object"}var Mr=14400*1e3;function Z(t){return t&&t._delegate?t._delegate:t}var _=class{constructor(e,n,s){this.name=e,this.instanceFactory=n,this.type=s,this.multipleInstances=!1,this.serviceProps={},this.instantiationMode="LAZY",this.onInstanceCreated=null}setInstantiationMode(e){return this.instantiationMode=e,this}setMultipleInstances(e){return this.multipleInstances=e,this}setServiceProps(e){return this.serviceProps=e,this}setInstanceCreatedCallback(e){return this.onInstanceCreated=e,this}};var M="[DEFAULT]";var ge=class{constructor(e,n){this.name=e,this.container=n,this.component=null,this.instances=new Map,this.instancesDeferred=new Map,this.instancesOptions=new Map,this.onInitCallbacks=new Map}get(e){let n=this.normalizeInstanceIdentifier(e);if(!this.instancesDeferred.has(n)){let s=new O;if(this.instancesDeferred.set(n,s),this.isInitialized(n)||this.shouldAutoInitialize())try{let r=this.getOrInitializeService({instanceIdentifier:n});r&&s.resolve(r)}catch{}}return this.instancesDeferred.get(n).promise}getImmediate(e){let n=this.normalizeInstanceIdentifier(e?.identifier),s=e?.optional??!1;if(this.isInitialized(n)||this.shouldAutoInitialize())try{return this.getOrInitializeService({instanceIdentifier:n})}catch(r){if(s)return null;throw r}else{if(s)return null;throw Error(`Service ${this.name} is not available`)}}getComponent(){return this.component}setComponent(e){if(e.name!==this.name)throw Error(`Mismatching Component ${e.name} for Provider ${this.name}.`);if(this.component)throw Error(`Component for ${this.name} has already been provided`);if(this.component=e,!!this.shouldAutoInitialize()){if(_n(e))try{this.getOrInitializeService({instanceIdentifier:M})}catch{}for(let[n,s]of this.instancesDeferred.entries()){let r=this.normalizeInstanceIdentifier(n);try{let i=this.getOrInitializeService({instanceIdentifier:r});s.resolve(i)}catch{}}}}clearInstance(e=M){this.instancesDeferred.delete(e),this.instancesOptions.delete(e),this.instances.delete(e)}async delete(){let e=Array.from(this.instances.values());await Promise.all([...e.filter(n=>"INTERNAL"in n).map(n=>n.INTERNAL.delete()),...e.filter(n=>"_delete"in n).map(n=>n._delete())])}isComponentSet(){return this.component!=null}isInitialized(e=M){return this.instances.has(e)}getOptions(e=M){return this.instancesOptions.get(e)||{}}initialize(e={}){let{options:n={}}=e,s=this.normalizeInstanceIdentifier(e.instanceIdentifier);if(this.isInitialized(s))throw Error(`${this.name}(${s}) has already been initialized`);if(!this.isComponentSet())throw Error(`Component ${this.name} has not been registered yet`);let r=this.getOrInitializeService({instanceIdentifier:s,options:n});for(let[i,o]of this.instancesDeferred.entries()){let a=this.normalizeInstanceIdentifier(i);s===a&&o.resolve(r)}return r}onInit(e,n){let s=this.normalizeInstanceIdentifier(n),r=this.onInitCallbacks.get(s)??new Set;r.add(e),this.onInitCallbacks.set(s,r);let i=this.instances.get(s);return i&&e(i,s),()=>{r.delete(e)}}invokeOnInitCallbacks(e,n){let s=this.onInitCallbacks.get(n);if(s)for(let r of s)try{r(e,n)}catch{}}getOrInitializeService({instanceIdentifier:e,options:n={}}){let s=this.instances.get(e);if(!s&&this.component&&(s=this.component.instanceFactory(this.container,{instanceIdentifier:En(e),options:n}),this.instances.set(e,s),this.instancesOptions.set(e,n),this.invokeOnInitCallbacks(s,e),this.component.onInstanceCreated))try{this.component.onInstanceCreated(this.container,e,s)}catch{}return s||null}normalizeInstanceIdentifier(e=M){return this.component?this.component.multipleInstances?e:M:e}shouldAutoInitialize(){return!!this.component&&this.component.instantiationMode!=="EXPLICIT"}};function En(t){return t===M?void 0:t}function _n(t){return t.instantiationMode==="EAGER"}var ee=class{constructor(e){this.name=e,this.providers=new Map}addComponent(e){let n=this.getProvider(e.name);if(n.isComponentSet())throw new Error(`Component ${e.name} has already been registered with ${this.name}`);n.setComponent(e)}addOrOverwriteComponent(e){this.getProvider(e.name).isComponentSet()&&this.providers.delete(e.name),this.addComponent(e)}getProvider(e){if(this.providers.has(e))return this.providers.get(e);let n=new ge(e,this);return this.providers.set(e,n),n}getProviders(){return Array.from(this.providers.values())}};var bn=[],p;(function(t){t[t.DEBUG=0]="DEBUG",t[t.VERBOSE=1]="VERBOSE",t[t.INFO=2]="INFO",t[t.WARN=3]="WARN",t[t.ERROR=4]="ERROR",t[t.SILENT=5]="SILENT"})(p||(p={}));var wn={debug:p.DEBUG,verbose:p.VERBOSE,info:p.INFO,warn:p.WARN,error:p.ERROR,silent:p.SILENT},Sn=p.INFO,yn={[p.DEBUG]:"log",[p.VERBOSE]:"log",[p.INFO]:"info",[p.WARN]:"warn",[p.ERROR]:"error"},An=(t,e,...n)=>{if(e<t.logLevel)return;let s=new Date().toISOString(),r=yn[e];if(r)console[r](`[${s}]  ${t.name}:`,...n);else throw new Error(`Attempted to log a message with an invalid logType (value: ${e})`)},D=class{constructor(e){this.name=e,this._logLevel=Sn,this._logHandler=An,this._userLogHandler=null,bn.push(this)}get logLevel(){return this._logLevel}set logLevel(e){if(!(e in p))throw new TypeError(`Invalid value "${e}" assigned to \`logLevel\``);this._logLevel=e}setLogLevel(e){this._logLevel=typeof e=="string"?wn[e]:e}get logHandler(){return this._logHandler}set logHandler(e){if(typeof e!="function")throw new TypeError("Value assigned to `logHandler` must be a function");this._logHandler=e}get userLogHandler(){return this._userLogHandler}set userLogHandler(e){this._userLogHandler=e}debug(...e){this._userLogHandler&&this._userLogHandler(this,p.DEBUG,...e),this._logHandler(this,p.DEBUG,...e)}log(...e){this._userLogHandler&&this._userLogHandler(this,p.VERBOSE,...e),this._logHandler(this,p.VERBOSE,...e)}info(...e){this._userLogHandler&&this._userLogHandler(this,p.INFO,...e),this._logHandler(this,p.INFO,...e)}warn(...e){this._userLogHandler&&this._userLogHandler(this,p.WARN,...e),this._logHandler(this,p.WARN,...e)}error(...e){this._userLogHandler&&this._userLogHandler(this,p.ERROR,...e),this._logHandler(this,p.ERROR,...e)}};var Tn=(t,e)=>e.some(n=>t instanceof n),rt,it;function On(){return rt||(rt=[IDBDatabase,IDBObjectStore,IDBIndex,IDBCursor,IDBTransaction])}function Cn(){return it||(it=[IDBCursor.prototype.advance,IDBCursor.prototype.continue,IDBCursor.prototype.continuePrimaryKey])}var ot=new WeakMap,Ee=new WeakMap,at=new WeakMap,me=new WeakMap,be=new WeakMap;function Rn(t){let e=new Promise((n,s)=>{let r=()=>{t.removeEventListener("success",i),t.removeEventListener("error",o)},i=()=>{n(S(t.result)),r()},o=()=>{s(t.error),r()};t.addEventListener("success",i),t.addEventListener("error",o)});return e.then(n=>{n instanceof IDBCursor&&ot.set(n,t)}).catch(()=>{}),be.set(e,t),e}function In(t){if(Ee.has(t))return;let e=new Promise((n,s)=>{let r=()=>{t.removeEventListener("complete",i),t.removeEventListener("error",o),t.removeEventListener("abort",o)},i=()=>{n(),r()},o=()=>{s(t.error||new DOMException("AbortError","AbortError")),r()};t.addEventListener("complete",i),t.addEventListener("error",o),t.addEventListener("abort",o)});Ee.set(t,e)}var _e={get(t,e,n){if(t instanceof IDBTransaction){if(e==="done")return Ee.get(t);if(e==="objectStoreNames")return t.objectStoreNames||at.get(t);if(e==="store")return n.objectStoreNames[1]?void 0:n.objectStore(n.objectStoreNames[0])}return S(t[e])},set(t,e,n){return t[e]=n,!0},has(t,e){return t instanceof IDBTransaction&&(e==="done"||e==="store")?!0:e in t}};function ct(t){_e=t(_e)}function vn(t){return t===IDBDatabase.prototype.transaction&&!("objectStoreNames"in IDBTransaction.prototype)?function(e,...n){let s=t.call(te(this),e,...n);return at.set(s,e.sort?e.sort():[e]),S(s)}:Cn().includes(t)?function(...e){return t.apply(te(this),e),S(ot.get(this))}:function(...e){return S(t.apply(te(this),e))}}function Dn(t){return typeof t=="function"?vn(t):(t instanceof IDBTransaction&&In(t),Tn(t,On())?new Proxy(t,_e):t)}function S(t){if(t instanceof IDBRequest)return Rn(t);if(me.has(t))return me.get(t);let e=Dn(t);return e!==t&&(me.set(t,e),be.set(e,t)),e}var te=t=>be.get(t);function ut(t,e,{blocked:n,upgrade:s,blocking:r,terminated:i}={}){let o=indexedDB.open(t,e),a=S(o);return s&&o.addEventListener("upgradeneeded",c=>{s(S(o.result),c.oldVersion,c.newVersion,S(o.transaction),c)}),n&&o.addEventListener("blocked",c=>n(c.oldVersion,c.newVersion,c)),a.then(c=>{i&&c.addEventListener("close",()=>i()),r&&c.addEventListener("versionchange",l=>r(l.oldVersion,l.newVersion,l))}).catch(()=>{}),a}var kn=["get","getKey","getAll","getAllKeys","count"],Nn=["put","add","delete","clear"],we=new Map;function lt(t,e){if(!(t instanceof IDBDatabase&&!(e in t)&&typeof e=="string"))return;if(we.get(e))return we.get(e);let n=e.replace(/FromIndex$/,""),s=e!==n,r=Nn.includes(n);if(!(n in(s?IDBIndex:IDBObjectStore).prototype)||!(r||kn.includes(n)))return;let i=async function(o,...a){let c=this.transaction(o,r?"readwrite":"readonly"),l=c.store;return s&&(l=l.index(a.shift())),(await Promise.all([l[n](...a),r&&c.done]))[0]};return we.set(e,i),i}ct(t=>({...t,get:(e,n,s)=>lt(e,n)||t.get(e,n,s),has:(e,n)=>!!lt(e,n)||t.has(e,n)}));var ye=class{constructor(e){this.container=e}getPlatformInfoString(){return this.container.getProviders().map(n=>{if(Ln(n)){let s=n.getImmediate();return`${s.library}/${s.version}`}else return null}).filter(n=>n).join(" ")}};function Ln(t){return t.getComponent()?.type==="VERSION"}var Ae="@firebase/app",dt="0.16.2";var I=new D("@firebase/app"),Pn="@firebase/app-compat",Mn="@firebase/analytics-compat",xn="@firebase/analytics",Un="@firebase/app-check-compat",$n="@firebase/app-check",Bn="@firebase/auth",Fn="@firebase/auth-compat",Hn="@firebase/database",Gn="@firebase/data-connect",Vn="@firebase/database-compat",jn="@firebase/functions",Wn="@firebase/functions-compat",zn="@firebase/installations",Kn="@firebase/installations-compat",Yn="@firebase/messaging",qn="@firebase/messaging-compat",Jn="@firebase/performance",Xn="@firebase/performance-compat",Qn="@firebase/remote-config",Zn="@firebase/remote-config-compat",es="@firebase/storage",ts="@firebase/storage-compat",ns="@firebase/firestore",ss="@firebase/ai",rs="@firebase/firestore-compat",is="firebase";var Te="[DEFAULT]",os={[Ae]:"fire-core",[Pn]:"fire-core-compat",[xn]:"fire-analytics",[Mn]:"fire-analytics-compat",[$n]:"fire-app-check",[Un]:"fire-app-check-compat",[Bn]:"fire-auth",[Fn]:"fire-auth-compat",[Hn]:"fire-rtdb",[Gn]:"fire-data-connect",[Vn]:"fire-rtdb-compat",[jn]:"fire-fn",[Wn]:"fire-fn-compat",[zn]:"fire-iid",[Kn]:"fire-iid-compat",[Yn]:"fire-fcm",[qn]:"fire-fcm-compat",[Jn]:"fire-perf",[Xn]:"fire-perf-compat",[Qn]:"fire-rc",[Zn]:"fire-rc-compat",[es]:"fire-gcs",[ts]:"fire-gcs-compat",[ns]:"fire-fst",[rs]:"fire-fst-compat",[ss]:"fire-vertex","fire-js":"fire-js",[is]:"fire-js-all"};var ne=new Map,as=new Map,Oe=new Map;function ht(t,e){try{t.container.addComponent(e)}catch(n){I.debug(`Component ${e.name} failed to register with FirebaseApp ${t.name}`,n)}}function k(t){let e=t.name;if(Oe.has(e))return I.debug(`There were multiple attempts to register component ${e}.`),!1;Oe.set(e,t);for(let n of ne.values())ht(n,t);for(let n of as.values())ht(n,t);return!0}function se(t,e){let n=t.container.getProvider("heartbeat").getImmediate({optional:!0});return n&&n.triggerHeartbeat(),t.container.getProvider(e)}function mt(t){return t==null?!1:t.settings!==void 0}var cs={"no-app":"No Firebase App '{$appName}' has been created - call initializeApp() first","bad-app-name":"Illegal App name: '{$appName}'","duplicate-app":"Firebase App named '{$appName}' already exists with different {$mismatchedParam}. Existing: '{$oldValue}'. New: '{$newValue}'.","app-deleted":"Firebase App named '{$appName}' already deleted","server-app-deleted":"Firebase Server App has been deleted","no-options":"Need to provide options, when not being deployed to hosting via source.","invalid-app-argument":"firebase.{$appName}() takes either no argument or a Firebase App instance.","invalid-log-argument":"First argument to `onLog` must be null or a function.","idb-open":"Error thrown when opening IndexedDB. Original error: {$originalErrorMessage}.","idb-get":"Error thrown when reading from IndexedDB. Original error: {$originalErrorMessage}.","idb-set":"Error thrown when writing to IndexedDB. Original error: {$originalErrorMessage}.","idb-delete":"Error thrown when deleting from IndexedDB. Original error: {$originalErrorMessage}.","finalization-registry-not-supported":"FirebaseServerApp deleteOnDeref field defined but the JS runtime does not support FinalizationRegistry.","invalid-server-app-environment":"FirebaseServerApp is not for use in browser environments."},R=new P("app","Firebase",cs);var Ce=class{constructor(e,n,s){this._isDeleted=!1,this._options={...e},this._config={...n},this._name=n.name,this._automaticDataCollectionEnabled=n.automaticDataCollectionEnabled,this._container=s,this.container.addComponent(new _("app",()=>this,"PUBLIC"))}get automaticDataCollectionEnabled(){return this.checkDestroyed(),this._automaticDataCollectionEnabled}set automaticDataCollectionEnabled(e){this.checkDestroyed(),this._automaticDataCollectionEnabled=e}get name(){return this.checkDestroyed(),this._name}get options(){return this.checkDestroyed(),this._options}get config(){return this.checkDestroyed(),this._config}get container(){return this._container}get isDeleted(){return this._isDeleted}set isDeleted(e){this._isDeleted=e}checkDestroyed(){if(this.isDeleted)throw R.create("app-deleted",{appName:this._name})}};function ve(t,e={}){let n=t;typeof e!="object"&&(e={name:e});let s={name:Te,automaticDataCollectionEnabled:!0,...e},r=s.name;if(typeof r!="string"||!r)throw R.create("bad-app-name",{appName:String(r)});if(n||(n=pe()),!n)throw R.create("no-options");let i=ne.get(r);if(i)if(Q(n,i.options)){if(Q(s,i.config))return i;throw R.create("duplicate-app",{appName:r,mismatchedParam:"config",oldValue:JSON.stringify(i.config),newValue:JSON.stringify(s)})}else throw R.create("duplicate-app",{appName:r,mismatchedParam:"options",oldValue:JSON.stringify(i.options),newValue:JSON.stringify(n)});let o=new ee(r);for(let c of Oe.values())o.addComponent(c);let a=new Ce(n,s,o);return ne.set(r,a),a}function re(t=Te){let e=ne.get(t);if(!e&&t===Te&&pe())return ve();if(!e)throw R.create("no-app",{appName:t});return e}function y(t,e,n){let s=os[t]??t;n&&(s+=`-${n}`);let r=s.match(/\s|\//),i=e.match(/\s|\//);if(r||i){let o=[`Unable to register library "${s}" with version "${e}":`];r&&o.push(`library name "${s}" contains illegal characters (whitespace or "/")`),r&&i&&o.push("and"),i&&o.push(`version name "${e}" contains illegal characters (whitespace or "/")`),I.warn(o.join(" "));return}k(new _(`${s}-version`,()=>({library:s,version:e}),"VERSION"))}var ls="firebase-heartbeat-database",us=1,V="firebase-heartbeat-store",Se=null;function Et(){return Se||(Se=ut(ls,us,{upgrade:(t,e)=>{switch(e){case 0:try{t.createObjectStore(V)}catch(n){console.warn(n)}}}}).catch(t=>{throw R.create("idb-open",{originalErrorMessage:t.message})})),Se}async function ds(t){try{let n=(await Et()).transaction(V),s=await n.objectStore(V).get(_t(t));return await n.done,s}catch(e){if(e instanceof C)I.warn(e.message);else{let n=R.create("idb-get",{originalErrorMessage:e?.message});I.warn(n.message)}}}async function ft(t,e){try{let s=(await Et()).transaction(V,"readwrite");await s.objectStore(V).put(e,_t(t)),await s.done}catch(n){if(n instanceof C)I.warn(n.message);else{let s=R.create("idb-set",{originalErrorMessage:n?.message});I.warn(s.message)}}}function _t(t){return`${t.name}!${t.options.appId}`}var hs=1024,fs=30,Re=class{constructor(e){this.container=e,this._heartbeatsCache=null;let n=this.container.getProvider("app").getImmediate();this._storage=new Ie(n),this._heartbeatsCachePromise=this._storage.read().then(s=>(this._heartbeatsCache=s,s))}async triggerHeartbeat(){try{let n=this.container.getProvider("platform-logger").getImmediate().getPlatformInfoString(),s=pt();if(this._heartbeatsCache?.heartbeats==null&&(this._heartbeatsCache=await this._heartbeatsCachePromise,this._heartbeatsCache?.heartbeats==null)||this._heartbeatsCache.lastSentHeartbeatDate===s||this._heartbeatsCache.heartbeats.some(r=>r.date===s))return;if(this._heartbeatsCache.heartbeats.push({date:s,agent:n}),this._heartbeatsCache.heartbeats.length>fs){let r=gs(this._heartbeatsCache.heartbeats);this._heartbeatsCache.heartbeats.splice(r,1)}return this._storage.overwrite(this._heartbeatsCache)}catch(e){I.warn(e)}}async getHeartbeatsHeader(){try{if(this._heartbeatsCache===null&&await this._heartbeatsCachePromise,this._heartbeatsCache?.heartbeats==null||this._heartbeatsCache.heartbeats.length===0)return"";let e=pt(),{heartbeatsToSend:n,unsentEntries:s}=ps(this._heartbeatsCache.heartbeats),r=fe(JSON.stringify({version:2,heartbeats:n}));return this._heartbeatsCache.lastSentHeartbeatDate=e,s.length>0?(this._heartbeatsCache.heartbeats=s,await this._storage.overwrite(this._heartbeatsCache)):(this._heartbeatsCache.heartbeats=[],this._storage.overwrite(this._heartbeatsCache)),r}catch(e){return I.warn(e),""}}};function pt(){return new Date().toISOString().substring(0,10)}function ps(t,e=hs){let n=[],s=t.slice();for(let r of t){let i=n.find(o=>o.agent===r.agent);if(i){if(i.dates.push(r.date),gt(n)>e){i.dates.pop();break}}else if(n.push({agent:r.agent,dates:[r.date]}),gt(n)>e){n.pop();break}s=s.slice(1)}return{heartbeatsToSend:n,unsentEntries:s}}var Ie=class{constructor(e){this.app=e,this._canUseIndexedDBPromise=this.runIndexedDBEnvironmentCheck()}async runIndexedDBEnvironmentCheck(){return G()?nt().then(()=>!0).catch(()=>!1):!1}async read(){if(await this._canUseIndexedDBPromise){let n=await ds(this.app);return n?.heartbeats?n:{heartbeats:[]}}else return{heartbeats:[]}}async overwrite(e){if(await this._canUseIndexedDBPromise){let s=await this.read();return ft(this.app,{lastSentHeartbeatDate:e.lastSentHeartbeatDate??s.lastSentHeartbeatDate,heartbeats:e.heartbeats})}else return}async add(e){if(await this._canUseIndexedDBPromise){let s=await this.read();return ft(this.app,{lastSentHeartbeatDate:e.lastSentHeartbeatDate??s.lastSentHeartbeatDate,heartbeats:[...s.heartbeats,...e.heartbeats]})}else return}};function gt(t){return fe(JSON.stringify({version:2,heartbeats:t})).length}function gs(t){if(t.length===0)return-1;let e=0,n=t[0].date;for(let s=1;s<t.length;s++)t[s].date<n&&(n=t[s].date,e=s);return e}function ms(t){k(new _("platform-logger",e=>new ye(e),"PRIVATE")),k(new _("heartbeat",e=>new Re(e),"PRIVATE")),y(Ae,dt,t),y(Ae,dt,"esm2020"),y("fire-js","")}ms("");var Es="firebase",_s="12.19.0";y(Es,_s,"app");var bt="@firebase/ai",Pe="2.16.0";var U="AI",bs="us-central1",ws="global",Ss="firebasevertexai.googleapis.com",B="v1beta",wt=Pe,ys="gl-js",As="hybrid",Ts=180*1e3,Os="gemini-2.5-flash-lite";var d=class t extends C{constructor(e,n,s){let r=U,i=`${r}/${e}`,o=`${r}: ${n} (${i})`;super(e,o),this.code=e,this.customErrorData=s,Error.captureStackTrace&&Error.captureStackTrace(this,t),Object.setPrototypeOf(this,t.prototype),this.toString=()=>o}};var St=["user","model","function","system"];var It={HARM_SEVERITY_NEGLIGIBLE:"HARM_SEVERITY_NEGLIGIBLE",HARM_SEVERITY_LOW:"HARM_SEVERITY_LOW",HARM_SEVERITY_MEDIUM:"HARM_SEVERITY_MEDIUM",HARM_SEVERITY_HIGH:"HARM_SEVERITY_HIGH",HARM_SEVERITY_UNSUPPORTED:"HARM_SEVERITY_UNSUPPORTED"};var E={STOP:"STOP",MAX_TOKENS:"MAX_TOKENS",SAFETY:"SAFETY",RECITATION:"RECITATION",OTHER:"OTHER",BLOCKLIST:"BLOCKLIST",PROHIBITED_CONTENT:"PROHIBITED_CONTENT",SPII:"SPII",MALFORMED_FUNCTION_CALL:"MALFORMED_FUNCTION_CALL",IMAGE_SAFETY:"IMAGE_SAFETY",IMAGE_PROHIBITED_CONTENT:"IMAGE_PROHIBITED_CONTENT",IMAGE_OTHER:"IMAGE_OTHER",NO_IMAGE:"NO_IMAGE",IMAGE_RECITATION:"IMAGE_RECITATION",LANGUAGE:"LANGUAGE",UNEXPECTED_TOOL_CALL:"UNEXPECTED_TOOL_CALL",TOO_MANY_TOOL_CALLS:"TOO_MANY_TOOL_CALLS",MISSING_THOUGHT_SIGNATURE:"MISSING_THOUGHT_SIGNATURE",MALFORMED_RESPONSE:"MALFORMED_RESPONSE"};var w={PREFER_ON_DEVICE:"prefer_on_device",ONLY_ON_DEVICE:"only_on_device",ONLY_IN_CLOUD:"only_in_cloud",PREFER_IN_CLOUD:"prefer_in_cloud"},N={ON_DEVICE:"on_device",IN_CLOUD:"in_cloud"};var u={ERROR:"error",REQUEST_ERROR:"request-error",RESPONSE_ERROR:"response-error",FETCH_ERROR:"fetch-error",SESSION_CLOSED:"session-closed",INVALID_CONTENT:"invalid-content",API_NOT_ENABLED:"api-not-enabled",INVALID_SCHEMA:"invalid-schema",NO_API_KEY:"no-api-key",NO_APP_ID:"no-app-id",NO_MODEL:"no-model",NO_PROJECT_ID:"no-project-id",PARSE_FAILED:"parse-failed",UNSUPPORTED:"unsupported"};var A={AGENT_PLATFORM:"AGENT_PLATFORM",VERTEX_AI:"VERTEX_AI",GOOGLE_AI:"GOOGLE_AI"};var W=class{constructor(e){this.backendType=e}},z=class extends W{constructor(){super(A.GOOGLE_AI)}_getModelPath(e,n){return`/${B}/projects/${e}/${n}`}_getTemplatePath(e,n){return`/${B}/projects/${e}/templates/${n}`}},K=class extends W{constructor(e){super(A.VERTEX_AI),this.location=bs,e&&(this.location=e)}_getModelPath(e,n){return`/${B}/projects/${e}/locations/${this.location}/${n}`}_getTemplatePath(e,n){return`/${B}/projects/${e}/locations/${this.location}/templates/${n}`}},$=class extends W{constructor(e){super(A.AGENT_PLATFORM),this.location=ws,e&&(this.location=e)}_getModelPath(e,n){return`/${B}/projects/${e}/locations/${this.location}/${n}`}_getTemplatePath(e,n){return`/${B}/projects/${e}/locations/${this.location}/templates/${n}`}};function Cs(t){if(t instanceof z)return`${U}/googleai`;if(t instanceof K)return`${U}/vertexai/${t.location}`;if(t instanceof $)return`${U}/agentplatform/${t.location}`;throw new d(u.ERROR,`Invalid backend: ${JSON.stringify(t.backendType)}`)}function Rs(t){let e=t.split("/");if(e[0]!==U)throw new d(u.ERROR,`Invalid instance identifier, unknown prefix '${e[0]}'`);switch(e[1]){case"vertexai":let s=e[2];if(!s)throw new d(u.ERROR,`Invalid instance identifier, unknown location '${t}'`);return new K(s);case"agentplatform":let r=e[2];if(!r)throw new d(u.ERROR,`Invalid instance identifier, unknown location '${t}'`);return new $(r);case"googleai":return new z;default:throw new d(u.ERROR,`Invalid instance identifier string: '${t}'`)}}var m=new D("@firebase/vertexai"),v;(function(t){t.UNAVAILABLE="unavailable",t.DOWNLOADABLE="downloadable",t.DOWNLOADING="downloading",t.AVAILABLE="available"})(v||(v={}));var vt={type:"text",languages:["en"]},De=[vt,{type:"image"}],ke=[vt],oe=class t{constructor(e,n,s){this.languageModelProvider=e,this.mode=n,this.downloadPromise=null,this.onDeviceParams={createOptions:{expectedInputs:De,expectedOutputs:ke}},s&&(this.onDeviceParams=s,this.onDeviceParams.createOptions?(this.onDeviceParams.createOptions.expectedInputs||(this.onDeviceParams.createOptions.expectedInputs=De),this.onDeviceParams.createOptions.expectedOutputs||(this.onDeviceParams.createOptions.expectedOutputs=ke)):this.onDeviceParams.createOptions={expectedInputs:De,expectedOutputs:ke})}async isAvailable(e){if(!this.mode)return m.debug("On-device inference unavailable because mode is undefined."),!1;if(this.mode===w.ONLY_IN_CLOUD)return m.debug('On-device inference unavailable because mode is "only_in_cloud".'),!1;let n=await this.languageModelProvider?.availability(this.onDeviceParams.createOptions);if(this.mode===w.ONLY_ON_DEVICE){if(n===v.UNAVAILABLE)throw new d(u.API_NOT_ENABLED,"Local LanguageModel API not available in this environment.");if(n===v.DOWNLOADABLE||n===v.DOWNLOADING){m.debug("Waiting for download of LanguageModel to complete.");try{await this.downloadPromise}catch(s){throw new d(u.ERROR,s.message)}return!0}return!0}return n!==v.AVAILABLE?(m.debug(`On-device inference unavailable because availability is "${n}".`),!1):t.isOnDeviceRequest(e)?!0:(m.debug("On-device inference unavailable because request is incompatible."),!1)}async generateContent(e){let n=await this.createSession(),s=await Promise.all(e.contents.map(t.toLanguageModelMessage)),r=await n.prompt(s,this.onDeviceParams.promptOptions);return t.toResponse(r)}async generateContentStream(e){let n=await this.createSession(),s=await Promise.all(e.contents.map(t.toLanguageModelMessage)),r=n.promptStreaming(s,this.onDeviceParams.promptOptions);return t.toStreamResponse(r)}async countTokens(e){throw new d(u.REQUEST_ERROR,"Count Tokens is not yet available for on-device model.")}static isOnDeviceRequest(e){if(e.contents.length===0)return m.debug("Empty prompt rejected for on-device inference."),!1;for(let n of e.contents){if(n.parts.some(s=>"functionResponse"in s))return m.debug("Content with a function response part rejected for on-device inference."),!1;for(let s of n.parts)if(s.inlineData&&t.SUPPORTED_MIME_TYPES.indexOf(s.inlineData.mimeType)===-1)return m.debug(`Unsupported mime type "${s.inlineData.mimeType}" rejected for on-device inference.`),!1}return!0}async downloadIfAvailable(e){let n=await this.languageModelProvider?.availability(this.onDeviceParams.createOptions);return(n===v.DOWNLOADABLE||n===v.DOWNLOADING)&&this.download(e),n}download(e){if(this.downloadPromise)return;let n={...this.onDeviceParams.createOptions};n&&!n.monitor&&e&&(n.monitor=s=>{s.addEventListener("downloadprogress",r=>{e(r.loaded)})}),this.downloadPromise=this.languageModelProvider?.create(n).finally(()=>{this.downloadPromise=null})}static async toLanguageModelMessage(e){let n=await Promise.all(e.parts.map(t.toLanguageModelMessageContent));return{role:t.toLanguageModelMessageRole(e.role),content:n}}static async toLanguageModelMessageContent(e){if(e.text)return{type:"text",value:e.text};if(e.inlineData){let s=await(await __rpfFetch(`data:${e.inlineData.mimeType};base64,${e.inlineData.data}`)).blob();return{type:"image",value:await createImageBitmap(s)}}throw new d(u.REQUEST_ERROR,"Processing of this Part type is not currently supported.")}static toLanguageModelMessageRole(e){return e==="model"?"assistant":"user"}async createSession(){if(!this.languageModelProvider)throw new d(u.UNSUPPORTED,"Chrome AI requested for unsupported browser version.");let e=await this.languageModelProvider.create(this.onDeviceParams.createOptions);return this.oldSession&&this.oldSession.destroy(),this.oldSession=e,e}static toResponse(e){return{json:async()=>({candidates:[{content:{parts:[{text:e}]}}]})}}static toStreamResponse(e){let n=new TextEncoder;return{body:e.pipeThrough(new TransformStream({transform(s,r){let i=JSON.stringify({candidates:[{content:{role:"model",parts:[{text:s}]}}]});r.enqueue(n.encode(`data: ${i}
+
+`))}}))}}};oe.SUPPORTED_MIME_TYPES=["image/jpeg","image/png"];function Is(t,e,n){let r=(e||H()).LanguageModel;if(r&&t)return new oe(r,t,n)}var Me=class{constructor(e,n,s,r,i){this.app=e,this.backend=n,this.chromeAdapterFactory=i;let o=r?.getImmediate({optional:!0}),a=s?.getImmediate({optional:!0});this.auth=a||null,this.appCheck=o||null,n instanceof K||n instanceof $?this.location=n.location:this.location=""}_delete(){return Promise.resolve()}set options(e){this._options=e}get options(){return this._options}};function vs(t,{instanceIdentifier:e}){if(!e)throw new d(u.ERROR,"AIService instance identifier is undefined.");let n=Rs(e),s=t.getProvider("app").getImmediate(),r=t.getProvider("auth-internal"),i=t.getProvider("app-check-internal");return new Me(s,n,r,i,Is)}function Ds(t){if(t.app?.options?.apiKey)if(t.app?.options?.projectId){if(!t.app?.options?.appId)throw new d(u.NO_APP_ID,'The "appId" field is empty in the local Firebase config. Firebase AI requires this field to contain a valid app ID.')}else throw new d(u.NO_PROJECT_ID,'The "projectId" field is empty in the local Firebase config. Firebase AI requires this field to contain a valid project ID.');else throw new d(u.NO_API_KEY,'The "apiKey" field is empty in the local Firebase config. Firebase AI requires this field to contain a valid API key.');let e={apiKey:t.app.options.apiKey,project:t.app.options.projectId,appId:t.app.options.appId,automaticDataCollectionEnabled:t.app.automaticDataCollectionEnabled,location:t.location,backend:t.backend};if(mt(t.app)&&t.app.settings.appCheckToken){let n=t.app.settings.appCheckToken;e.getAppCheckToken=()=>Promise.resolve({token:n})}else t.appCheck&&(t.options?.useLimitedUseAppCheckTokens?e.getAppCheckToken=()=>t.appCheck.getLimitedUseToken():e.getAppCheckToken=()=>t.appCheck.getToken());return t.auth&&(e.getAuthToken=()=>t.auth.getToken()),e}var xe=class t{constructor(e,n){this._apiSettings=Ds(e),this.model=t.normalizeModelName(n,this._apiSettings.backend.backendType)}static normalizeModelName(e,n){return n===A.GOOGLE_AI?t.normalizeGoogleAIModelName(e):t.normalizeVertexAIModelName(e)}static normalizeGoogleAIModelName(e){return`models/${e}`}static normalizeVertexAIModelName(e){let n;return e.includes("/")?e.startsWith("models/")?n=`publishers/google/${e}`:n=e:n=`publishers/google/models/${e}`,n}};var ks="Timeout has expired.",Ne="AbortError",Ue=class{constructor(e){this.params=e}toString(){let e=new URL(this.baseUrl);return e.pathname=this.pathname,e.search=this.queryParams.toString(),e.toString()}get pathname(){return this.params.templateId?`${this.params.apiSettings.backend._getTemplatePath(this.params.apiSettings.project,this.params.templateId)}:${this.params.task}`:`${this.params.apiSettings.backend._getModelPath(this.params.apiSettings.project,this.params.model)}:${this.params.task}`}get baseUrl(){return this.params.singleRequestOptions?.baseUrl??`https://${Ss}`}get queryParams(){let e=new URLSearchParams;return this.params.stream&&e.set("alt","sse"),e}};function Ns(t){let e=[];return e.push(`${ys}/${wt}`),e.push(`fire/${wt}`),(t.params.apiSettings.inferenceMode===w.PREFER_ON_DEVICE||t.params.apiSettings.inferenceMode===w.PREFER_IN_CLOUD)&&e.push(As),e.join(" ")}async function Ls(t){let e=new Headers;if(e.append("Content-Type","application/json"),e.append("x-goog-api-client",Ns(t)),e.append("x-goog-api-key",t.params.apiSettings.apiKey),t.params.apiSettings.automaticDataCollectionEnabled&&e.append("X-Firebase-Appid",t.params.apiSettings.appId),t.params.apiSettings.getAppCheckToken){let n=await t.params.apiSettings.getAppCheckToken();n&&(e.append("X-Firebase-AppCheck",n.token),n.error&&m.warn(`Unable to obtain a valid App Check token: ${n.error.message}`))}if(t.params.apiSettings.getAuthToken){let n=await t.params.apiSettings.getAuthToken();n&&e.append("Authorization",`Firebase ${n.accessToken}`)}return e}async function He(t,e){let n=new Ue(t),s,r=t.singleRequestOptions?.signal,i=t.singleRequestOptions?.timeout!=null&&t.singleRequestOptions.timeout>=0?t.singleRequestOptions.timeout:Ts,o=new AbortController,a=setTimeout(()=>{o.abort(new DOMException(ks,Ne)),m.debug(`Aborting request to ${n} due to timeout (${i}ms)`)},i),c=AbortSignal.any(r?[r,o.signal]:[o.signal]);if(r&&r.aborted)throw clearTimeout(a),new DOMException(r.reason??"Aborted externally before fetch",Ne);try{let l={method:"POST",headers:await Ls(n),signal:c,body:e};if(s=await __rpfFetch(n.toString(),l),!s.ok){let h="",f;try{let g=await s.json();h=g.error.message,g.error.details&&(h+=` ${JSON.stringify(g.error.details)}`,f=g.error.details)}catch{}throw s.status===403&&f&&f.some(g=>g.reason==="SERVICE_DISABLED")&&f.some(g=>g.links?.[0]?.description.includes("Google developers console API activation"))?new d(u.API_NOT_ENABLED,`The Firebase AI SDK requires the Firebase AI API ('firebasevertexai.googleapis.com') to be enabled in your Firebase project. Enable this API by visiting the Firebase Console at https://console.firebase.google.com/project/${n.params.apiSettings.project}/ailogic/ and clicking "Get started". If you enabled this API recently, wait a few minutes for the action to propagate to our systems and then retry.`,{status:s.status,statusText:s.statusText,errorDetails:f}):new d(u.FETCH_ERROR,`Error fetching from ${n}: [${s.status} ${s.statusText}] ${h}`,{status:s.status,statusText:s.statusText,errorDetails:f})}}catch(l){let h=l;throw l.code!==u.FETCH_ERROR&&l.code!==u.API_NOT_ENABLED&&l instanceof Error&&l.name!==Ne&&(h=new d(u.ERROR,`Error fetching from ${n.toString()}: ${l.message}`),h.stack=l.stack),h}finally{clearTimeout(a)}return s}function ie(t){if(t.candidates&&t.candidates.length>0){if(t.candidates.length>1&&m.warn(`This response had ${t.candidates.length} candidates. Returning text from the first candidate only. Access response.candidates directly to use the other candidates.`),kt(t.candidates[0]))throw new d(u.RESPONSE_ERROR,`Response error: ${x(t)}. Response body stored in error.response`,{response:t});return!0}else return!1}function ae(t,e=N.IN_CLOUD){t.candidates&&!t.candidates[0].hasOwnProperty("index")&&(t.candidates[0].index=0);let n=Ps(t);return n.inferenceSource=e,n}function Ps(t){return t.text=()=>{if(ie(t))return yt(t,e=>!e.thought);if(t.promptFeedback)throw new d(u.RESPONSE_ERROR,`Text not available. ${x(t)}`,{response:t});return""},t.thoughtSummary=()=>{if(ie(t)){let e=yt(t,n=>!!n.thought);return e===""?void 0:e}else if(t.promptFeedback)throw new d(u.RESPONSE_ERROR,`Thought summary not available. ${x(t)}`,{response:t})},t.inlineDataParts=()=>{if(ie(t))return Ms(t);if(t.promptFeedback)throw new d(u.RESPONSE_ERROR,`Data not available. ${x(t)}`,{response:t})},t.functionCalls=()=>{if(ie(t))return Dt(t);if(t.promptFeedback)throw new d(u.RESPONSE_ERROR,`Function call not available. ${x(t)}`,{response:t})},t}function yt(t,e){let n=[];if(t.candidates?.[0].content?.parts)for(let s of t.candidates?.[0].content?.parts)s.text&&e(s)&&n.push(s.text);return n.length>0?n.join(""):""}function Dt(t){if(!t)return;let e=[];if(t.candidates?.[0].content?.parts)for(let n of t.candidates?.[0].content?.parts)n.functionCall&&e.push(n.functionCall);if(e.length>0)return e}function Ms(t){let e=[];if(t.candidates?.[0].content?.parts)for(let n of t.candidates?.[0].content?.parts)n.inlineData&&e.push(n);if(e.length>0)return e}var xs=[E.RECITATION,E.SAFETY,E.BLOCKLIST,E.PROHIBITED_CONTENT,E.SPII,E.MALFORMED_FUNCTION_CALL,E.IMAGE_SAFETY,E.IMAGE_PROHIBITED_CONTENT,E.IMAGE_OTHER,E.NO_IMAGE,E.IMAGE_RECITATION,E.LANGUAGE,E.UNEXPECTED_TOOL_CALL,E.TOO_MANY_TOOL_CALLS,E.MISSING_THOUGHT_SIGNATURE,E.MALFORMED_RESPONSE];function kt(t){return!!t.finishReason&&xs.some(e=>e===t.finishReason)}function x(t){let e="";if((!t.candidates||t.candidates.length===0)&&t.promptFeedback)e+="Response was blocked",t.promptFeedback?.blockReason&&(e+=` due to ${t.promptFeedback.blockReason}`),t.promptFeedback?.blockReasonMessage&&(e+=`: ${t.promptFeedback.blockReasonMessage}`);else if(t.candidates?.[0]){let n=t.candidates[0];kt(n)&&(e+=`Candidate was blocked due to ${n.finishReason}`,n.finishMessage&&(e+=`: ${n.finishMessage}`))}return e}function Nt(t){if(t.safetySettings?.forEach(e=>{if(e.method)throw new d(u.UNSUPPORTED,"SafetySetting.method is not supported in the the Gemini Developer API. Please remove this property.")}),t.generationConfig?.topK){let e=Math.round(t.generationConfig.topK);e!==t.generationConfig.topK&&(m.warn("topK in GenerationConfig has been rounded to the nearest integer to match the format for requests to the Gemini Developer API."),t.generationConfig.topK=e)}return t}function Ge(t){return{candidates:t.candidates?$s(t.candidates):void 0,prompt:t.promptFeedback?Bs(t.promptFeedback):void 0,usageMetadata:t.usageMetadata}}function Us(t,e){return{generateContentRequest:{model:e,...t}}}function $s(t){let e=[],n;return e&&t.forEach(s=>{let r;if(s.citationMetadata&&(r={citations:s.citationMetadata.citationSources}),s.safetyRatings&&(n=s.safetyRatings.map(o=>({...o,severity:o.severity??It.HARM_SEVERITY_UNSUPPORTED,probabilityScore:o.probabilityScore??0,severityScore:o.severityScore??0}))),s.content?.parts?.some(o=>o?.videoMetadata))throw new d(u.UNSUPPORTED,"Part.videoMetadata is not supported in the Gemini Developer API. Please remove this property.");let i={index:s.index,content:s.content,finishReason:s.finishReason,finishMessage:s.finishMessage,safetyRatings:n,citationMetadata:r,groundingMetadata:s.groundingMetadata,urlContextMetadata:s.urlContextMetadata};e.push(i)}),e}function Bs(t){let e=[];return t.safetyRatings.forEach(s=>{e.push({category:s.category,probability:s.probability,severity:s.severity??It.HARM_SEVERITY_UNSUPPORTED,probabilityScore:s.probabilityScore??0,severityScore:s.severityScore??0,blocked:s.blocked})}),{blockReason:t.blockReason,safetyRatings:e,blockReasonMessage:t.blockReasonMessage}}var At=/^data\: (.*)(?:\n\n|\r\r|\r\n\r\n)/;async function Fs(t,e,n){let s=t.body.pipeThrough(new TextDecoderStream("utf8",{fatal:!0})),r=js(s),[i,o]=r.tee(),{response:a,firstValue:c}=await Hs(o,e,n);return{stream:Vs(i,e,n),response:a,firstValue:c}}async function Hs(t,e,n){let[s,r]=t.tee(),i=s.getReader(),{value:o}=await i.read();return{firstValue:o,response:Gs(r,e,n)}}async function Gs(t,e,n){let s=[],r=t.getReader();for(;;){let{done:i,value:o}=await r.read();if(i){let a=Ws(s);return e.backend.backendType===A.GOOGLE_AI&&(a=Ge(a)),ae(a,n)}s.push(o)}}async function*Vs(t,e,n){let s=t.getReader();for(;;){let{value:r,done:i}=await s.read();if(i)break;let o;e.backend.backendType===A.GOOGLE_AI?o=ae(Ge(r),n):o=ae(r,n);let a=o.candidates?.[0];!a?.content?.parts&&!a?.finishReason&&!a?.citationMetadata&&!a?.urlContextMetadata||(yield o)}}function js(t){let e=t.getReader();return new ReadableStream({start(s){let r="";return i();function i(){return e.read().then(({value:o,done:a})=>{if(a){if(r.trim()){s.error(new d(u.PARSE_FAILED,"Failed to parse stream"));return}s.close();return}r+=o;let c=r.match(At),l;for(;c;){try{l=JSON.parse(c[1])}catch{s.error(new d(u.PARSE_FAILED,`Error parsing JSON response: "${c[1]}`));return}s.enqueue(l),r=r.substring(c[0].length),c=r.match(At)}return i()})}}})}function Ws(t){let n={promptFeedback:t[t.length-1]?.promptFeedback};for(let s of t)if(s.candidates)for(let r of s.candidates){let i=r.index||0;n.candidates||(n.candidates=[]),n.candidates[i]||(n.candidates[i]={index:r.index}),n.candidates[i].citationMetadata=r.citationMetadata,n.candidates[i].finishReason=r.finishReason,n.candidates[i].finishMessage=r.finishMessage,n.candidates[i].safetyRatings=r.safetyRatings,n.candidates[i].groundingMetadata=r.groundingMetadata;let o=r.urlContextMetadata;if(typeof o=="object"&&o!==null&&Object.keys(o).length>0&&(n.candidates[i].urlContextMetadata=o),r.content){if(!r.content.parts)continue;n.candidates[i].content||(n.candidates[i].content={role:r.content.role||"user",parts:[]});for(let a of r.content.parts){let c={...a};a.text!==""&&Object.keys(c).length>0&&n.candidates[i].content.parts.push(c)}}}return n}var zs=[u.FETCH_ERROR,u.ERROR,u.API_NOT_ENABLED];async function Lt(t,e,n,s){if(!e)return{response:await s(),inferenceSource:N.IN_CLOUD};switch(e.mode){case w.ONLY_ON_DEVICE:if(await e.isAvailable(t))return{response:await n(),inferenceSource:N.ON_DEVICE};throw new d(u.UNSUPPORTED,"Inference mode is ONLY_ON_DEVICE, but an on-device model is not available.");case w.ONLY_IN_CLOUD:return{response:await s(),inferenceSource:N.IN_CLOUD};case w.PREFER_IN_CLOUD:try{return{response:await s(),inferenceSource:N.IN_CLOUD}}catch(r){if(r instanceof d&&zs.includes(r.code)&&await e.isAvailable(t))return{response:await n(),inferenceSource:N.ON_DEVICE};throw r}case w.PREFER_ON_DEVICE:return await e.isAvailable(t)?{response:await n(),inferenceSource:N.ON_DEVICE}:{response:await s(),inferenceSource:N.IN_CLOUD};default:throw new d(u.ERROR,`Unexpected infererence mode: ${e.mode}`)}}async function Ks(t,e,n,s){return t.backend.backendType===A.GOOGLE_AI&&(n=Nt(n)),He({task:"streamGenerateContent",model:e,apiSettings:t,stream:!0,singleRequestOptions:s},JSON.stringify(n))}async function Pt(t,e,n,s,r){let i=await Lt(n,s,()=>s.generateContentStream(n),()=>Ks(t,e,n,r));return Fs(i.response,t,i.inferenceSource)}async function Ys(t,e,n,s){return t.backend.backendType===A.GOOGLE_AI&&(n=Nt(n)),He({model:e,task:"generateContent",apiSettings:t,stream:!1,singleRequestOptions:s},JSON.stringify(n))}async function Mt(t,e,n,s,r){let i=await Lt(n,s,()=>s.generateContent(n),()=>Ys(t,e,n,r)),o=await qs(i.response,t);return{response:ae(o,i.inferenceSource)}}async function qs(t,e){let n=await t.json();return e.backend.backendType===A.GOOGLE_AI?Ge(n):n}function Ve(t){if(t!=null){if(typeof t=="string")return{role:"system",parts:[{text:t}]};if(t.text)return{role:"system",parts:[t]};if(t.parts)return t.role?t:{role:"system",parts:t.parts}}}function j(t){let e=[];if(typeof t=="string")e=[{text:t}];else for(let n of t)typeof n=="string"?e.push({text:n}):e.push(n);return Js(e)}function Js(t){let e={role:"user",parts:[]},n=!1,s=!1;for(let r of t)"functionResponse"in r?s=!0:n=!0,e.parts.push(r);if(n&&s)throw new d(u.INVALID_CONTENT,"Within a single message, FunctionResponse cannot be mixed with other type of Part in the request for sending chat message.");if(!n&&!s)throw new d(u.INVALID_CONTENT,"No Content is provided for sending chat message.");return e}function Le(t){let e;return t.contents?e=t:e={contents:[j(t)]},t.systemInstruction&&(e.systemInstruction=Ve(t.systemInstruction)),e}var Tt="SILENT_ERROR",Ot=10,$e=class{constructor(e,n,s){this.params=n,this.requestOptions=s,this._history=[],this._sendPromise=Promise.resolve(),this._apiSettings=e}async getHistory(){return await this._sendPromise,this._history}async _sendMessage(e,n){let s={};await this._sendPromise;let r=[];return this._sendPromise=this._sendPromise.then(async()=>{let i,o=0,a=this.requestOptions?.maxSequentialFunctionCalls??Ot;do{let c;if(i){o++;let f=await this._callFunctionsAsNeeded(i);c=j(f)}else c=j(e);let l=this._formatRequest(c,[...r]);r.push(c);let h=await this._callGenerateContent(l,n);if(h)if(s=h,i=this._getCallableFunctionCalls(h.response),h.response.candidates&&h.response.candidates.length>0){let f={parts:h.response.candidates?.[0].content.parts||[],role:h.response.candidates?.[0].content.role||"model"};r.push(f)}else{let f=x(h.response);f&&m.warn(`sendMessage() was unsuccessful. ${f}. Inspect response object for details.`)}else i=void 0}while(i&&o<a);i&&o>=a&&m.warn(`Automatic function calling exceeded the limit of ${a} function calls. Returning last model response.`)}),await this._sendPromise,this._history=this._history.concat(r),s}async _sendMessageStream(e,n){await this._sendPromise;let s=[],i=(async()=>{let o,a=0,c=this.requestOptions?.maxSequentialFunctionCalls??Ot,l;do{let h;if(o){a++;let g=await this._callFunctionsAsNeeded(o);h=j(g)}else h=j(e);let f=this._formatRequest(h,[...s]);if(s.push(h),l=await this._callGenerateContentStream(f,n),o=this._getCallableFunctionCalls(l.firstValue),o&&l.firstValue&&l.firstValue.candidates&&l.firstValue.candidates.length>0){let g={...l.firstValue.candidates[0].content};g.role||(g.role="model"),s.push(g)}}while(o&&a<c);return o&&a>=c&&m.warn(`Automatic function calling exceeded the limit of ${c} function calls. Returning last model response.`),{stream:l.stream,response:l.response}})();return this._sendPromise=this._sendPromise.then(async()=>i).catch(o=>{throw new Error(Tt)}).then(o=>o.response).then(o=>{if(o.candidates&&o.candidates.length>0){this._history=this._history.concat(s);let a={...o.candidates[0].content};a.role||(a.role="model"),this._history.push(a)}else{let a=x(o);a&&m.warn(`sendMessageStream() was unsuccessful. ${a}. Inspect response object for details.`)}}).catch(o=>{o.message!==Tt&&o.name!=="AbortError"&&m.error(o)}),i}_getCallableFunctionCalls(e){let n=this.params?.tools?.find(r=>r.functionDeclarations);if(!n?.functionDeclarations)return;let s=Dt(e);if(s){for(let r of s)if(!n.functionDeclarations?.some(o=>o.name===r.name&&typeof o.functionReference=="function"))return;return s}}async _callFunctionsAsNeeded(e){let n=[],s=[],r=this.params?.tools?.find(i=>i.functionDeclarations);if(r&&r.functionDeclarations){for(let o of e){let a=r.functionDeclarations.find(c=>c.name===o.name);if(a?.functionReference){let c=Promise.resolve(a.functionReference(o.args)).catch(l=>{let h=new d(u.ERROR,`Error in user-defined function "${a.name}": ${l.message}`);throw h.stack=l.stack,h});n.push({name:o.name,id:o.id,results:c}),s.push(c)}}await Promise.all(s);let i=[];for(let{name:o,id:a,results:c}of n){let l={name:o,response:await c};a&&(l.id=a),i.push({functionResponse:l})}return i}else throw new d(u.REQUEST_ERROR,'No function declarations were provided in "tools".')}};var Ct=["text","inlineData","functionCall","functionResponse","thought","thoughtSignature"],Xs={user:["text","inlineData","functionResponse"],function:["functionResponse"],model:["text","functionCall","thought","thoughtSignature"],system:["text"]},Rt={user:["model"],function:["model"],model:["user","function"],system:[]};function Qs(t){let e=null;for(let n of t){let{role:s,parts:r}=n;if(!e&&s!=="user")throw new d(u.INVALID_CONTENT,`First Content should be with role 'user', got ${s}`);if(!St.includes(s))throw new d(u.INVALID_CONTENT,`Each item should include role field. Got ${s} but valid roles are: ${JSON.stringify(St)}`);if(!Array.isArray(r))throw new d(u.INVALID_CONTENT,"Content should have 'parts' property with an array of Parts");if(r.length===0)throw new d(u.INVALID_CONTENT,"Each Content should have at least one part");let i={text:0,inlineData:0,functionCall:0,functionResponse:0,thought:0,thoughtSignature:0,executableCode:0,codeExecutionResult:0};for(let a of r)for(let c of Ct)c in a&&(i[c]+=1);let o=Xs[s];for(let a of Ct)if(!o.includes(a)&&i[a]>0)throw new d(u.INVALID_CONTENT,`Content with role '${s}' can't contain '${a}' part`);if(e&&!Rt[s].includes(e.role))throw new d(u.INVALID_CONTENT,`Content with role '${s}' can't follow '${e.role}'. Valid previous roles: ${JSON.stringify(Rt)}`);e=n}}var Be=class extends $e{constructor(e,n,s,r,i){super(e,r,i),this.model=n,this.chromeAdapter=s,this.params=r,this.requestOptions=i,r?.history&&(Qs(r.history),this._history=r.history),this.params?.systemInstruction!=null&&(this.params={...this.params,systemInstruction:Ve(this.params.systemInstruction)})}_formatRequest(e,n){return{safetySettings:this.params?.safetySettings,generationConfig:this.params?.generationConfig,tools:this.params?.tools,toolConfig:this.params?.toolConfig,systemInstruction:this.params?.systemInstruction,contents:[...this._history,...n,e]}}_callGenerateContent(e,n){return Mt(this._apiSettings,this.model,e,this.chromeAdapter,{...this.requestOptions,...n})}_callGenerateContentStream(e,n){return Pt(this._apiSettings,this.model,e,this.chromeAdapter,{...this.requestOptions,...n})}async sendMessage(e,n){return this._sendMessage(e,n)}async sendMessageStream(e,n){return this._sendMessageStream(e,n)}};async function Zs(t,e,n,s){let r="";if(t.backend.backendType===A.GOOGLE_AI){let o=Us(n,e);r=JSON.stringify(o)}else r=JSON.stringify(n);return(await He({model:e,task:"countTokens",apiSettings:t,stream:!1,singleRequestOptions:s},r)).json()}async function er(t,e,n,s,r){if(s?.mode===w.ONLY_ON_DEVICE)throw new d(u.UNSUPPORTED,"countTokens() is not supported for on-device models.");return Zs(t,e,n,r)}var Fe=class extends xe{constructor(e,n,s,r){super(e,n.model),this.chromeAdapter=r,this.generationConfig=n.generationConfig||{},tr(this.generationConfig),this.safetySettings=n.safetySettings||[],this.tools=n.tools,this.toolConfig=n.toolConfig,this.systemInstruction=Ve(n.systemInstruction),this.requestOptions=s||{}}async initializeDeviceModel(e){if(!this.chromeAdapter||this.chromeAdapter.mode===w.ONLY_IN_CLOUD)return;if(await this.chromeAdapter.downloadIfAvailable(e)===v.UNAVAILABLE){let s=new d(u.API_NOT_ENABLED,"Local LanguageModel API not available in this environment.");if(this.chromeAdapter.mode===w.ONLY_ON_DEVICE)throw s;m.debug(s.message)}await this.chromeAdapter.downloadPromise}async generateContent(e,n){let s=Le(e);return Mt(this._apiSettings,this.model,{generationConfig:this.generationConfig,safetySettings:this.safetySettings,tools:this.tools,toolConfig:this.toolConfig,systemInstruction:this.systemInstruction,...s},this.chromeAdapter,{...this.requestOptions,...n})}async generateContentStream(e,n){let s=Le(e),{stream:r,response:i}=await Pt(this._apiSettings,this.model,{generationConfig:this.generationConfig,safetySettings:this.safetySettings,tools:this.tools,toolConfig:this.toolConfig,systemInstruction:this.systemInstruction,...s},this.chromeAdapter,{...this.requestOptions,...n});return{stream:r,response:i}}startChat(e){return new Be(this._apiSettings,this.model,this.chromeAdapter,{tools:this.tools,toolConfig:this.toolConfig,systemInstruction:this.systemInstruction,generationConfig:this.generationConfig,safetySettings:this.safetySettings,...e},this.requestOptions)}async countTokens(e,n){let s=Le(e);return er(this._apiSettings,this.model,s,this.chromeAdapter,{...this.requestOptions,...n})}};function tr(t){if(t.thinkingConfig?.thinkingBudget!=null&&t.thinkingConfig?.thinkingLevel)throw new d(u.UNSUPPORTED,"Cannot set both thinkingBudget and thinkingLevel in a config.");if(t.responseSchema!=null&&t.responseJsonSchema!=null)throw new d(u.UNSUPPORTED,"Cannot set both responseSchema and responseJsonSchema in a config.");if((t.responseSchema!=null||t.responseJsonSchema!=null)&&t.responseMimeType!=="application/json"&&t.responseMimeType!=="text/x.enum")throw new d(u.UNSUPPORTED,'responseMimeType must be set to "application/json" or "text/x.enum" if responseSchema or responseJsonSchema are set.')}var nr="audio-processor",ai=`
+  class AudioProcessor extends AudioWorkletProcessor {
+    constructor(options) {
+      super();
+      this.targetSampleRate = options.processorOptions.targetSampleRate;
+      // 'sampleRate' is a global variable available inside the AudioWorkletGlobalScope,
+      // representing the native sample rate of the AudioContext.
+      this.inputSampleRate = sampleRate;
+    }
+
+    /**
+     * This method is called by the browser's audio engine for each block of audio data.
+     * Input is a single input, with a single channel (input[0][0]).
+     */
+    process(inputs) {
+      const input = inputs[0];
+      if (input && input.length > 0 && input[0].length > 0) {
+        const pcmData = input[0]; // Float32Array of raw audio samples.
+        
+        // Simple linear interpolation for resampling.
+        const resampled = new Float32Array(Math.round(pcmData.length * this.targetSampleRate / this.inputSampleRate));
+        const ratio = pcmData.length / resampled.length;
+        for (let i = 0; i < resampled.length; i++) {
+          resampled[i] = pcmData[Math.floor(i * ratio)];
+        }
+
+        // Convert Float32 (-1, 1) samples to Int16 (-32768, 32767)
+        const resampledInt16 = new Int16Array(resampled.length);
+        for (let i = 0; i < resampled.length; i++) {
+          const sample = Math.max(-1, Math.min(1, resampled[i]));
+          if (sample < 0) {
+            resampledInt16[i] = sample * 32768;
+          } else {
+            resampledInt16[i] = sample * 32767;
+          }
+        }
+        
+        this.port.postMessage(resampledInt16);
+      }
+      // Return true to keep the processor alive and processing the next audio block.
+      return true;
+    }
+  }
+
+  // Register the processor with a name that can be used to instantiate it from the main thread.
+  registerProcessor('${nr}', AudioProcessor);
+`;function xt(t=re(),e){t=Z(t);let n=se(t,U),s=e?.backend??new z,r={useLimitedUseAppCheckTokens:e?.useLimitedUseAppCheckTokens??!1},i=Cs(s),o=n.getImmediate({identifier:i});return o.options=r,o}var sr=["mode","onDeviceParams","inCloudParams"];function Ut(t,e,n){let s=e,r;if(s.mode){for(let a of Object.keys(e))sr.includes(a)||m.warn(`When a hybrid inference mode is specified (mode is currently set to ${s.mode}), "${a}" cannot be configured at the top level. Configuration for in-cloud and on-device must be done separately in inCloudParams and onDeviceParams. Configuration values set outside of inCloudParams and onDeviceParams will be ignored.`);r=s.inCloudParams||{model:Os}}else r=e;if(!r.model)throw new d(u.NO_MODEL,"Must provide a model name. Example: getGenerativeModel({ model: 'my-model-name' })");let i=t.chromeAdapterFactory?.(s.mode,typeof window>"u"?void 0:window,s.onDeviceParams),o=new Fe(t,r,n,i);return o._apiSettings.inferenceMode=s.mode,o}function rr(){k(new _(U,vs,"PUBLIC").setMultipleInstances(!0)),y(bt,Pe),y(bt,Pe,"esm2020")}rr();var ze=new Map,Ht={activated:!1,tokenObservers:[]},ir={initialized:!1,enabled:!1};function b(t){return ze.get(t)||{...Ht}}function or(t,e){return ze.set(t,e),ze.get(t)}function ue(){return ir}var ar="https://content-firebaseappcheck.googleapis.com/v1";var cr="exchangeDebugToken",$t={RETRIAL_MIN_WAIT:30*1e3,RETRIAL_MAX_WAIT:960*1e3},mi=1440*60*1e3;var Ke=class{constructor(e,n,s,r,i){if(this.operation=e,this.retryPolicy=n,this.getWaitDuration=s,this.lowerBound=r,this.upperBound=i,this.pending=null,this.nextErrorWaitInterval=r,r>i)throw new Error("Proactive refresh lower bound greater than upper bound!")}start(){this.nextErrorWaitInterval=this.lowerBound,this.process(!0).catch(()=>{})}stop(){this.pending&&(this.pending.reject("cancelled"),this.pending=null)}isRunning(){return!!this.pending}async process(e){this.stop();try{this.pending=new O,this.pending.promise.catch(n=>{}),await lr(this.getNextRun(e)),this.pending.resolve(),await this.pending.promise,this.pending=new O,this.pending.promise.catch(n=>{}),await this.operation(),this.pending.resolve(),await this.pending.promise,this.process(!0).catch(()=>{})}catch(n){this.retryPolicy(n)?this.process(!1).catch(()=>{}):this.stop()}}getNextRun(e){if(e)return this.nextErrorWaitInterval=this.lowerBound,this.getWaitDuration();{let n=this.nextErrorWaitInterval;return this.nextErrorWaitInterval*=2,this.nextErrorWaitInterval>this.upperBound&&(this.nextErrorWaitInterval=this.upperBound),n}}};function lr(t){return new Promise(e=>{setTimeout(e,t)})}var ur={"already-initialized":"You have already called initializeAppCheck() for FirebaseApp {$appName} with different options. To avoid this error, call initializeAppCheck() with the same options as when it was originally called. This will return the already initialized instance.","use-before-activation":"App Check is being used before initializeAppCheck() is called for FirebaseApp {$appName}. Call initializeAppCheck() before instantiating other Firebase services.","fetch-network-error":"Fetch failed to connect to a network. Check Internet connection. Original error: {$originalErrorMessage}.","fetch-parse-error":"Fetch client could not parse response. Original error: {$originalErrorMessage}.","fetch-status-error":"Fetch server returned an HTTP error status. HTTP status: {$httpStatus}.","storage-open":"Error thrown when opening storage. Original error: {$originalErrorMessage}.","storage-get":"Error thrown when reading from storage. Original error: {$originalErrorMessage}.","storage-set":"Error thrown when writing to storage. Original error: {$originalErrorMessage}.","recaptcha-error":"ReCAPTCHA error.","initial-throttle":"{$httpStatus} error. Attempts allowed again after {$time}",throttled:"Requests throttled due to previous {$httpStatus} error. Attempts allowed again after {$time}"},T=new P("appCheck","AppCheck",ur);function Gt(t){if(!b(t).activated)throw T.create("use-before-activation",{appName:t.name})}async function Vt({url:t,body:e},n){let s={"Content-Type":"application/json"},r=n.getImmediate({optional:!0});if(r){let f=await r.getHeartbeatsHeader();f&&(s["X-Firebase-Client"]=f)}let i={method:"POST",body:JSON.stringify(e),headers:s},o;try{o=await __rpfFetch(t,i)}catch(f){throw T.create("fetch-network-error",{originalErrorMessage:f?.message})}if(o.status!==200)throw T.create("fetch-status-error",{httpStatus:o.status});let a;try{a=await o.json()}catch(f){throw T.create("fetch-parse-error",{originalErrorMessage:f?.message})}let c=a.ttl.match(/^([\d.]+)(s)$/);if(!c||!c[2]||isNaN(Number(c[1])))throw T.create("fetch-parse-error",{originalErrorMessage:`ttl field (timeToLive) is not in standard Protobuf Duration format: ${a.ttl}`});let l=Number(c[1])*1e3,h=Date.now();return{token:a.token,expireTimeMillis:h+l,issuedAtTimeMillis:h}}function jt(t,e){let{projectId:n,appId:s,apiKey:r}=t.options;return{url:`${ar}/projects/${n}/apps/${s}:${cr}?key=${r}`,body:{debug_token:e}}}var dr="firebase-app-check-database",hr=1,Y="firebase-app-check-store",Wt="debug-token",ce=null;function zt(){return ce||(ce=new Promise((t,e)=>{try{let n=indexedDB.open(dr,hr);n.onsuccess=s=>{t(s.target.result)},n.onerror=s=>{e(T.create("storage-open",{originalErrorMessage:s.target.error?.message}))},n.onupgradeneeded=s=>{let r=s.target.result;s.oldVersion===0&&r.createObjectStore(Y,{keyPath:"compositeKey"})}}catch(n){e(T.create("storage-open",{originalErrorMessage:n?.message}))}}),ce)}function fr(t){return Yt(qt(t))}function pr(t,e){return Kt(qt(t),e)}function gr(t){return Kt(Wt,t)}function mr(){return Yt(Wt)}async function Kt(t,e){let s=(await zt()).transaction(Y,"readwrite"),i=s.objectStore(Y).put({compositeKey:t,value:e});return new Promise((o,a)=>{i.onsuccess=c=>{o()},s.onerror=c=>{a(T.create("storage-set",{originalErrorMessage:c.target.error?.message}))}})}async function Yt(t){let n=(await zt()).transaction(Y,"readonly"),r=n.objectStore(Y).get(t);return new Promise((i,o)=>{r.onsuccess=a=>{let c=a.target.result;i(c?c.value:void 0)},n.onerror=a=>{o(T.create("storage-get",{originalErrorMessage:a.target.error?.message}))}})}function qt(t){return`${t.options.appId}-${t.name}`}var L=new D("@firebase/app-check");async function Er(t){if(G()){let e;try{e=await fr(t)}catch(n){L.warn(`Failed to read token from IndexedDB. Error: ${n}`)}return e}}function je(t,e){return G()?pr(t,e).catch(n=>{L.warn(`Failed to write token to IndexedDB. Error: ${n}`)}):Promise.resolve()}async function _r(t){let e;try{e=await mr()}catch{}if(e)return e;{let n=crypto.randomUUID(),s=`To use this token for app debugging, register it with your project.
+
+Firebase App Check debug token: ${n}
+
+`,r=t?.options.appId,i=t?.options.projectId;return i&&r?s+=`You can do so in the Firebase Console:
+https://console.firebase.google.com/project/${i}/appcheck/apps?selectedAppId=${r}
+
+Or using the Firebase CLI:
+firebase appcheck:debugtokens:create ${n} --project ${i} --app ${r}
+
+`:s+=`You will need to add it to your app's App Check settings in the Firebase Console for it to work.
+
+`,s+=`Note: To keep your project secure, please revoke and delete this token using the
+Firebase Console or the CLI (\`firebase appcheck:debugtokens:delete\`) when you finish debugging.
+
+Warning: This debug token is a secret and should not be shared or uploaded to source code.
+
+Debug Token Guide: https://firebase.google.com/docs/app-check/web/debug-provider
+Firebase CLI install instructions: https://firebase.google.com/docs/cli
+`,console.log(s),gr(n).catch(o=>L.warn(`Failed to persist debug token to IndexedDB. Error: ${o}`)),n}}function Je(){return ue().enabled}async function Xe(){let t=ue();if(t.enabled&&t.token)return t.token.promise;throw Error(`
+            Can't get debug token in production mode.
+        `)}function br(t){let e=H(),n=ue();if(n.initialized=!0,typeof e.FIREBASE_APPCHECK_DEBUG_TOKEN!="string"&&e.FIREBASE_APPCHECK_DEBUG_TOKEN!==!0)return;n.enabled=!0;let s=new O;n.token=s,typeof e.FIREBASE_APPCHECK_DEBUG_TOKEN=="string"?s.resolve(e.FIREBASE_APPCHECK_DEBUG_TOKEN):s.resolve(_r(t))}var wr={error:"UNKNOWN_ERROR"};function Sr(t){return X.encodeString(JSON.stringify(t),!1)}async function Ye(t,e=!1,n=!1){let s=t.app;Gt(s);let r=b(s),i=r.token,o;if(i&&!F(i)&&(r.token=void 0,i=void 0),!i){let l=await r.cachedTokenPromise;l&&(F(l)?i=l:await je(s,void 0))}if(!e&&i&&F(i))return{token:i.token};let a=!1;if(Je())try{let l=await Xe();r.exchangeTokenPromise||(r.exchangeTokenPromise=Vt(jt(s,l),t.heartbeatServiceProvider).finally(()=>{r.exchangeTokenPromise=void 0}),a=!0);let h=await r.exchangeTokenPromise;return await je(s,h),r.token=h,{token:h.token}}catch(l){return l.code==="appCheck/throttled"||l.code==="appCheck/initial-throttle"?L.warn(l.message):n&&L.error(l),We(l)}try{r.exchangeTokenPromise||(r.exchangeTokenPromise=r.provider.getToken().finally(()=>{r.exchangeTokenPromise=void 0}),a=!0),i=await b(s).exchangeTokenPromise}catch(l){l.code==="appCheck/throttled"||l.code==="appCheck/initial-throttle"?L.warn(l.message):n&&L.error(l),o=l}let c;return i?o?F(i)?c={token:i.token,internalError:o}:c=We(o):(c={token:i.token},r.token=i,await je(s,i)):c=We(o),a&&Qt(s,c),c}async function yr(t){let e=t.app;Gt(e);let{provider:n}=b(e);if(Je()){let s=await Xe(),r=jt(e,s);r.body.limited_use=!0;let{token:i}=await Vt(r,t.heartbeatServiceProvider);return{token:i}}else{let{token:s}=await n.getToken(!0);return{token:s}}}function Jt(t,e,n,s){let{app:r}=t,i=b(r),o={next:n,error:s,type:e};if(i.tokenObservers=[...i.tokenObservers,o],i.token&&F(i.token)){let a=i.token;Promise.resolve().then(()=>{n({token:a.token}),Bt(t)}).catch(()=>{})}i.cachedTokenPromise.then(()=>Bt(t))}function Xt(t,e){let n=b(t),s=n.tokenObservers.filter(r=>r.next!==e);s.length===0&&n.tokenRefresher&&n.tokenRefresher.isRunning()&&n.tokenRefresher.stop(),n.tokenObservers=s}function Bt(t){let{app:e}=t,n=b(e),s=n.tokenRefresher;s||(s=Ar(t),n.tokenRefresher=s),!s.isRunning()&&n.isTokenAutoRefreshEnabled&&s.start()}function Ar(t){let{app:e}=t;return new Ke(async()=>{let n=b(e),s;if(n.token?s=await Ye(t,!0):s=await Ye(t),s.error)throw s.error;if(s.internalError)throw s.internalError},()=>!0,()=>{let n=b(e);if(n.token){let s=n.token.issuedAtTimeMillis+(n.token.expireTimeMillis-n.token.issuedAtTimeMillis)*.5+3e5,r=n.token.expireTimeMillis-300*1e3;return s=Math.min(s,r),Math.max(0,s-Date.now())}else return 0},$t.RETRIAL_MIN_WAIT,$t.RETRIAL_MAX_WAIT)}function Qt(t,e){let n=b(t).tokenObservers;for(let s of n)try{s.type==="EXTERNAL"&&e.error!=null?s.error(e.error):s.next(e)}catch{}}function F(t){return t.expireTimeMillis-Date.now()>0}function We(t){return{token:Sr(wr),error:t}}var qe=class{constructor(e,n){this.app=e,this.heartbeatServiceProvider=n}_delete(){let{tokenObservers:e}=b(this.app);for(let n of e)Xt(this.app,n.next);return Promise.resolve()}};function Tr(t,e){return new qe(t,e)}function Or(t){return{getToken:e=>Ye(t,e),getLimitedUseToken:()=>yr(t),addTokenListener:e=>Jt(t,"INTERNAL",e),removeTokenListener:e=>Xt(t.app,e)}}var Cr="@firebase/app-check",Rr="0.13.1";var le=class t{constructor(e){this._customProviderOptions=e}async getToken(){let e=await this._customProviderOptions.getToken(),n=st(e.token),s=n!==null&&n<Date.now()&&n>0?n*1e3:Date.now();return{...e,issuedAtTimeMillis:s}}initialize(e){this._app=e}isEqual(e){return e instanceof t?this._customProviderOptions.getToken.toString()===e._customProviderOptions.getToken.toString():!1}};function Zt(t=re(),e){t=Z(t);let n=se(t,"app-check");if(ue().initialized||br(t),Je()&&Xe().then(r=>{console.log(`Firebase App Check debug token: ${r}`)}),n.isInitialized()){let r=n.getImmediate(),i=n.getOptions();if(i&&!!i.isTokenAutoRefreshEnabled==!!e.isTokenAutoRefreshEnabled&&i.provider?.isEqual(e.provider))return r;throw T.create("already-initialized",{appName:t.name})}let s=n.initialize({options:e});return Ir(t,e.provider,e.isTokenAutoRefreshEnabled),b(t).isTokenAutoRefreshEnabled&&Jt(s,"INTERNAL",()=>{}),s}function Ir(t,e,n=!1){let s=or(t,{...Ht});s.activated=!0,s.provider=e,s.cachedTokenPromise=Er(t).then(r=>(r&&F(r)&&(s.token=r,Qt(t,{token:r.token})),r)),s.isTokenAutoRefreshEnabled=n&&t.automaticDataCollectionEnabled,!t.automaticDataCollectionEnabled&&n&&L.warn("`isTokenAutoRefreshEnabled` is true but `automaticDataCollectionEnabled` was set to false during `initializeApp()`. This blocks automatic token refresh."),s.provider.initialize(t)}var vr="app-check",Ft="app-check-internal";function Dr(){k(new _(vr,t=>{let e=t.getProvider("app").getImmediate(),n=t.getProvider("heartbeat");return Tr(e,n)},"PUBLIC").setInstantiationMode("EXPLICIT").setInstanceCreatedCallback((t,e,n)=>{t.getProvider(Ft).initialize()})),k(new _(Ft,t=>{let e=t.getProvider("app-check").getImmediate();return Or(e)},"PUBLIC").setInstantiationMode("EXPLICIT")),y(Cr,Rr)}Dr();return an(kr);})();
+/*! Bundled license information:
+
+@firebase/util/dist/index.esm.js:
+@firebase/util/dist/index.esm.js:
+@firebase/util/dist/index.esm.js:
+@firebase/util/dist/index.esm.js:
+@firebase/util/dist/index.esm.js:
+@firebase/util/dist/index.esm.js:
+@firebase/util/dist/index.esm.js:
+@firebase/util/dist/index.esm.js:
+@firebase/util/dist/index.esm.js:
+@firebase/util/dist/index.esm.js:
+@firebase/util/dist/index.esm.js:
+@firebase/logger/dist/esm/index.esm.js:
+  (**
+   * @license
+   * Copyright 2017 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/util/dist/index.esm.js:
+@firebase/util/dist/index.esm.js:
+  (**
+   * @license
+   * Copyright 2022 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/util/dist/index.esm.js:
+  (**
+   * @license
+   * Copyright 2017 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+  (**
+   * @license
+   * Copyright 2021 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/util/dist/index.esm.js:
+@firebase/component/dist/esm/index.esm.js:
+@firebase/app/dist/esm/index.esm.js:
+@firebase/app/dist/esm/index.esm.js:
+@firebase/app/dist/esm/index.esm.js:
+  (**
+   * @license
+   * Copyright 2019 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/util/dist/index.esm.js:
+firebase/app/dist/esm/index.esm.js:
+@firebase/app-check/dist/esm/index.esm.js:
+@firebase/app-check/dist/esm/index.esm.js:
+@firebase/app-check/dist/esm/index.esm.js:
+@firebase/app-check/dist/esm/index.esm.js:
+@firebase/app-check/dist/esm/index.esm.js:
+  (**
+   * @license
+   * Copyright 2020 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/util/dist/index.esm.js:
+  (**
+   * @license
+   * Copyright 2021 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+  (**
+   * @license
+   * Copyright 2025 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/util/dist/index.esm.js:
+@firebase/ai/dist/esm/index.esm.js:
+@firebase/ai/dist/esm/index.esm.js:
+@firebase/ai/dist/esm/index.esm.js:
+@firebase/ai/dist/esm/index.esm.js:
+@firebase/ai/dist/esm/index.esm.js:
+  (**
+   * @license
+   * Copyright 2025 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/app/dist/esm/index.esm.js:
+  (**
+   * @license
+   * Copyright 2019 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+  (**
+   * @license
+   * Copyright 2023 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/app/dist/esm/index.esm.js:
+  (**
+   * @license
+   * Copyright 2021 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+  (**
+   * @license
+   * Copyright 2019 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/ai/dist/esm/index.esm.js:
+@firebase/ai/dist/esm/index.esm.js:
+@firebase/ai/dist/esm/index.esm.js:
+@firebase/ai/dist/esm/index.esm.js:
+@firebase/ai/dist/esm/index.esm.js:
+  (**
+   * @license
+   * Copyright 2024 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/ai/dist/esm/index.esm.js:
+@firebase/ai/dist/esm/index.esm.js:
+  (**
+   * @license
+   * Copyright 2024 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+  (**
+   * @license
+   * Copyright 2025 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/ai/dist/esm/index.esm.js:
+  (**
+   * @license
+   * Copyright 2024 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+  (**
+   * @license
+   * Copyright 2026 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+  (**
+   * @license
+   * Copyright 2025 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/ai/dist/esm/index.esm.js:
+  (**
+   * @license
+   * Copyright 2026 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+
+@firebase/app-check/dist/esm/index.esm.js:
+@firebase/app-check/dist/esm/index.esm.js:
+  (**
+   * @license
+   * Copyright 2021 Google LLC
+   *
+   * Licensed under the Apache License, Version 2.0 (the "License");
+   * you may not use this file except in compliance with the License.
+   * You may obtain a copy of the License at
+   *
+   *   http://www.apache.org/licenses/LICENSE-2.0
+   *
+   * Unless required by applicable law or agreed to in writing, software
+   * distributed under the License is distributed on an "AS IS" BASIS,
+   * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   * See the License for the specific language governing permissions and
+   * limitations under the License.
+   *)
+*/
+return RpfFirebase;
+    // <<< FIREBASE SDK BUNDLE <<<
+  }
+  /* eslint-enable */
 
   try {
     const app = new App();
